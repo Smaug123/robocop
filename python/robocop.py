@@ -227,7 +227,11 @@ def main():
         action="store_true",
         help="If set, do not make any changes, just print what would be done.",
     )
-    parser.add_argument("--api-key", type=str, required=True, help="OpenAI API key.")
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        help="OpenAI API key. If not provided, will use OPENAI_API_KEY environment variable.",
+    )
     parser.add_argument(
         "--additional-prompt",
         type=str,
@@ -255,6 +259,17 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Get API key from args or environment
+    api_key = args.api_key
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print(
+                "Error: OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Convert string to ReasoningEffort type safely
     def get_reasoning_effort(effort_str: str) -> ReasoningEffort:
@@ -331,7 +346,7 @@ Do identify syntax errors in languages like Python and Groovy, which often lack 
 
     additional_prompt = args.additional_prompt.strip()
 
-    client = OpenAI(api_key=args.api_key)
+    client = OpenAI(api_key=api_key)
 
     user_prompt = f"""Below is a git diff, and then the contents of the altered files after the diff was applied.
 {additional_prompt}
