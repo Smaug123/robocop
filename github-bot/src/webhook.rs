@@ -29,6 +29,26 @@ pub struct GitHubWebhookPayload {
     pub repository: Option<Repository>,
     pub sender: Option<User>,
     pub installation: Option<Installation>,
+    pub comment: Option<Comment>,
+    pub issue: Option<Issue>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Comment {
+    pub id: u64,
+    pub body: String,
+    pub user: User,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Issue {
+    pub number: u64,
+    pub pull_request: Option<PullRequestLink>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PullRequestLink {
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -240,6 +260,34 @@ pub async fn github_webhook_handler(
                 }
             } else {
                 warn!("No pull request information in payload");
+            }
+        }
+        Some("created") => {
+            info!("Processing comment event");
+
+            // Check if this is a comment on a pull request
+            if let (Some(comment), Some(issue)) = (&payload.comment, &payload.issue) {
+                if issue.pull_request.is_some() {
+                    info!(
+                        "Comment on PR #{} in {}, by {}",
+                        issue.number,
+                        payload
+                            .repository
+                            .as_ref()
+                            .map(|r| &r.full_name)
+                            .unwrap_or(&"unknown".to_string()),
+                        comment.user.login
+                    );
+
+                    info!(
+                        "Comment body preview: {}",
+                        comment.body.lines().next().unwrap_or("")
+                    );
+                } else {
+                    info!("Comment is on an issue, not a PR, ignoring");
+                }
+            } else {
+                warn!("Comment event missing comment or issue data");
             }
         }
         _ => {
