@@ -510,6 +510,17 @@
             return await response.text();
         }
 
+        async function fetchBatchError(fileId) {
+            const apiKey = getApiKey();
+            const response = await fetch(`${API_BASE}/files/${fileId}/content`, {
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`
+                }
+            });
+            if (!response.ok) throw new Error(`Failed to fetch error file: ${response.statusText}`);
+            return await response.text();
+        }
+
         function parseReviewFromOutput(outputText) {
             const lines = outputText.trim().split('\n');
             for (const line of lines) {
@@ -540,6 +551,32 @@
                 console.warn('Failed to parse model content as JSON:', content.substring(0, 100), 'Error:', e.message);
                 return null;
             }
+        }
+
+        function parseErrorFromOutput(errorText) {
+            const lines = errorText.trim().split('\n');
+            const errors = [];
+
+            for (const line of lines) {
+                if (!line.trim()) continue;
+
+                try {
+                    const errorEntry = JSON.parse(line.trim());
+                    // Error file format: { "custom_id": "...", "error": { "message": "...", "code": "..." } }
+                    if (errorEntry.error) {
+                        errors.push({
+                            customId: errorEntry.custom_id,
+                            message: errorEntry.error.message || 'Unknown error',
+                            code: errorEntry.error.code || 'unknown'
+                        });
+                    }
+                } catch (jsonError) {
+                    console.warn('Skipping malformed error JSON line:', line.substring(0, 100));
+                    continue;
+                }
+            }
+
+            return errors.length > 0 ? errors : null;
         }
 
         function escapeHtml(text) {
@@ -723,6 +760,7 @@
 
                 // Cache for completed batch review data
                 const cachedReviews = JSON.parse(localStorage.getItem('robocop_review_cache') || '{}');
+                const cachedErrors = JSON.parse(localStorage.getItem('robocop_error_cache') || '{}');
 
                 // Detect errors in batches
                 roboCopBatches.forEach(batch => {
@@ -757,7 +795,31 @@
                         }
                     });
 
-                await Promise.all(outputPromises);
+                // Fetch error files for batches with errors in parallel (only if not already cached)
+                const errorPromises = roboCopBatches
+                    .filter(batch => batch.hasErrors && batch.errorFileId)
+                    .map(async batch => {
+                        // Check if we already have cached error data for this batch
+                        if (cachedErrors[batch.id]) {
+                            batch.errorData = cachedErrors[batch.id];
+                            return;
+                        }
+
+                        try {
+                            const errorText = await fetchBatchError(batch.errorFileId);
+                            batch.errorData = parseErrorFromOutput(errorText);
+
+                            // Cache the error data
+                            if (batch.errorData) {
+                                cachedErrors[batch.id] = batch.errorData;
+                                localStorage.setItem('robocop_error_cache', JSON.stringify(cachedErrors));
+                            }
+                        } catch (e) {
+                            console.error(`Failed to fetch error file for batch ${batch.id}:`, e);
+                        }
+                    });
+
+                await Promise.all([...outputPromises, ...errorPromises]);
 
                 renderBatches(roboCopBatches);
                 
