@@ -22,7 +22,7 @@ impl fmt::Display for RobocopCommand {
 /// Parse a comment body for robocop commands
 ///
 /// Returns the first valid command found in the comment, or None if no command is found.
-/// Commands must start with @smaug123-robocop at the beginning of a line (after trimming leading whitespace).
+/// Commands must start with @smaug123-robocop at the beginning of a line (after trimming leading and trailing whitespace).
 pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
     for line in body.lines() {
         let trimmed = line.trim();

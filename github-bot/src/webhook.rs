@@ -445,6 +445,7 @@ async fn process_cancel_reviews(
 
     let mut cancelled_count = 0;
     let mut failed_cancellations = Vec::new();
+    let mut batches_to_remove = Vec::new();
 
     for (batch_id, _batch) in &batches_to_cancel {
         info!("Attempting to cancel batch {}", batch_id);
@@ -460,6 +461,7 @@ async fn process_cancel_reviews(
                     batch_id, cancel_response.status
                 );
                 cancelled_count += 1;
+                batches_to_remove.push(batch_id.clone());
             }
             Err(e) => {
                 warn!("Failed to cancel batch {}: {}", batch_id, e);
@@ -481,6 +483,7 @@ async fn process_cancel_reviews(
                                 batch_id, status_response.status
                             );
                             cancelled_count += 1; // Count as cancelled since it won't be processed
+                            batches_to_remove.push(batch_id.clone());
                         }
                     }
                     Err(e) => {
@@ -491,10 +494,10 @@ async fn process_cancel_reviews(
         }
     }
 
-    // Remove all batches from tracking
+    // Remove only successfully cancelled or terminal batches from tracking
     {
         let mut pending = state.pending_batches.write().await;
-        for (batch_id, _) in &batches_to_cancel {
+        for batch_id in &batches_to_remove {
             pending.remove(batch_id);
         }
     }
@@ -1009,20 +1012,7 @@ pub fn webhook_router(middleware_state: Arc<AppState>) -> Router<Arc<AppState>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::GitHubClient;
-    use crate::openai::OpenAIClient;
     use serde_json::json;
-
-    fn create_test_state(target_user_id: u64) -> Arc<AppState> {
-        Arc::new(AppState {
-            github_client: GitHubClient::new(123456, "test-key".to_string()),
-            openai_client: OpenAIClient::new("test-api-key".to_string()),
-            webhook_secret: "test-secret".to_string(),
-            target_user_id,
-            pending_batches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            recording_logger: None,
-        })
-    }
 
     fn create_comment_webhook_payload(
         action: &str,
