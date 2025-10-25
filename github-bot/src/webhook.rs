@@ -867,6 +867,9 @@ async fn cancel_superseded_batches(
         }
 
         // Check if the existing commit is an ancestor of the new commit
+        // is_ancestor(new_sha, existing_sha) returns true when existing_sha is an ancestor of new_sha
+        // In this case: is batch.head_sha (old commit) an ancestor of new_head_sha (new commit)?
+        // If true, the old batch is superseded by the new commit and should be cancelled.
         let is_ancestor_result = {
             let github_client = &state.github_client;
             GitOps::is_ancestor(
@@ -874,8 +877,8 @@ async fn cancel_superseded_batches(
                 installation_id,
                 repo_owner,
                 repo_name,
-                new_head_sha,
-                &batch.head_sha,
+                new_head_sha,    // The new commit (descendant)
+                &batch.head_sha, // The old commit (potential ancestor)
             )
             .await
         };

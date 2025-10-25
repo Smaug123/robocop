@@ -22,7 +22,8 @@ impl fmt::Display for RobocopCommand {
 /// Parse a comment body for robocop commands
 ///
 /// Returns the first valid command found in the comment, or None if no command is found.
-/// Commands must start with @smaug123-robocop at the beginning of a line (after trimming leading and trailing whitespace).
+/// Commands must start with @smaug123-robocop at the beginning of a line (after trimming leading and trailing whitespace),
+/// followed by whitespace and then the command name.
 pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
     for line in body.lines() {
         let trimmed = line.trim();
@@ -30,6 +31,19 @@ pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
         // Check if line starts with @smaug123-robocop (case-insensitive)
         let lowercase = trimmed.to_lowercase();
         if let Some(rest) = lowercase.strip_prefix("@smaug123-robocop") {
+            // Require whitespace boundary after the mention
+            // Accept only if rest is empty (just the mention) or starts with whitespace
+            if rest.is_empty() {
+                // Just "@smaug123-robocop" with no command
+                continue;
+            }
+
+            // Check if the first character after the mention is whitespace
+            if !rest.starts_with(|c: char| c.is_whitespace()) {
+                // No whitespace boundary, e.g., "@smaug123-robocopreview"
+                continue;
+            }
+
             let command_part = rest.trim();
 
             // Parse the command
@@ -119,6 +133,43 @@ mod tests {
         assert_eq!(
             parse_comment("@SmAuG123-RoBoCop review"),
             Some(RobocopCommand::Review)
+        );
+    }
+
+    #[test]
+    fn test_requires_whitespace_boundary() {
+        // Mention must be followed by whitespace before the command
+        assert_eq!(
+            parse_comment("@smaug123-robocopreview"),
+            None,
+            "Should reject mention without whitespace separator"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocopcancel"),
+            None,
+            "Should reject mention without whitespace separator"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop-review"),
+            None,
+            "Should reject mention with hyphen separator instead of whitespace"
+        );
+
+        // Valid commands with whitespace
+        assert_eq!(
+            parse_comment("@smaug123-robocop review"),
+            Some(RobocopCommand::Review),
+            "Should accept command with space separator"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop\treview"),
+            Some(RobocopCommand::Review),
+            "Should accept command with tab separator"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop  review"),
+            Some(RobocopCommand::Review),
+            "Should accept command with multiple spaces"
         );
     }
 }
