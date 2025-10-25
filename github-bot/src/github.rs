@@ -118,6 +118,20 @@ struct AppInfoResponse {
     slug: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PullRequestResponse {
+    pub number: u64,
+    pub head: PullRequestRefResponse,
+    pub base: PullRequestRefResponse,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PullRequestRefResponse {
+    pub sha: String,
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+}
+
 impl GitHubClient {
     pub fn new(app_id: u64, private_key: String) -> Self {
         Self::new_with_recording(app_id, private_key, None)
@@ -947,6 +961,67 @@ impl GitHubClient {
             )
             .await?;
         Ok(new_comment.id)
+    }
+
+    pub async fn get_pull_request(
+        &self,
+        correlation_id: Option<&str>,
+        installation_id: u64,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: u64,
+    ) -> Result<PullRequestResponse> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}",
+            repo_owner, repo_name, pr_number
+        );
+
+        info!(
+            "Fetching PR #{} from {}/{}",
+            pr_number, repo_owner, repo_name
+        );
+
+        let token = self.get_installation_token(installation_id).await?;
+        let mut request_builder = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github.v3+json");
+
+        if let Some(cid) = correlation_id {
+            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .context("Failed to send get pull request request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .context("Failed to read error response body")?;
+            error!("GitHub API error fetching PR: {} - {}", status, error_text);
+            return Err(anyhow!(
+                "GitHub API error fetching PR: {} - {}",
+                status,
+                error_text
+            ));
+        }
+
+        let pr_response: PullRequestResponse = response
+            .json()
+            .await
+            .context("Failed to parse pull request response")?;
+
+        info!(
+            "Successfully fetched PR #{} (head: {}, base: {})",
+            pr_response.number, pr_response.head.sha, pr_response.base.sha
+        );
+
+        Ok(pr_response)
     }
 
     pub async fn compare_commits(
