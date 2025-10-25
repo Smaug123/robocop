@@ -530,7 +530,7 @@
                     const result = JSON.parse(line.trim());
                     if (result.custom_id === 'robocop-review-1') {
                         // Check for HTTP error status codes in the response
-                        if (result.response?.status_code && result.response.status_code !== 200) {
+                        if (result.response && typeof result.response.status_code === 'number' && result.response.status_code !== 200) {
                             return {
                                 isHttpError: true,
                                 statusCode: result.response.status_code,
@@ -576,7 +576,7 @@
                     const errorEntry = JSON.parse(line.trim());
 
                     // Handle HTTP error status codes (e.g., {"response": {"status_code": 503, ...}, "error": null})
-                    if (errorEntry.response?.status_code && errorEntry.response.status_code !== 200) {
+                    if (errorEntry.response && typeof errorEntry.response.status_code === 'number' && errorEntry.response.status_code !== 200) {
                         errors.push({
                             customId: errorEntry.custom_id,
                             message: `HTTP ${errorEntry.response.status_code} error`,
