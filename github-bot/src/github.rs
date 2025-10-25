@@ -1003,10 +1003,7 @@ impl GitHubClient {
                 .text()
                 .await
                 .context("Failed to read error response body")?;
-            error!(
-                "GitHub API error fetching PR: {} - {}",
-                status, error_text
-            );
+            error!("GitHub API error fetching PR: {} - {}", status, error_text);
             return Err(anyhow!(
                 "GitHub API error fetching PR: {} - {}",
                 status,

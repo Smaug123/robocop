@@ -404,10 +404,9 @@ async fn process_cancel_reviews(
 
         // Post a comment indicating there are no reviews to cancel
         let version = crate::get_bot_version();
-        let no_reviews_content = format!(
-            "ℹ️ **No reviews to cancel**\n\n\
+        let no_reviews_content = "ℹ️ **No reviews to cancel**\n\n\
             There are no pending reviews for this pull request."
-        );
+            .to_string();
 
         let pr_info = PullRequestInfo {
             installation_id,
@@ -436,7 +435,11 @@ async fn process_cancel_reviews(
     for (batch_id, _batch) in &batches_to_cancel {
         info!("Attempting to cancel batch {}", batch_id);
 
-        match state.openai_client.cancel_batch(correlation_id, batch_id).await {
+        match state
+            .openai_client
+            .cancel_batch(correlation_id, batch_id)
+            .await
+        {
             Ok(cancel_response) => {
                 info!(
                     "Successfully cancelled batch {} (status: {})",
@@ -449,13 +452,20 @@ async fn process_cancel_reviews(
                 failed_cancellations.push((batch_id.clone(), e.to_string()));
 
                 // Check if batch is already completed/failed/cancelled
-                match state.openai_client.get_batch(correlation_id, batch_id).await {
+                match state
+                    .openai_client
+                    .get_batch(correlation_id, batch_id)
+                    .await
+                {
                     Ok(status_response) => {
                         if matches!(
                             status_response.status.as_str(),
                             "completed" | "failed" | "cancelled" | "expired"
                         ) {
-                            info!("Batch {} is already in terminal state: {}", batch_id, status_response.status);
+                            info!(
+                                "Batch {} is already in terminal state: {}",
+                                batch_id, status_response.status
+                            );
                             cancelled_count += 1; // Count as cancelled since it won't be processed
                         }
                     }
