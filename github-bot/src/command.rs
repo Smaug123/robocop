@@ -22,13 +22,14 @@ impl fmt::Display for RobocopCommand {
 /// Parse a comment body for robocop commands
 ///
 /// Returns the first valid command found in the comment, or None if no command is found.
-/// Commands must start with @smaug123-robocop at the beginning of a line.
+/// Commands must start with @smaug123-robocop at the beginning of a line (after trimming leading whitespace).
 pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
     for line in body.lines() {
         let trimmed = line.trim();
 
-        // Check if line starts with @smaug123-robocop
-        if let Some(rest) = trimmed.strip_prefix("@smaug123-robocop") {
+        // Check if line starts with @smaug123-robocop (case-insensitive)
+        let lowercase = trimmed.to_lowercase();
+        if let Some(rest) = lowercase.strip_prefix("@smaug123-robocop") {
             let command_part = rest.trim();
 
             // Parse the command
@@ -101,6 +102,23 @@ mod tests {
         assert_eq!(
             parse_comment("I think @smaug123-robocop review would be great"),
             None
+        );
+    }
+
+    #[test]
+    fn test_case_insensitive_mention() {
+        // The mention should be case-insensitive
+        assert_eq!(
+            parse_comment("@Smaug123-Robocop review"),
+            Some(RobocopCommand::Review)
+        );
+        assert_eq!(
+            parse_comment("@SMAUG123-ROBOCOP cancel"),
+            Some(RobocopCommand::Cancel)
+        );
+        assert_eq!(
+            parse_comment("@SmAuG123-RoBoCop review"),
+            Some(RobocopCommand::Review)
         );
     }
 }
