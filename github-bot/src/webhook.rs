@@ -319,7 +319,37 @@ pub async fn github_webhook_handler(
                                 }
                             }
                             command::RobocopCommand::Cancel => {
-                                info!("@robocop cancel command not yet implemented");
+                                info!("Processing @robocop cancel command");
+
+                                if let (Some(repo), Some(installation)) =
+                                    (payload.repository.clone(), &payload.installation)
+                                {
+                                    let state_clone = state.clone();
+                                    let issue_number = issue.number;
+                                    let installation_id = installation.id;
+                                    let correlation_id_clone = correlation_id.clone();
+
+                                    tokio::spawn(async move {
+                                        info!(
+                                            "Spawned background task to cancel reviews for PR #{}",
+                                            issue_number
+                                        );
+
+                                        if let Err(e) = process_cancel_reviews(
+                                            correlation_id_clone.as_deref(),
+                                            state_clone,
+                                            installation_id,
+                                            repo,
+                                            issue_number,
+                                        )
+                                        .await
+                                        {
+                                            error!("Failed to cancel reviews: {}", e);
+                                        }
+                                    });
+                                } else {
+                                    warn!("Missing repository or installation info for cancel command");
+                                }
                             }
                         }
                     }
@@ -338,6 +368,157 @@ pub async fn github_webhook_handler(
     Ok(Json(WebhookResponse {
         message: "Webhook received".to_string(),
     }))
+}
+
+async fn process_cancel_reviews(
+    correlation_id: Option<&str>,
+    state: Arc<AppState>,
+    installation_id: u64,
+    repo: Repository,
+    pr_number: u64,
+) -> anyhow::Result<()> {
+    info!(
+        "Cancelling all pending reviews for PR #{} in {}",
+        pr_number, repo.full_name
+    );
+
+    let repo_owner = &repo.owner.login;
+    let repo_name = &repo.name;
+
+    // Get all pending batches for this PR
+    let batches_to_cancel: Vec<(String, crate::PendingBatch)> = {
+        let pending = state.pending_batches.read().await;
+        pending
+            .iter()
+            .filter(|(_, batch)| {
+                batch.pr_number == pr_number
+                    && batch.repo_owner == *repo_owner
+                    && batch.repo_name == *repo_name
+            })
+            .map(|(id, batch)| (id.clone(), batch.clone()))
+            .collect()
+    };
+
+    if batches_to_cancel.is_empty() {
+        info!("No pending batches found for PR #{}", pr_number);
+
+        // Post a comment indicating there are no reviews to cancel
+        let version = crate::get_bot_version();
+        let no_reviews_content = format!(
+            "ℹ️ **No reviews to cancel**\n\n\
+            There are no pending reviews for this pull request."
+        );
+
+        let pr_info = PullRequestInfo {
+            installation_id,
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            pr_number,
+        };
+
+        state
+            .github_client
+            .manage_robocop_comment(correlation_id, &pr_info, &no_reviews_content, &version)
+            .await?;
+
+        return Ok(());
+    }
+
+    info!(
+        "Found {} pending batches to cancel for PR #{}",
+        batches_to_cancel.len(),
+        pr_number
+    );
+
+    let mut cancelled_count = 0;
+    let mut failed_cancellations = Vec::new();
+
+    for (batch_id, _batch) in &batches_to_cancel {
+        info!("Attempting to cancel batch {}", batch_id);
+
+        match state.openai_client.cancel_batch(correlation_id, batch_id).await {
+            Ok(cancel_response) => {
+                info!(
+                    "Successfully cancelled batch {} (status: {})",
+                    batch_id, cancel_response.status
+                );
+                cancelled_count += 1;
+            }
+            Err(e) => {
+                warn!("Failed to cancel batch {}: {}", batch_id, e);
+                failed_cancellations.push((batch_id.clone(), e.to_string()));
+
+                // Check if batch is already completed/failed/cancelled
+                match state.openai_client.get_batch(correlation_id, batch_id).await {
+                    Ok(status_response) => {
+                        if matches!(
+                            status_response.status.as_str(),
+                            "completed" | "failed" | "cancelled" | "expired"
+                        ) {
+                            info!("Batch {} is already in terminal state: {}", batch_id, status_response.status);
+                            cancelled_count += 1; // Count as cancelled since it won't be processed
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to check status of batch {}: {}", batch_id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove all batches from tracking
+    {
+        let mut pending = state.pending_batches.write().await;
+        for (batch_id, _) in &batches_to_cancel {
+            pending.remove(batch_id);
+        }
+    }
+
+    info!(
+        "Cancelled {}/{} batches for PR #{}",
+        cancelled_count,
+        batches_to_cancel.len(),
+        pr_number
+    );
+
+    // Post a comment with cancellation results
+    let version = crate::get_bot_version();
+    let cancellation_content = if failed_cancellations.is_empty() {
+        format!(
+            "✅ **Reviews cancelled**\n\n\
+            Successfully cancelled {} pending review{}.",
+            cancelled_count,
+            if cancelled_count == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "⚠️ **Reviews partially cancelled**\n\n\
+            Successfully cancelled {}/{} pending reviews.\n\n\
+            **Failed cancellations:**\n{}",
+            cancelled_count,
+            batches_to_cancel.len(),
+            failed_cancellations
+                .iter()
+                .map(|(id, err)| format!("- Batch `{}`: {}", id, err))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+
+    let pr_info = PullRequestInfo {
+        installation_id,
+        repo_owner: repo_owner.to_string(),
+        repo_name: repo_name.to_string(),
+        pr_number,
+    };
+
+    state
+        .github_client
+        .manage_robocop_comment(correlation_id, &pr_info, &cancellation_content, &version)
+        .await?;
+
+    Ok(())
 }
 
 async fn process_manual_review(
