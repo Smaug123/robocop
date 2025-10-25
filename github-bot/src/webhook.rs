@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::command;
 use crate::git::GitOps;
 use crate::github::{FileContentRequest, FileSizeLimits, PullRequestInfo};
 use crate::openai::ReviewMetadata;
@@ -279,10 +280,49 @@ pub async fn github_webhook_handler(
                         comment.user.login
                     );
 
-                    info!(
-                        "Comment body preview: {}",
-                        comment.body.lines().next().unwrap_or("")
-                    );
+                    // Parse the comment for robocop commands
+                    if let Some(robocop_command) = command::parse_comment(&comment.body) {
+                        info!("Found robocop command: {}", robocop_command);
+
+                        match robocop_command {
+                            command::RobocopCommand::Review => {
+                                info!("Processing @robocop review command");
+
+                                if let (Some(repo), Some(installation)) =
+                                    (payload.repository.clone(), &payload.installation)
+                                {
+                                    let state_clone = state.clone();
+                                    let issue_number = issue.number;
+                                    let installation_id = installation.id;
+                                    let correlation_id_clone = correlation_id.clone();
+
+                                    tokio::spawn(async move {
+                                        info!(
+                                            "Spawned background task for manual review of PR #{}",
+                                            issue_number
+                                        );
+
+                                        if let Err(e) = process_manual_review(
+                                            correlation_id_clone.as_deref(),
+                                            state_clone,
+                                            installation_id,
+                                            repo,
+                                            issue_number,
+                                        )
+                                        .await
+                                        {
+                                            error!("Failed to process manual review: {}", e);
+                                        }
+                                    });
+                                } else {
+                                    warn!("Missing repository or installation info for review command");
+                                }
+                            }
+                            command::RobocopCommand::Cancel => {
+                                info!("@robocop cancel command not yet implemented");
+                            }
+                        }
+                    }
                 } else {
                     info!("Comment is on an issue, not a PR, ignoring");
                 }
@@ -298,6 +338,48 @@ pub async fn github_webhook_handler(
     Ok(Json(WebhookResponse {
         message: "Webhook received".to_string(),
     }))
+}
+
+async fn process_manual_review(
+    correlation_id: Option<&str>,
+    state: Arc<AppState>,
+    installation_id: u64,
+    repo: Repository,
+    pr_number: u64,
+) -> anyhow::Result<()> {
+    info!(
+        "Processing manual review request for PR #{} in {}",
+        pr_number, repo.full_name
+    );
+
+    let github_client = &state.github_client;
+
+    // Fetch PR details to get head and base SHAs
+    let pr_details = github_client
+        .get_pull_request(
+            correlation_id,
+            installation_id,
+            &repo.owner.login,
+            &repo.name,
+            pr_number,
+        )
+        .await?;
+
+    // Convert to PullRequest type for process_code_review
+    let pr = PullRequest {
+        number: pr_details.number,
+        head: PullRequestRef {
+            sha: pr_details.head.sha,
+            ref_name: pr_details.head.ref_name,
+        },
+        base: PullRequestRef {
+            sha: pr_details.base.sha,
+            ref_name: pr_details.base.ref_name,
+        },
+    };
+
+    // Use the existing code review logic
+    process_code_review(correlation_id, state, installation_id, repo, pr).await
 }
 
 async fn process_code_review(
