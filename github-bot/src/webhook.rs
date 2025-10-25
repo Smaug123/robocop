@@ -1105,8 +1105,7 @@ mod tests {
         // comment.user.id == state.target_user_id
         // This test verifies we have the data structures to perform that check.
         assert_ne!(
-            comment_target.user.id,
-            comment_unauthorized.user.id,
+            comment_target.user.id, comment_unauthorized.user.id,
             "User IDs should be different for authorization testing"
         );
     }
