@@ -991,3 +991,161 @@ pub fn webhook_router(middleware_state: Arc<AppState>) -> Router<Arc<AppState>> 
             verify_webhook_signature,
         ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::GitHubClient;
+    use crate::openai::OpenAIClient;
+    use serde_json::json;
+
+    fn create_test_state(target_user_id: u64) -> Arc<AppState> {
+        Arc::new(AppState {
+            github_client: GitHubClient::new(123456, "test-key".to_string()),
+            openai_client: OpenAIClient::new("test-api-key".to_string()),
+            webhook_secret: "test-secret".to_string(),
+            target_user_id,
+            pending_batches: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            recording_logger: None,
+        })
+    }
+
+    fn create_comment_webhook_payload(
+        action: &str,
+        comment_body: &str,
+        comment_user_id: u64,
+        comment_user_login: &str,
+        pr_number: u64,
+    ) -> GitHubWebhookPayload {
+        GitHubWebhookPayload {
+            action: Some(action.to_string()),
+            pull_request: None,
+            repository: Some(Repository {
+                name: "test-repo".to_string(),
+                full_name: "test-owner/test-repo".to_string(),
+                owner: User {
+                    id: 12345,
+                    login: "test-owner".to_string(),
+                },
+            }),
+            sender: Some(User {
+                id: comment_user_id,
+                login: comment_user_login.to_string(),
+            }),
+            installation: Some(Installation { id: 67890 }),
+            comment: Some(Comment {
+                id: 999,
+                body: comment_body.to_string(),
+                user: User {
+                    id: comment_user_id,
+                    login: comment_user_login.to_string(),
+                },
+            }),
+            issue: Some(Issue {
+                number: pr_number,
+                pull_request: Some(PullRequestLink {
+                    url: format!("https://api.github.com/repos/test-owner/test-repo/pulls/{}", pr_number),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_comment_events_check_user_authorization() {
+        // This test verifies that the webhook handler code checks user authorization
+        // for comment events, just like it does for PR events.
+        //
+        // SECURITY REQUIREMENT: Only the configured target_user_id should be able to
+        // trigger @robocop commands via PR comments. This prevents unauthorized users
+        // from depleting OpenAI credits.
+        //
+        // This test inspects the source code to verify the authorization check exists.
+
+        let source_code = include_str!("webhook.rs");
+
+        // Find the comment event handler section (action == "created")
+        let comment_section_start = source_code
+            .find(r#"Some("created") =>"#)
+            .expect("Could not find comment event handler");
+
+        // Find the end of the comment section (next match arm or end of match)
+        let after_comment_section = &source_code[comment_section_start..];
+        let comment_section_end = after_comment_section
+            .find("\n        _ =>")
+            .expect("Could not find end of comment event handler");
+
+        let comment_handler_code = &after_comment_section[..comment_section_end];
+
+        // CRITICAL CHECK: The comment handler MUST check if comment.user.id == state.target_user_id
+        // just like the PR event handler does (see line 217: "if sender.id == state.target_user_id")
+
+        // Check that we're verifying the user ID before processing commands
+        let has_user_check = comment_handler_code.contains("comment.user.id")
+            && comment_handler_code.contains("target_user_id");
+
+        assert!(
+            has_user_check,
+            "SECURITY BUG: Comment event handler does not check if comment.user.id == state.target_user_id!\n\
+            This allows ANY GitHub user to trigger @robocop commands and deplete OpenAI credits.\n\n\
+            The fix should add a check like:\n\
+            if comment.user.id == state.target_user_id {{\n\
+                // process commands\n\
+            }} else {{\n\
+                info!(\"Ignoring command from unauthorized user\");\n\
+            }}\n\n\
+            Compare with PR event handler at line 217 which correctly checks: sender.id == state.target_user_id"
+        );
+    }
+
+    #[test]
+    fn test_webhook_payload_deserialization() {
+        // Test that we can deserialize a comment webhook payload correctly
+        let json_payload = json!({
+            "action": "created",
+            "comment": {
+                "id": 123,
+                "body": "@robocop review",
+                "user": {
+                    "id": 456,
+                    "login": "test-user"
+                }
+            },
+            "issue": {
+                "number": 789,
+                "pull_request": {
+                    "url": "https://api.github.com/repos/owner/repo/pulls/789"
+                }
+            },
+            "repository": {
+                "name": "repo",
+                "full_name": "owner/repo",
+                "owner": {
+                    "id": 111,
+                    "login": "owner"
+                }
+            },
+            "sender": {
+                "id": 456,
+                "login": "test-user"
+            },
+            "installation": {
+                "id": 999
+            }
+        });
+
+        let payload: Result<GitHubWebhookPayload, _> = serde_json::from_value(json_payload);
+        assert!(payload.is_ok());
+
+        let payload = payload.unwrap();
+        assert_eq!(payload.action, Some("created".to_string()));
+        assert!(payload.comment.is_some());
+        assert!(payload.issue.is_some());
+
+        let comment = payload.comment.unwrap();
+        assert_eq!(comment.body, "@robocop review");
+        assert_eq!(comment.user.id, 456);
+
+        let sender = payload.sender.unwrap();
+        assert_eq!(sender.id, 456);
+    }
+}
