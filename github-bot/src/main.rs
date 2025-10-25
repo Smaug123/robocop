@@ -26,7 +26,7 @@ use github_bot::AppState;
 async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(json!({
         "status": "healthy",
-        "service": "github-bot"
+        "service": "robocop"
     })))
 }
 
@@ -37,8 +37,8 @@ async fn help_handler(headers: HeaderMap) -> Response {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
 
-    // If client prefers HTML, serve HTML
-    if accept.contains("text/html") {
+    // If client prefers HTML, serve HTML (case-insensitive check)
+    if accept.to_lowercase().contains("text/html") {
         let html = generate_help_html();
         return Html(html).into_response();
     }
@@ -46,7 +46,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
     // Default to JSON
     let version = github_bot::get_bot_version();
     let json_data = json!({
-        "service": "GitHub Code Review Bot",
+        "service": "robocop",
         "version": version,
         "description": "Automated code reviews using OpenAI's batch API",
         "endpoints": [
@@ -94,7 +94,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
                 "RECORDING_LOG_PATH (default: recordings.jsonl)"
             ]
         },
-        "documentation": "https://github.com/your-repo/robocop"
+        "documentation": "https://github.com/Smaug123/robocop"
     });
 
     Json(json_data).into_response()
