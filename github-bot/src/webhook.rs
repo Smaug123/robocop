@@ -294,7 +294,7 @@ pub async fn github_webhook_handler(
 
                             match robocop_command {
                                 command::RobocopCommand::Review => {
-                                    info!("Processing @robocop review command");
+                                    info!("Processing @smaug123-robocop review command");
 
                                     if let (Some(repo), Some(installation)) =
                                         (payload.repository.clone(), &payload.installation)
@@ -327,7 +327,7 @@ pub async fn github_webhook_handler(
                                     }
                                 }
                                 command::RobocopCommand::Cancel => {
-                                    info!("Processing @robocop cancel command");
+                                    info!("Processing @smaug123-robocop cancel command");
 
                                     if let (Some(repo), Some(installation)) =
                                         (payload.repository.clone(), &payload.installation)
@@ -1121,7 +1121,7 @@ mod tests {
             "action": "created",
             "comment": {
                 "id": 123,
-                "body": "@robocop review",
+                "body": "@smaug123-robocop review",
                 "user": {
                     "id": 456,
                     "login": "test-user"
@@ -1159,7 +1159,7 @@ mod tests {
         assert!(payload.issue.is_some());
 
         let comment = payload.comment.unwrap();
-        assert_eq!(comment.body, "@robocop review");
+        assert_eq!(comment.body, "@smaug123-robocop review");
         assert_eq!(comment.user.id, 456);
 
         let sender = payload.sender.unwrap();

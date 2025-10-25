@@ -1,4 +1,4 @@
-/// Command parsing for @robocop mentions in comments
+/// Command parsing for @smaug123-robocop mentions in comments
 use std::fmt;
 
 /// A parsed robocop command from a comment
@@ -22,13 +22,13 @@ impl fmt::Display for RobocopCommand {
 /// Parse a comment body for robocop commands
 ///
 /// Returns the first valid command found in the comment, or None if no command is found.
-/// Commands must start with @robocop at the beginning of a line.
+/// Commands must start with @smaug123-robocop at the beginning of a line.
 pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
     for line in body.lines() {
         let trimmed = line.trim();
 
-        // Check if line starts with @robocop
-        if let Some(rest) = trimmed.strip_prefix("@robocop") {
+        // Check if line starts with @smaug123-robocop
+        if let Some(rest) = trimmed.strip_prefix("@smaug123-robocop") {
             let command_part = rest.trim();
 
             // Parse the command
@@ -50,15 +50,15 @@ mod tests {
     #[test]
     fn test_parse_review_command() {
         assert_eq!(
-            parse_comment("@robocop review"),
+            parse_comment("@smaug123-robocop review"),
             Some(RobocopCommand::Review)
         );
         assert_eq!(
-            parse_comment("@robocop Review"),
+            parse_comment("@smaug123-robocop Review"),
             Some(RobocopCommand::Review)
         );
         assert_eq!(
-            parse_comment("  @robocop review  "),
+            parse_comment("  @smaug123-robocop review  "),
             Some(RobocopCommand::Review)
         );
     }
@@ -66,40 +66,40 @@ mod tests {
     #[test]
     fn test_parse_cancel_command() {
         assert_eq!(
-            parse_comment("@robocop cancel"),
+            parse_comment("@smaug123-robocop cancel"),
             Some(RobocopCommand::Cancel)
         );
         assert_eq!(
-            parse_comment("@robocop Cancel"),
+            parse_comment("@smaug123-robocop Cancel"),
             Some(RobocopCommand::Cancel)
         );
     }
 
     #[test]
     fn test_parse_multiline_comment() {
-        let comment = "Hey there,\n\n@robocop review\n\nThanks!";
+        let comment = "Hey there,\n\n@smaug123-robocop review\n\nThanks!";
         assert_eq!(parse_comment(comment), Some(RobocopCommand::Review));
     }
 
     #[test]
     fn test_no_command() {
         assert_eq!(parse_comment("This is just a regular comment"), None);
-        assert_eq!(parse_comment("robocop review"), None); // Missing @
-        assert_eq!(parse_comment("@robocop"), None); // No command
-        assert_eq!(parse_comment("@robocop unknown"), None); // Invalid command
+        assert_eq!(parse_comment("smaug123-robocop review"), None); // Missing @
+        assert_eq!(parse_comment("@smaug123-robocop"), None); // No command
+        assert_eq!(parse_comment("@smaug123-robocop unknown"), None); // Invalid command
     }
 
     #[test]
     fn test_first_command_wins() {
-        let comment = "@robocop review\n@robocop cancel";
+        let comment = "@smaug123-robocop review\n@smaug123-robocop cancel";
         assert_eq!(parse_comment(comment), Some(RobocopCommand::Review));
     }
 
     #[test]
     fn test_midline_mention_ignored() {
-        // @robocop must be at the start of a line
+        // @smaug123-robocop must be at the start of a line
         assert_eq!(
-            parse_comment("I think @robocop review would be great"),
+            parse_comment("I think @smaug123-robocop review would be great"),
             None
         );
     }
