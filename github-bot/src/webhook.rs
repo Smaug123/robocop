@@ -284,73 +284,87 @@ pub async fn github_webhook_handler(
                     if let Some(robocop_command) = command::parse_comment(&comment.body) {
                         info!("Found robocop command: {}", robocop_command);
 
-                        match robocop_command {
-                            command::RobocopCommand::Review => {
-                                info!("Processing @robocop review command");
+                        // SECURITY: Only process commands from the configured target user
+                        // to prevent unauthorized users from depleting OpenAI credits
+                        if comment.user.id == state.target_user_id {
+                            info!(
+                                "Command from target user detected (ID: {}, username: {}), processing...",
+                                comment.user.id, comment.user.login
+                            );
 
-                                if let (Some(repo), Some(installation)) =
-                                    (payload.repository.clone(), &payload.installation)
-                                {
-                                    let state_clone = state.clone();
-                                    let issue_number = issue.number;
-                                    let installation_id = installation.id;
-                                    let correlation_id_clone = correlation_id.clone();
+                            match robocop_command {
+                                command::RobocopCommand::Review => {
+                                    info!("Processing @robocop review command");
 
-                                    tokio::spawn(async move {
-                                        info!(
-                                            "Spawned background task for manual review of PR #{}",
-                                            issue_number
-                                        );
+                                    if let (Some(repo), Some(installation)) =
+                                        (payload.repository.clone(), &payload.installation)
+                                    {
+                                        let state_clone = state.clone();
+                                        let issue_number = issue.number;
+                                        let installation_id = installation.id;
+                                        let correlation_id_clone = correlation_id.clone();
 
-                                        if let Err(e) = process_manual_review(
-                                            correlation_id_clone.as_deref(),
-                                            state_clone,
-                                            installation_id,
-                                            repo,
-                                            issue_number,
-                                        )
-                                        .await
-                                        {
-                                            error!("Failed to process manual review: {}", e);
-                                        }
-                                    });
-                                } else {
-                                    warn!("Missing repository or installation info for review command");
+                                        tokio::spawn(async move {
+                                            info!(
+                                                "Spawned background task for manual review of PR #{}",
+                                                issue_number
+                                            );
+
+                                            if let Err(e) = process_manual_review(
+                                                correlation_id_clone.as_deref(),
+                                                state_clone,
+                                                installation_id,
+                                                repo,
+                                                issue_number,
+                                            )
+                                            .await
+                                            {
+                                                error!("Failed to process manual review: {}", e);
+                                            }
+                                        });
+                                    } else {
+                                        warn!("Missing repository or installation info for review command");
+                                    }
+                                }
+                                command::RobocopCommand::Cancel => {
+                                    info!("Processing @robocop cancel command");
+
+                                    if let (Some(repo), Some(installation)) =
+                                        (payload.repository.clone(), &payload.installation)
+                                    {
+                                        let state_clone = state.clone();
+                                        let issue_number = issue.number;
+                                        let installation_id = installation.id;
+                                        let correlation_id_clone = correlation_id.clone();
+
+                                        tokio::spawn(async move {
+                                            info!(
+                                                "Spawned background task to cancel reviews for PR #{}",
+                                                issue_number
+                                            );
+
+                                            if let Err(e) = process_cancel_reviews(
+                                                correlation_id_clone.as_deref(),
+                                                state_clone,
+                                                installation_id,
+                                                repo,
+                                                issue_number,
+                                            )
+                                            .await
+                                            {
+                                                error!("Failed to cancel reviews: {}", e);
+                                            }
+                                        });
+                                    } else {
+                                        warn!("Missing repository or installation info for cancel command");
+                                    }
                                 }
                             }
-                            command::RobocopCommand::Cancel => {
-                                info!("Processing @robocop cancel command");
-
-                                if let (Some(repo), Some(installation)) =
-                                    (payload.repository.clone(), &payload.installation)
-                                {
-                                    let state_clone = state.clone();
-                                    let issue_number = issue.number;
-                                    let installation_id = installation.id;
-                                    let correlation_id_clone = correlation_id.clone();
-
-                                    tokio::spawn(async move {
-                                        info!(
-                                            "Spawned background task to cancel reviews for PR #{}",
-                                            issue_number
-                                        );
-
-                                        if let Err(e) = process_cancel_reviews(
-                                            correlation_id_clone.as_deref(),
-                                            state_clone,
-                                            installation_id,
-                                            repo,
-                                            issue_number,
-                                        )
-                                        .await
-                                        {
-                                            error!("Failed to cancel reviews: {}", e);
-                                        }
-                                    });
-                                } else {
-                                    warn!("Missing repository or installation info for cancel command");
-                                }
-                            }
+                        } else {
+                            info!(
+                                "Command from different user (ID: {}, username: {}), ignoring",
+                                comment.user.id, comment.user.login
+                            );
                         }
                     }
                 } else {
@@ -1044,7 +1058,10 @@ mod tests {
             issue: Some(Issue {
                 number: pr_number,
                 pull_request: Some(PullRequestLink {
-                    url: format!("https://api.github.com/repos/test-owner/test-repo/pulls/{}", pr_number),
+                    url: format!(
+                        "https://api.github.com/repos/test-owner/test-repo/pulls/{}",
+                        pr_number
+                    ),
                 }),
             }),
         }
