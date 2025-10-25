@@ -525,12 +525,24 @@
             const lines = outputText.trim().split('\n');
             for (const line of lines) {
                 if (!line.trim()) continue;
-                
+
                 try {
                     const result = JSON.parse(line.trim());
-                    if (result.custom_id === 'robocop-review-1' && result.response?.body?.choices?.[0]?.message?.content) {
-                        const content = result.response.body.choices[0].message.content;
-                        return parseJsonContent(content);
+                    if (result.custom_id === 'robocop-review-1') {
+                        // Check for HTTP error status codes in the response
+                        if (result.response?.status_code && result.response.status_code !== 200) {
+                            return {
+                                isHttpError: true,
+                                statusCode: result.response.status_code,
+                                requestId: result.response.request_id || 'N/A'
+                            };
+                        }
+
+                        // Check for successful response with content
+                        if (result.response?.body?.choices?.[0]?.message?.content) {
+                            const content = result.response.body.choices[0].message.content;
+                            return parseJsonContent(content);
+                        }
                     }
                 } catch (jsonError) {
                     // Skip malformed JSON lines and continue processing other lines
@@ -538,7 +550,7 @@
                     continue;
                 }
             }
-            
+
             // Log if no valid review was found in any line
             console.warn('No valid robocop review found in output');
             return null;
@@ -562,8 +574,19 @@
 
                 try {
                     const errorEntry = JSON.parse(line.trim());
-                    // Error file format: { "custom_id": "...", "error": { "message": "...", "code": "..." } }
-                    if (errorEntry.error) {
+
+                    // Handle HTTP error status codes (e.g., {"response": {"status_code": 503, ...}, "error": null})
+                    if (errorEntry.response?.status_code && errorEntry.response.status_code !== 200) {
+                        errors.push({
+                            customId: errorEntry.custom_id,
+                            message: `HTTP ${errorEntry.response.status_code} error`,
+                            code: `http_${errorEntry.response.status_code}`,
+                            statusCode: errorEntry.response.status_code,
+                            requestId: errorEntry.response.request_id
+                        });
+                    }
+                    // Handle traditional error format: { "custom_id": "...", "error": { "message": "...", "code": "..." } }
+                    else if (errorEntry.error) {
                         errors.push({
                             customId: errorEntry.custom_id,
                             message: errorEntry.error.message || 'Unknown error',
@@ -655,6 +678,40 @@
         }
 
         function renderReview(batch) {
+            // Handle HTTP error status codes (e.g., 503 Service Unavailable)
+            if (batch.reviewData?.isHttpError) {
+                const normalizedBatchId = normalizeId(batch.id);
+                const rawBatchId = batch.id;
+                const statusCode = batch.reviewData.statusCode;
+                const requestId = batch.reviewData.requestId;
+
+                return `
+                    <button
+                        id="btn-${normalizedBatchId}"
+                        data-batch-id="${rawBatchId}"
+                        class="text-blue-600 hover:text-blue-800 font-medium text-sm review-toggle-btn"
+                    >
+                        ▶ Show
+                    </button>
+                    <span class="text-red-600 ml-2 text-sm font-semibold">HTTP Error ${statusCode}</span>
+                    <div id="review-${normalizedBatchId}" class="review-content mt-2">
+                        <div class="bg-red-50 rounded p-3 mt-2 text-sm border border-red-200">
+                            <div class="mb-2">
+                                <strong class="text-red-800">HTTP Error Response</strong>
+                            </div>
+                            <div class="mb-2">
+                                <strong class="text-gray-700">Status Code:</strong>
+                                <span class="text-red-600 font-semibold">${statusCode}</span>
+                            </div>
+                            <div class="mb-2">
+                                <strong class="text-gray-700">Request ID:</strong>
+                                <code class="text-xs bg-white px-1 py-0.5 rounded">${escapeHtml(requestId)}</code>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
             // Handle error state - batch completed but had errors
             if (batch.hasErrors) {
                 const normalizedBatchId = normalizeId(batch.id);
@@ -669,6 +726,18 @@
                     errorDetailsHtml = batch.errorData.map(error => {
                         const escapedMessage = escapeHtml(error.message);
                         const escapedCode = escapeHtml(error.code);
+
+                        // If this is an HTTP error, show status code prominently
+                        if (error.statusCode) {
+                            const escapedRequestId = escapeHtml(error.requestId || 'N/A');
+                            return `<div class="mb-2 p-2 bg-white rounded border border-red-200">
+                                <div><strong>HTTP Status Code:</strong> <span class="text-red-600 font-semibold">${error.statusCode}</span></div>
+                                <div><strong>Request ID:</strong> <code class="text-xs bg-gray-50 px-1 py-0.5 rounded">${escapedRequestId}</code></div>
+                                <div class="text-gray-600 text-sm mt-1">${escapedMessage}</div>
+                            </div>`;
+                        }
+
+                        // Traditional error format
                         return `<div class="mb-2 p-2 bg-white rounded border border-red-200">
                             <div><strong>Error Code:</strong> ${escapedCode}</div>
                             <div><strong>Message:</strong> ${escapedMessage}</div>
