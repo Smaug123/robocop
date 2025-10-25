@@ -77,8 +77,8 @@ async fn help_handler(headers: HeaderMap) -> Response {
             "OpenAI batch API integration for cost-effective processing",
             "Superseded commit cancellation using git ancestry",
             "Review status tracking and updates via PR comments",
-            "Manual review trigger via @robocop review comment",
-            "Cancel pending reviews via @robocop cancel comment"
+            "Manual review trigger via @smaug123-robocop review comment",
+            "Cancel pending reviews via @smaug123-robocop cancel comment"
         ],
         "configuration": {
             "required_env_vars": [
