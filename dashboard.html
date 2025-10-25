@@ -723,7 +723,16 @@
 
                 // Cache for completed batch review data
                 const cachedReviews = JSON.parse(localStorage.getItem('robocop_review_cache') || '{}');
-                
+
+                // Detect errors in batches
+                roboCopBatches.forEach(batch => {
+                    // Check for errors using request_counts.failed or presence of error_file_id
+                    const failedCount = batch.request_counts?.failed || 0;
+                    batch.hasErrors = failedCount > 0 || !!batch.error_file_id;
+                    batch.failedCount = failedCount;
+                    batch.errorFileId = batch.error_file_id;
+                });
+
                 // Fetch output for completed batches in parallel (only if not already cached)
                 const outputPromises = roboCopBatches
                     .filter(batch => batch.status === 'completed' && batch.output_file_id)
@@ -733,11 +742,11 @@
                             batch.reviewData = cachedReviews[batch.id];
                             return;
                         }
-                        
+
                         try {
                             const output = await fetchBatchOutput(batch.output_file_id);
                             batch.reviewData = parseReviewFromOutput(output);
-                            
+
                             // Cache the review data for completed batches
                             if (batch.reviewData) {
                                 cachedReviews[batch.id] = batch.reviewData;
