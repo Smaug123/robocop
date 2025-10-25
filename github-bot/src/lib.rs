@@ -1,4 +1,5 @@
 pub mod batch_processor;
+pub mod command;
 pub mod config;
 pub mod git;
 pub mod github;
