@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robocop GitHub Bot - Help</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            border-bottom: 1px solid #ecf0f1;
+            padding-bottom: 5px;
+        }
+        .version {
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .endpoint {
+            background: #ecf0f1;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border-left: 4px solid #3498db;
+        }
+        .endpoint-path {
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+            color: #2980b9;
+        }
+        .method {
+            display: inline-block;
+            background: #27ae60;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            font-weight: bold;
+            margin-right: 8px;
+        }
+        .method.post {
+            background: #e67e22;
+        }
+        ul {
+            line-height: 1.8;
+        }
+        code {
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            color: #e74c3c;
+        }
+        .feature-list li {
+            margin: 8px 0;
+        }
+        .env-var {
+            background: #fff3cd;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ecf0f1;
+            text-align: center;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Robocop GitHub Bot</h1>
+        <p class="version">Version: {version}</p>
+        <p><strong>Automated code reviews using OpenAI's batch API</strong></p>
+
+        <h2>📡 Available Endpoints</h2>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span><span class="endpoint-path">/health</span></div>
+            <p>Health check endpoint - returns service status</p>
+            <p><strong>Authentication:</strong> None</p>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method post">POST</span><span class="endpoint-path">/webhook</span></div>
+            <p>GitHub webhook receiver for PR events (opened, synchronize)</p>
+            <p><strong>Authentication:</strong> GitHub webhook signature (<code>X-Hub-Signature-256</code>)</p>
+        </div>
+
+        <div class="endpoint">
+            <div><span class="method">GET</span><span class="endpoint-path">/help</span></div>
+            <p>This page - API documentation and service information</p>
+            <p><strong>Authentication:</strong> None</p>
+            <p><strong>Content Negotiation:</strong> Returns JSON for API clients, HTML for browsers</p>
+        </div>
+
+        <h2>✨ Features</h2>
+        <ul class="feature-list">
+            <li>Automated code reviews on PR open/synchronize events</li>
+            <li>OpenAI batch API integration for cost-effective processing</li>
+            <li>Superseded commit cancellation using git ancestry</li>
+            <li>Review status tracking and updates via PR comments</li>
+            <li>Manual review trigger via <code>@smaug123-robocop review</code> comment</li>
+            <li>Cancel pending reviews via <code>@smaug123-robocop cancel</code> comment</li>
+        </ul>
+
+        <h2>⚙️ Configuration</h2>
+        <h3>Required Environment Variables</h3>
+        <div class="env-var">GITHUB_APP_ID</div>
+        <div class="env-var">GITHUB_PRIVATE_KEY</div>
+        <div class="env-var">GITHUB_WEBHOOK_SECRET</div>
+        <div class="env-var">OPENAI_API_KEY</div>
+        <div class="env-var">TARGET_GITHUB_USER_ID</div>
+
+        <h3>Optional Environment Variables</h3>
+        <div class="env-var">PORT (default: 3000)</div>
+        <div class="env-var">RECORDING_ENABLED (default: false)</div>
+        <div class="env-var">RECORDING_LOG_PATH (default: recordings.jsonl)</div>
+
+        <h2>🔧 Usage</h2>
+        <p><strong>Automatic Reviews:</strong> Configure the GitHub webhook to point to <code>/webhook</code>. Reviews will automatically trigger on PR open and new commits.</p>
+        <p><strong>Manual Reviews:</strong> Comment <code>@smaug123-robocop review</code> on any PR to trigger a review.</p>
+        <p><strong>Cancel Reviews:</strong> Comment <code>@smaug123-robocop cancel</code> on any PR to cancel pending reviews.</p>
+
+        <footer>
+            <p>Robocop GitHub Bot v{version}</p>
+        </footer>
+    </div>
+</body>
+</html>
