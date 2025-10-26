@@ -5,6 +5,7 @@ pub mod git;
 pub mod github;
 pub mod openai;
 pub mod recording;
+pub mod review_state;
 pub mod webhook;
 
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ use tokio::sync::RwLock;
 pub use github::*;
 pub use openai::*;
 pub use recording::RecordingLogger;
+pub use review_state::{PullRequestId, ReviewState};
 
 mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
@@ -51,5 +53,6 @@ pub struct AppState {
     pub webhook_secret: String,
     pub target_user_id: u64,
     pub pending_batches: Arc<RwLock<HashMap<String, PendingBatch>>>,
+    pub review_states: Arc<RwLock<HashMap<PullRequestId, ReviewState>>>,
     pub recording_logger: Option<RecordingLogger>,
 }

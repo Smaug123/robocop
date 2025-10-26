@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
         webhook_secret: config.github_webhook_secret,
         target_user_id: config.target_user_id,
         pending_batches: Arc::new(RwLock::new(HashMap::new())),
+        review_states: Arc::new(RwLock::new(HashMap::new())),
         recording_logger,
     });
 
