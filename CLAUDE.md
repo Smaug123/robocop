@@ -27,6 +27,8 @@ The Rust crate is located in the `github-bot/` subdirectory. All commands should
 - **Run**: `nix develop --command cargo run --manifest-path github-bot/Cargo.toml`
 - **Build Nix Package**: `nix build`
 
+Before committing in the Rust subdirectory, always run Clippy and the formatter.
+
 ### Standalone Python Script (Python)
 
 #### Environment Setup
@@ -179,3 +181,7 @@ When working with this codebase, always follow these security practices:
 ### XSS Prevention
 - **ALWAYS** escape user-controlled content using `escapeHtml()` before inserting into DOM
 - Be aware that browser href assignment does NOT sanitize protocols - explicit validation is required
+
+## Development guidelines
+
+- When fixing a bug, always write the test first that demonstrates the bug, commit it in failing state, and then make the fix to the code.
