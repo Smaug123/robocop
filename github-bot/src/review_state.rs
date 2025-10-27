@@ -8,18 +8,13 @@ use tracing::info;
 ///
 /// Using a discriminated union instead of boolean to make the intent explicit
 /// and allow for future extension (e.g., TemporarilyDisabled with expiry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ReviewState {
     /// Reviews are enabled (default behavior)
+    #[default]
     Enabled,
     /// Reviews are explicitly disabled by user request
     Disabled,
-}
-
-impl Default for ReviewState {
-    fn default() -> Self {
-        ReviewState::Enabled
-    }
 }
 
 /// Unique identifier for a pull request across repositories
