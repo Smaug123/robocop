@@ -222,6 +222,21 @@ pub async fn github_webhook_handler(
 
                         if let Some(repo) = payload.repository.clone() {
                             if let Some(installation) = &payload.installation {
+                                // Invalidate cached review state on PR edits to ensure we rehydrate
+                                // from the potentially updated PR description
+                                if payload.action.as_deref() == Some("edited") {
+                                    let pr_id = crate::PullRequestId {
+                                        repo_owner: repo.owner.login.clone(),
+                                        repo_name: repo.name.clone(),
+                                        pr_number: pr.number,
+                                    };
+                                    state.review_states.write().await.remove(&pr_id);
+                                    info!(
+                                        "Invalidated cached review state for PR #{} due to edit",
+                                        pr.number
+                                    );
+                                }
+
                                 let state_clone = state.clone();
                                 let pr_clone = pr.clone();
                                 let installation_id = installation.id;
