@@ -172,7 +172,9 @@ impl OpenAIClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().context("Failed to read error response body")?;
+            let error_text = response
+                .text()
+                .context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Files API error: {} - {}",
                 status,
@@ -214,7 +216,9 @@ impl OpenAIClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().context("Failed to read error response body")?;
+            let error_text = response
+                .text()
+                .context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Batches API error: {} - {}",
                 status,
@@ -242,7 +246,9 @@ impl OpenAIClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().context("Failed to read error response body")?;
+            let error_text = response
+                .text()
+                .context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Get Batch API error: {} - {}",
                 status,
@@ -269,7 +275,9 @@ impl OpenAIClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().context("Failed to read error response body")?;
+            let error_text = response
+                .text()
+                .context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Cancel Batch API error: {} - {}",
                 status,
@@ -296,7 +304,9 @@ impl OpenAIClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().context("Failed to read error response body")?;
+            let error_text = response
+                .text()
+                .context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Download File API error: {} - {}",
                 status,
@@ -304,7 +314,9 @@ impl OpenAIClient {
             ));
         }
 
-        let content = response.text().context("Failed to read batch output content")?;
+        let content = response
+            .text()
+            .context("Failed to read batch output content")?;
         Ok(content)
     }
 

@@ -1,6 +1,6 @@
+use insta::{assert_debug_snapshot, with_settings};
 use robocop_server::recording::test_utils::{MockGenerator, TestSuite};
 use robocop_server::recording::types::{Direction, EventType, RecordedEvent};
-use insta::{assert_debug_snapshot, with_settings};
 use serde_json::json;
 use std::fs;
 
