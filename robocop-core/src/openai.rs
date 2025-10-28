@@ -1,15 +1,13 @@
 use anyhow::{anyhow, Context, Result};
-use reqwest::Client;
-use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{error, info};
 
-use crate::recording::{RecordingLogger, RecordingMiddleware, ServiceType, CORRELATION_ID_HEADER};
+use crate::review::{create_user_prompt, get_system_prompt, ReviewMetadata};
 
+/// Synchronous OpenAI client for code review batch processing
 #[derive(Clone)]
 pub struct OpenAIClient {
-    client: ClientWithMiddleware,
+    client: reqwest::blocking::Client,
     api_key: String,
 }
 
@@ -132,70 +130,49 @@ pub struct BatchRequest {
     pub body: BatchRequestBody,
 }
 
-#[derive(Debug)]
-pub struct ReviewMetadata {
-    pub head_hash: String,
-    pub merge_base: String,
-    pub branch_name: Option<String>,
-    pub repo_name: String,
-    pub remote_url: Option<String>,
-    pub pull_request_url: Option<String>,
-}
-
 impl OpenAIClient {
     pub fn new(api_key: String) -> Self {
-        Self::new_with_recording(api_key, None)
-    }
-
-    pub fn new_with_recording(api_key: String, recording_logger: Option<RecordingLogger>) -> Self {
-        let client = create_openai_client(recording_logger);
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("Smaug123-robocop/0.1.0")
+            .build()
+            .expect("Failed to create HTTP client");
 
         Self { client, api_key }
     }
 
-    pub async fn upload_file(
+    pub fn upload_file(
         &self,
-        _correlation_id: Option<&str>,
         file_content: &[u8],
         filename: &str,
         purpose: &str,
         expires_after: Option<ExpiresAfter>,
     ) -> Result<FileUploadResponse> {
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::blocking::multipart::Form::new()
             .text("purpose", purpose.to_string())
             .part(
                 "file",
-                reqwest::multipart::Part::bytes(file_content.to_vec())
+                reqwest::blocking::multipart::Part::bytes(file_content.to_vec())
                     .file_name(filename.to_string())
                     .mime_str("application/jsonl")?,
             );
 
-        let form = if let Some(expires) = expires_after {
-            form.text("expires_after[anchor]", expires.anchor)
-                .text("expires_after[seconds]", expires.seconds.to_string())
-        } else {
-            form
-        };
+        if let Some(expires) = expires_after {
+            form = form
+                .text("expires_after[anchor]", expires.anchor)
+                .text("expires_after[seconds]", expires.seconds.to_string());
+        }
 
-        // Note: Using reqwest directly because reqwest_middleware doesn't support multipart forms
-        // This bypasses recording middleware for file uploads, so correlation ID cannot be propagated
-        // TODO: Consider implementing a custom solution to record multipart uploads with correlation ID
-        let reqwest_client = reqwest::Client::new();
-        let response = reqwest_client
+        let response = self
+            .client
             .post("https://api.openai.com/v1/files")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .multipart(form)
             .send()
-            .await
             .context("Failed to upload file to OpenAI")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .context("Failed to read error response body")?;
-            error!("OpenAI Files API error: {} - {}", status, error_text);
+            let error_text = response.text().context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Files API error: {} - {}",
                 status,
@@ -205,19 +182,13 @@ impl OpenAIClient {
 
         let upload_response: FileUploadResponse = response
             .json()
-            .await
             .context("Failed to parse file upload response")?;
-        info!(
-            "Successfully uploaded file: {} (id: {}, {} bytes)",
-            upload_response.filename, upload_response.id, upload_response.bytes
-        );
 
         Ok(upload_response)
     }
 
-    pub async fn create_batch(
+    pub fn create_batch(
         &self,
-        correlation_id: Option<&str>,
         input_file_id: String,
         endpoint: String,
         completion_window: String,
@@ -232,29 +203,18 @@ impl OpenAIClient {
             output_expires_after,
         };
 
-        let mut request_builder = self
+        let response = self
             .client
             .post("https://api.openai.com/v1/batches")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .body(serde_json::to_string(&request_body)?);
-
-        if let Some(cid) = correlation_id {
-            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
-        }
-
-        let response = request_builder
+            .body(serde_json::to_string(&request_body)?)
             .send()
-            .await
             .context("Failed to create batch request")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .context("Failed to read error response body")?;
-            error!("OpenAI Batches API error: {} - {}", status, error_text);
+            let error_text = response.text().context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Batches API error: {} - {}",
                 status,
@@ -264,45 +224,25 @@ impl OpenAIClient {
 
         let batch_response: BatchResponse = response
             .json()
-            .await
             .context("Failed to parse batch create response")?;
-        info!(
-            "Successfully created batch: {} (status: {})",
-            batch_response.id, batch_response.status
-        );
 
         Ok(batch_response)
     }
 
-    pub async fn get_batch(
-        &self,
-        correlation_id: Option<&str>,
-        batch_id: &str,
-    ) -> Result<BatchResponse> {
+    pub fn get_batch(&self, batch_id: &str) -> Result<BatchResponse> {
         let url = format!("https://api.openai.com/v1/batches/{}", batch_id);
 
-        let mut request_builder = self
+        let response = self
             .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json");
-
-        if let Some(cid) = correlation_id {
-            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
-        }
-
-        let response = request_builder
+            .header("Content-Type", "application/json")
             .send()
-            .await
             .context("Failed to get batch status")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .context("Failed to read error response body")?;
-            error!("OpenAI Get Batch API error: {} - {}", status, error_text);
+            let error_text = response.text().context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Get Batch API error: {} - {}",
                 status,
@@ -312,42 +252,24 @@ impl OpenAIClient {
 
         let batch_response: BatchResponse = response
             .json()
-            .await
             .context("Failed to parse batch status response")?;
         Ok(batch_response)
     }
 
-    pub async fn cancel_batch(
-        &self,
-        correlation_id: Option<&str>,
-        batch_id: &str,
-    ) -> Result<BatchResponse> {
+    pub fn cancel_batch(&self, batch_id: &str) -> Result<BatchResponse> {
         let url = format!("https://api.openai.com/v1/batches/{}/cancel", batch_id);
 
-        info!("Cancelling batch: {}", batch_id);
-
-        let mut request_builder = self
+        let response = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json");
-
-        if let Some(cid) = correlation_id {
-            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
-        }
-
-        let response = request_builder
+            .header("Content-Type", "application/json")
             .send()
-            .await
             .context("Failed to cancel batch")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .context("Failed to read error response body")?;
-            error!("OpenAI Cancel Batch API error: {} - {}", status, error_text);
+            let error_text = response.text().context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Cancel Batch API error: {} - {}",
                 status,
@@ -357,47 +279,24 @@ impl OpenAIClient {
 
         let batch_response: BatchResponse = response
             .json()
-            .await
             .context("Failed to parse batch cancel response")?;
-        info!(
-            "Successfully cancelled batch: {} (status: {})",
-            batch_response.id, batch_response.status
-        );
 
         Ok(batch_response)
     }
 
-    pub async fn download_batch_output(
-        &self,
-        correlation_id: Option<&str>,
-        file_id: &str,
-    ) -> Result<String> {
+    pub fn download_batch_output(&self, file_id: &str) -> Result<String> {
         let url = format!("https://api.openai.com/v1/files/{}/content", file_id);
 
-        let mut request_builder = self
+        let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key));
-
-        if let Some(cid) = correlation_id {
-            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
-        }
-
-        let response = request_builder
+            .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
-            .await
             .context("Failed to download batch output")?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .context("Failed to read error response body")?;
-            error!(
-                "OpenAI Download File API error: {} - {}",
-                status, error_text
-            );
+            let error_text = response.text().context("Failed to read error response body")?;
             return Err(anyhow!(
                 "OpenAI Download File API error: {} - {}",
                 status,
@@ -405,10 +304,7 @@ impl OpenAIClient {
             ));
         }
 
-        let content = response
-            .text()
-            .await
-            .context("Failed to read batch output content")?;
+        let content = response.text().context("Failed to read batch output content")?;
         Ok(content)
     }
 
@@ -442,27 +338,19 @@ impl OpenAIClient {
         }
     }
 
-    fn create_system_prompt() -> String {
-        include_str!("../prompt.txt").to_string()
-    }
-
-    pub async fn process_code_review_batch(
+    /// Process a code review batch request
+    /// Returns the batch ID
+    pub fn process_code_review_batch(
         &self,
-        correlation_id: Option<&str>,
         diff: &str,
         file_contents: &[(String, String)], // (file_path, content) pairs
         metadata: &ReviewMetadata,
         reasoning_effort: &str,
+        version: Option<&str>,
+        additional_prompt: Option<&str>,
     ) -> Result<String> {
-        // Create user prompt following robocop pattern
-        let mut user_prompt = format!(
-            "Below is a git diff, and then the contents of the altered files after the diff was applied.\n\nDIFF BEGINS:\n{}\nDIFF ENDS\n\nFILE CONTENTS AFTER DIFF APPLIED (omits non-Unicode files and files deleted in the diff):\n\n",
-            diff
-        );
-
-        for (file_path, content) in file_contents {
-            user_prompt.push_str(&format!("\n === {} ===\n\n{}\n\n", file_path, content));
-        }
+        // Create user prompt
+        let user_prompt = create_user_prompt(diff, file_contents, additional_prompt);
 
         // Create batch request
         let batch_request = BatchRequest {
@@ -475,7 +363,7 @@ impl OpenAIClient {
                 messages: vec![
                     BatchRequestMessage {
                         role: "system".to_string(),
-                        content: Self::create_system_prompt(),
+                        content: get_system_prompt(),
                     },
                     BatchRequestMessage {
                         role: "user".to_string(),
@@ -487,30 +375,18 @@ impl OpenAIClient {
         };
 
         // Convert to JSONL format (with trailing newline)
-        let jsonl_content = format!(
-            "{}
-",
-            serde_json::to_string(&batch_request)?
-        );
+        let jsonl_content = format!("{}\n", serde_json::to_string(&batch_request)?);
         let jsonl_bytes = jsonl_content.as_bytes();
 
-        info!("Created batch request ({} bytes JSONL)", jsonl_bytes.len());
-
         // Upload batch file
-        let file_response = self
-            .upload_file(
-                correlation_id,
-                jsonl_bytes,
-                "batch_request.jsonl",
-                "batch",
-                None, // No expiration for batch files
-            )
-            .await?;
-
-        info!("Uploaded batch file: {}", file_response.id);
+        let file_response = self.upload_file(
+            jsonl_bytes,
+            "batch_request.jsonl",
+            "batch",
+            None, // No expiration for batch files
+        )?;
 
         // Create batch metadata
-        let version = crate::get_bot_version();
         let mut batch_metadata = HashMap::new();
         batch_metadata.insert(
             "description".to_string(),
@@ -527,7 +403,10 @@ impl OpenAIClient {
         );
         batch_metadata.insert("metadata_schema".to_string(), "1".to_string());
         batch_metadata.insert("repo_name".to_string(), metadata.repo_name.clone());
-        batch_metadata.insert("version".to_string(), version);
+
+        if let Some(ver) = version {
+            batch_metadata.insert("version".to_string(), ver.to_string());
+        }
 
         if let Some(url) = &metadata.remote_url {
             batch_metadata.insert("remote_url".to_string(), url.clone());
@@ -538,40 +417,14 @@ impl OpenAIClient {
         }
 
         // Create batch
-        let batch_response = self
-            .create_batch(
-                correlation_id,
-                file_response.id,
-                "/v1/chat/completions".to_string(),
-                "24h".to_string(),
-                Some(batch_metadata),
-                None, // No output expiration
-            )
-            .await?;
-
-        info!(
-            "Created batch: {} (status: {})",
-            batch_response.id, batch_response.status
-        );
+        let batch_response = self.create_batch(
+            file_response.id,
+            "/v1/chat/completions".to_string(),
+            "24h".to_string(),
+            Some(batch_metadata),
+            None, // No output expiration
+        )?;
 
         Ok(batch_response.id)
     }
-}
-
-pub fn create_openai_client(recording_logger: Option<RecordingLogger>) -> ClientWithMiddleware {
-    use reqwest_middleware::ClientBuilder;
-
-    let client = Client::builder()
-        .user_agent("Smaug123-robocop/0.1.0")
-        .build()
-        .expect("Failed to create HTTP client");
-
-    let mut builder = ClientBuilder::new(client);
-
-    if let Some(logger) = recording_logger {
-        let recording_middleware = RecordingMiddleware::new(logger, ServiceType::OpenAi);
-        builder = builder.with(recording_middleware);
-    }
-
-    builder.build()
 }

@@ -22,28 +22,31 @@
           extensions = [ "rust-src" "clippy" ];
         };
         
-        github-bot = pkgs.rustPlatform.buildRustPackage {
-          pname = "github-bot";
+        robocop-server = pkgs.rustPlatform.buildRustPackage {
+          pname = "robocop-server";
           version = "0.1.0";
-          
-          src = ./github-bot;
-          
+
+          src = ./.;
+
           cargoLock = {
-            lockFile = ./github-bot/Cargo.lock;
+            lockFile = ./Cargo.lock;
           };
-          
+
           nativeBuildInputs = with pkgs; [
             pkg-config
           ];
-          
+
           buildInputs = with pkgs; [
             openssl
             libiconv
           ];
-          
+
+          # Build only the server binary
+          buildAndTestSubdir = "robocop-server";
+
           meta = with pkgs.lib; {
-            description = "GitHub Code Review Bot";
-            homepage = "https://github.com/your-username/github-bot";
+            description = "Robocop GitHub Code Review Server";
+            homepage = "https://github.com/Smaug123/robocop";
             license = licenses.mit;
             maintainers = [ ];
           };
@@ -51,8 +54,10 @@
       in
       {
         packages = {
-          default = github-bot;
-          github-bot = github-bot;
+          default = robocop-server;
+          robocop-server = robocop-server;
+          # Alias for backwards compatibility
+          github-bot = robocop-server;
         };
         
         devShells.default = pkgs.mkShell {
