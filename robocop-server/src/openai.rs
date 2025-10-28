@@ -1,96 +1,23 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use reqwest_middleware::ClientWithMiddleware;
-use serde::Serialize;
 use std::collections::HashMap;
 use tracing::{error, info};
 
 use crate::recording::{RecordingLogger, RecordingMiddleware, ServiceType, CORRELATION_ID_HEADER};
 
 // Re-export types from robocop_core for use in the server
-pub use robocop_core::ReviewMetadata;
+pub use robocop_core::{
+    BatchCreateRequest, BatchRequest, BatchRequestBody, BatchRequestMessage, BatchResponse,
+    ExpiresAfter, FileUploadResponse, JsonSchema, RequestCounts, ResponseFormat, ReviewMetadata,
+    Schema, SchemaProperties, SchemaProperty,
+};
 
 // Server-specific types that need async handling
 #[derive(Clone)]
 pub struct OpenAIClient {
     client: ClientWithMiddleware,
     api_key: String,
-}
-
-// Re-export robocop-core types for compatibility
-pub use robocop_core::{
-    BatchResponse, ExpiresAfter, FileUploadResponse, RequestCounts,
-};
-
-#[derive(Debug, Serialize)]
-pub struct BatchCreateRequest {
-    pub input_file_id: String,
-    pub endpoint: String,
-    pub completion_window: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_expires_after: Option<ExpiresAfter>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchRequestMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchRequestBody {
-    pub model: String,
-    pub reasoning_effort: String,
-    pub messages: Vec<BatchRequestMessage>,
-    pub response_format: ResponseFormat,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResponseFormat {
-    #[serde(rename = "type")]
-    pub format_type: String,
-    pub json_schema: JsonSchema,
-}
-
-#[derive(Debug, Serialize)]
-pub struct JsonSchema {
-    pub schema: Schema,
-    pub strict: bool,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Schema {
-    #[serde(rename = "type")]
-    pub schema_type: String,
-    pub properties: SchemaProperties,
-    pub required: Vec<String>,
-    #[serde(rename = "additionalProperties")]
-    pub additional_properties: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SchemaProperties {
-    pub reasoning: SchemaProperty,
-    #[serde(rename = "substantiveComments")]
-    pub substantive_comments: SchemaProperty,
-    pub summary: SchemaProperty,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SchemaProperty {
-    #[serde(rename = "type")]
-    pub property_type: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchRequest {
-    pub custom_id: String,
-    pub method: String,
-    pub url: String,
-    pub body: BatchRequestBody,
 }
 
 impl OpenAIClient {
