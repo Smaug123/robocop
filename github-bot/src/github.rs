@@ -123,6 +123,7 @@ pub struct PullRequestResponse {
     pub number: u64,
     pub head: PullRequestRefResponse,
     pub base: PullRequestRefResponse,
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1097,6 +1098,24 @@ impl GitHubClient {
     }
 }
 
+/// Check if a PR description or comment contains the disable-reviews marker
+///
+/// This performs a case-insensitive search for the @smaug123-robocop disable-reviews
+/// pattern anywhere in the text (not just at line start, since PR descriptions
+/// are not constrained like comments).
+pub fn contains_disable_reviews_marker(text: &str) -> bool {
+    for line in text.lines() {
+        if line
+            .trim()
+            .to_lowercase()
+            .contains("@smaug123-robocop disable-reviews")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn create_github_client(recording_logger: Option<RecordingLogger>) -> ClientWithMiddleware {
     use reqwest_middleware::ClientBuilder;
 
@@ -1113,4 +1132,39 @@ pub fn create_github_client(recording_logger: Option<RecordingLogger>) -> Client
     }
 
     builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_contains_disable_reviews_marker_present() {
+        let text = "This is a PR\n\n@smaug123-robocop disable-reviews\n\nPlease don't review";
+        assert!(contains_disable_reviews_marker(text));
+    }
+
+    #[test]
+    fn test_contains_disable_reviews_marker_case_insensitive() {
+        let text = "@SMAUG123-ROBOCOP DISABLE-REVIEWS";
+        assert!(contains_disable_reviews_marker(text));
+
+        let text2 = "@Smaug123-Robocop Disable-Reviews";
+        assert!(contains_disable_reviews_marker(text2));
+    }
+
+    #[test]
+    fn test_contains_disable_reviews_marker_absent() {
+        let text = "Just a regular PR description";
+        assert!(!contains_disable_reviews_marker(text));
+
+        let text2 = "Mentions @smaug123-robocop but not the disable command";
+        assert!(!contains_disable_reviews_marker(text2));
+    }
+
+    #[test]
+    fn test_contains_disable_reviews_marker_with_whitespace() {
+        let text = "  @smaug123-robocop disable-reviews  ";
+        assert!(contains_disable_reviews_marker(text));
+    }
 }

@@ -77,7 +77,9 @@ async fn help_handler(headers: HeaderMap) -> Response {
             "OpenAI batch API integration for cost-effective processing",
             "Superseded commit cancellation using git ancestry",
             "Review status tracking and updates via PR comments",
+            "Review suppression via PR description or commands",
             "Manual review trigger via @smaug123-robocop review comment",
+            "Enable/disable reviews via @smaug123-robocop enable-reviews/disable-reviews",
             "Cancel pending reviews via @smaug123-robocop cancel comment"
         ],
         "configuration": {
@@ -151,6 +153,7 @@ async fn main() -> Result<()> {
         webhook_secret: config.github_webhook_secret,
         target_user_id: config.target_user_id,
         pending_batches: Arc::new(RwLock::new(HashMap::new())),
+        review_states: Arc::new(RwLock::new(HashMap::new())),
         recording_logger,
     });
 

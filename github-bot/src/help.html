@@ -106,7 +106,7 @@
 
         <div class="endpoint">
             <div><span class="method post">POST</span><span class="endpoint-path">/webhook</span></div>
-            <p>GitHub webhook receiver for PR events (opened, synchronize)</p>
+            <p>GitHub webhook receiver for PR events (opened, synchronize, edited)</p>
             <p><strong>Authentication:</strong> GitHub webhook signature (<code>X-Hub-Signature-256</code>)</p>
         </div>
 
@@ -123,7 +123,9 @@
             <li>OpenAI batch API integration for cost-effective processing</li>
             <li>Superseded commit cancellation using git ancestry</li>
             <li>Review status tracking and updates via PR comments</li>
+            <li>Review suppression via PR description or commands</li>
             <li>Manual review trigger via <code>@smaug123-robocop review</code> comment</li>
+            <li>Enable/disable reviews via <code>@smaug123-robocop enable-reviews</code> / <code>@smaug123-robocop disable-reviews</code></li>
             <li>Cancel pending reviews via <code>@smaug123-robocop cancel</code> comment</li>
         </ul>
 
@@ -144,6 +146,21 @@
         <p><strong>Automatic Reviews:</strong> Configure the GitHub webhook to point to <code>/webhook</code>. Reviews will automatically trigger on PR open and new commits.</p>
         <p><strong>Manual Reviews:</strong> Comment <code>@smaug123-robocop review</code> on any PR to trigger a review.</p>
         <p><strong>Cancel Reviews:</strong> Comment <code>@smaug123-robocop cancel</code> on any PR to cancel pending reviews.</p>
+
+        <h2>🔕 Review Suppression</h2>
+        <p>You can control whether robocop automatically reviews your pull requests:</p>
+
+        <h3>Disable Reviews via PR Description</h3>
+        <p>Include <code>@smaug123-robocop disable-reviews</code> anywhere in your PR description to suppress automatic reviews.</p>
+
+        <h3>Commands</h3>
+        <ul class="feature-list">
+            <li><code>@smaug123-robocop disable-reviews</code> - Disable automatic reviews and cancel pending reviews</li>
+            <li><code>@smaug123-robocop enable-reviews</code> - Enable automatic reviews and trigger review for current commit</li>
+            <li><code>@smaug123-robocop review</code> - Request a one-time review even if reviews are disabled</li>
+        </ul>
+
+        <p><strong>State Persistence:</strong> Once disabled, reviews stay disabled until explicitly enabled.</p>
 
         <footer>
             <p>Robocop GitHub Bot v{version}</p>

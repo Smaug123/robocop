@@ -8,6 +8,10 @@ pub enum RobocopCommand {
     Review,
     /// Cancel all pending reviews for this PR
     Cancel,
+    /// Enable automatic reviews
+    EnableReviews,
+    /// Disable automatic reviews
+    DisableReviews,
 }
 
 impl fmt::Display for RobocopCommand {
@@ -15,6 +19,8 @@ impl fmt::Display for RobocopCommand {
         match self {
             RobocopCommand::Review => write!(f, "review"),
             RobocopCommand::Cancel => write!(f, "cancel"),
+            RobocopCommand::EnableReviews => write!(f, "enable-reviews"),
+            RobocopCommand::DisableReviews => write!(f, "disable-reviews"),
         }
     }
 }
@@ -51,6 +57,10 @@ pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
                 return Some(RobocopCommand::Review);
             } else if command_part.eq_ignore_ascii_case("cancel") {
                 return Some(RobocopCommand::Cancel);
+            } else if command_part.eq_ignore_ascii_case("enable-reviews") {
+                return Some(RobocopCommand::EnableReviews);
+            } else if command_part.eq_ignore_ascii_case("disable-reviews") {
+                return Some(RobocopCommand::DisableReviews);
             }
         }
     }
@@ -171,5 +181,39 @@ mod tests {
             Some(RobocopCommand::Review),
             "Should accept command with multiple spaces"
         );
+    }
+
+    #[test]
+    fn test_parse_enable_reviews_command() {
+        assert_eq!(
+            parse_comment("@smaug123-robocop enable-reviews"),
+            Some(RobocopCommand::EnableReviews)
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop Enable-Reviews"),
+            Some(RobocopCommand::EnableReviews)
+        );
+        assert_eq!(
+            parse_comment("  @smaug123-robocop ENABLE-REVIEWS  "),
+            Some(RobocopCommand::EnableReviews)
+        );
+    }
+
+    #[test]
+    fn test_parse_disable_reviews_command() {
+        assert_eq!(
+            parse_comment("@smaug123-robocop disable-reviews"),
+            Some(RobocopCommand::DisableReviews)
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop Disable-Reviews"),
+            Some(RobocopCommand::DisableReviews)
+        );
+    }
+
+    #[test]
+    fn test_enable_disable_multiline() {
+        let comment = "Please review this.\n\n@smaug123-robocop enable-reviews";
+        assert_eq!(parse_comment(comment), Some(RobocopCommand::EnableReviews));
     }
 }
