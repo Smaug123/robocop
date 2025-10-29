@@ -4,30 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains three main components:
+This repository contains four main components:
 
-1. **GitHub Bot** (`github-bot/`): A Rust-based webhook server for automated code reviews
-2. **Standalone Python Script** (`python/`): A Python CLI tool for automated code reviews
-3. **Review Dashboard** (`dashboard.html`): A single HTML file to view the state of all code reviews performed using the tools in the repository
+1. **Robocop Core Library** (`robocop-core/`): A synchronous Rust library for OpenAI batch API integration and code review functionality (non-async, suitable for CLI tools)
+2. **Robocop Server** (`robocop-server/`): An async Rust-based GitHub webhook server for automated code reviews
+3. **Standalone Python Script** (`python/`): A Python CLI tool for automated code reviews (being replaced by Rust CLI)
+4. **Review Dashboard** (`dashboard.html`): A single HTML file to view the state of all code reviews performed using the tools in the repository
 
 ## Development Commands
 
-This project uses Nix for reproducible development environments.
+This project uses Nix for reproducible development environments and Cargo workspaces for the Rust crates.
 
-### GitHub Bot (Rust)
+### Rust Workspace (robocop-core + robocop-server)
 
-The Rust crate is located in the `github-bot/` subdirectory. All commands should be run from the project root within the Nix environment:
+The repository contains a Cargo workspace with two crates:
+- `robocop-core`: Synchronous library for OpenAI integration
+- `robocop-server`: Async GitHub webhook server
 
-- **Build**: `nix develop --command cargo build --manifest-path github-bot/Cargo.toml`
-- **Test**: `nix develop --command cargo test --manifest-path github-bot/Cargo.toml`
-- **Test with snapshots**: `nix develop --command cargo test --manifest-path github-bot/Cargo.toml --workspace`
-- **Lint**: `nix develop --command cargo clippy --manifest-path github-bot/Cargo.toml --all-targets --all-features -- -D warnings`
-- **Format**: `nix develop --command cargo fmt --manifest-path github-bot/Cargo.toml`
-- **Format Check**: `nix develop --command cargo fmt --manifest-path github-bot/Cargo.toml --check`
-- **Run**: `nix develop --command cargo run --manifest-path github-bot/Cargo.toml`
+All commands should be run from the project root within the Nix environment:
+
+- **Build All**: `nix develop --command cargo build`
+- **Build Server Only**: `nix develop --command cargo build -p robocop-server`
+- **Build Library Only**: `nix develop --command cargo build -p robocop-core`
+- **Test All**: `nix develop --command cargo test`
+- **Test Server Only**: `nix develop --command cargo test -p robocop-server`
+- **Test Library Only**: `nix develop --command cargo test -p robocop-core`
+- **Lint**: `nix develop --command cargo clippy --all-targets --all-features -- -D warnings`
+- **Format**: `nix develop --command cargo fmt`
+- **Format Check**: `nix develop --command cargo fmt --check`
+- **Run Server**: `nix develop --command cargo run -p robocop-server`
 - **Build Nix Package**: `nix build`
 
-Before committing in the Rust subdirectory, always run Clippy and the formatter.
+Before committing, always run Clippy and the formatter on the entire workspace.
 
 ### Standalone Python Script (Python)
 
@@ -48,11 +56,26 @@ Run these before declaring a change to be complete.
 
 ## Architecture Overview
 
-### GitHub Bot
+### Robocop Core Library
 
-This is a GitHub webhook-based bot that provides automated code reviews using OpenAI's batch API. The system uses async processing with background polling for batch completion.
+The `robocop-core` library provides synchronous, non-async OpenAI batch API integration. It is designed to be used by CLI tools and other non-async contexts.
 
-### Core Flow
+**Key Components:**
+- **OpenAI Client** (`src/openai.rs`): Synchronous client using blocking reqwest for file uploads, batch creation, status checking, and cancellation
+- **Review Types** (`src/review.rs`): ReviewMetadata, system prompt generation, and user prompt creation
+- **Git Data Types** (`src/git.rs`): GitData struct for representing repository information
+
+The library handles:
+- Creating batch review requests
+- Uploading JSONL files to OpenAI
+- Managing batch metadata (commit hashes, branch names, PR URLs)
+- Response format schemas for structured JSON output
+
+### Robocop Server
+
+This is a GitHub webhook-based bot that provides automated code reviews using OpenAI's batch API. The system uses async processing with background polling for batch completion and internally uses robocop-core types.
+
+**Core Flow:**
 1. **Webhook Reception**: Receives GitHub PR webhooks on `/webhook` endpoint
 2. **Event Filtering**: Only processes events from the configured target user ID
 3. **Diff Collection**: Gets diffs and changed file contents via GitHub API
@@ -60,16 +83,15 @@ This is a GitHub webhook-based bot that provides automated code reviews using Op
 5. **Polling Loop**: Background task polls batch status every 60 seconds
 6. **Result Processing**: Updates PR comments with review results when batches complete
 
-### Key Components
-
+**Key Components:**
 - **AppState**: Central state container with GitHub/OpenAI clients and pending batch tracking
-- **Webhook Handler** (`src/webhook.rs`): Processes GitHub webhooks with signature verification
-- **GitHub Client** (`src/github.rs`): Handles GitHub API interactions with JWT authentication
-- **OpenAI Client** (`src/openai.rs`): Manages OpenAI batch API requests and polling
-- **Recording System** (`src/recording/`): Optional HTTP request/response logging for debugging
-- **Git Operations** (`src/git.rs`): Git ancestry checking for superseded commit handling
+- **Webhook Handler** (`robocop-server/src/webhook.rs`): Processes GitHub webhooks with signature verification
+- **GitHub Client** (`robocop-server/src/github.rs`): Handles GitHub API interactions with JWT authentication
+- **OpenAI Client** (`robocop-server/src/openai.rs`): Async wrapper around OpenAI batch API requests (uses types from robocop-core)
+- **Recording System** (`robocop-server/src/recording/`): Optional HTTP request/response logging for debugging
+- **Git Operations** (`robocop-server/src/git.rs`): Git ancestry checking for superseded commit handling
 
-### Batch Processing
+**Batch Processing:**
 The system uses OpenAI's batch API for cost-effective async processing. When new commits supersede existing ones, it automatically cancels obsolete batches using git ancestry checks.
 
 ### Configuration
@@ -135,13 +157,20 @@ cd python/
 
 ## Key Implementation Details
 
-### GitHub Bot
+### Robocop Core Library
+- **Synchronous Design**: Uses blocking reqwest for all HTTP operations (no async/await)
+- **Type Safety**: Strongly typed request/response structures with serde
+- **Prompt Management**: System prompt loaded from prompt.txt, user prompt generation utilities
+- **Metadata Tracking**: Captures git commit info, branch names, and PR URLs in batch metadata
+
+### Robocop Server
 - **Git Operations**: Git ancestry checking for superseded commit handling
-- **Batch Processing**: Uses OpenAI's batch API for cost-effective async processing
+- **Batch Processing**: Uses OpenAI's batch API for cost-effective async processing (wraps robocop-core types)
 - **HTTP Recording**: Optional request/response logging for debugging
+- **Async Runtime**: Uses tokio for async webhook handling and polling
 
 ### Standalone Python Script
-- **Git Operations**: All git commands use `--no-ext-diff` flag to ensure consistent diff output
+- **Git Operations**: All `git diff` commands use `--no-ext-diff` flag to ensure consistent diff output
 - **File Reading**: Gracefully handles non-existent files and encoding errors
 - **Batch Processing**: Uploads JSONL files to OpenAI batch API with metadata tracking
 - **Error Handling**: Exits on git command failures with descriptive error messages
@@ -153,10 +182,17 @@ cd python/
 
 ## Dependencies
 
-### GitHub Bot
-- **Rust**: Async runtime with tokio
+### Robocop Core Library
+- **reqwest**: Blocking HTTP client for OpenAI API
+- **serde/serde_json**: Serialization and deserialization
+- **anyhow**: Error handling
+
+### Robocop Server
+- **robocop-core**: Core library for OpenAI integration
+- **tokio**: Async runtime
+- **axum**: Web framework for webhook handling
 - **GitHub API**: JWT authentication and webhook processing
-- **OpenAI API**: Batch processing integration
+- **reqwest-middleware**: HTTP middleware for recording
 
 ### Standalone Python Script
 - **openai**: OpenAI API client

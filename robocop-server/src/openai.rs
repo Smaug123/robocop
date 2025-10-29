@@ -1,145 +1,23 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use reqwest_middleware::ClientWithMiddleware;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{error, info};
 
 use crate::recording::{RecordingLogger, RecordingMiddleware, ServiceType, CORRELATION_ID_HEADER};
 
+// Re-export types from robocop_core for use in the server
+pub use robocop_core::{
+    BatchCreateRequest, BatchRequest, BatchRequestBody, BatchRequestMessage, BatchResponse,
+    ExpiresAfter, FileUploadResponse, JsonSchema, RequestCounts, ResponseFormat, ReviewMetadata,
+    Schema, SchemaProperties, SchemaProperty,
+};
+
+// Server-specific types that need async handling
 #[derive(Clone)]
 pub struct OpenAIClient {
     client: ClientWithMiddleware,
     api_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct FileUploadResponse {
-    pub id: String,
-    pub object: String,
-    pub bytes: u64,
-    pub created_at: u64,
-    pub expires_at: Option<u64>,
-    pub filename: String,
-    pub purpose: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ExpiresAfter {
-    pub anchor: String,
-    pub seconds: u32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchCreateRequest {
-    pub input_file_id: String,
-    pub endpoint: String,
-    pub completion_window: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_expires_after: Option<ExpiresAfter>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RequestCounts {
-    pub total: u32,
-    pub completed: u32,
-    pub failed: u32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BatchResponse {
-    pub id: String,
-    pub object: String,
-    pub endpoint: String,
-    pub errors: Option<serde_json::Value>,
-    pub input_file_id: String,
-    pub completion_window: String,
-    pub status: String,
-    pub output_file_id: Option<String>,
-    pub error_file_id: Option<String>,
-    pub created_at: u64,
-    pub in_progress_at: Option<u64>,
-    pub expires_at: Option<u64>,
-    pub finalizing_at: Option<u64>,
-    pub completed_at: Option<u64>,
-    pub failed_at: Option<u64>,
-    pub expired_at: Option<u64>,
-    pub cancelling_at: Option<u64>,
-    pub cancelled_at: Option<u64>,
-    pub request_counts: RequestCounts,
-    pub metadata: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchRequestMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchRequestBody {
-    pub model: String,
-    pub reasoning_effort: String,
-    pub messages: Vec<BatchRequestMessage>,
-    pub response_format: ResponseFormat,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResponseFormat {
-    #[serde(rename = "type")]
-    pub format_type: String,
-    pub json_schema: JsonSchema,
-}
-
-#[derive(Debug, Serialize)]
-pub struct JsonSchema {
-    pub schema: Schema,
-    pub strict: bool,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Schema {
-    #[serde(rename = "type")]
-    pub schema_type: String,
-    pub properties: SchemaProperties,
-    pub required: Vec<String>,
-    #[serde(rename = "additionalProperties")]
-    pub additional_properties: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SchemaProperties {
-    pub reasoning: SchemaProperty,
-    #[serde(rename = "substantiveComments")]
-    pub substantive_comments: SchemaProperty,
-    pub summary: SchemaProperty,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SchemaProperty {
-    #[serde(rename = "type")]
-    pub property_type: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchRequest {
-    pub custom_id: String,
-    pub method: String,
-    pub url: String,
-    pub body: BatchRequestBody,
-}
-
-#[derive(Debug)]
-pub struct ReviewMetadata {
-    pub head_hash: String,
-    pub merge_base: String,
-    pub branch_name: Option<String>,
-    pub repo_name: String,
-    pub remote_url: Option<String>,
-    pub pull_request_url: Option<String>,
 }
 
 impl OpenAIClient {
@@ -443,7 +321,7 @@ impl OpenAIClient {
     }
 
     fn create_system_prompt() -> String {
-        include_str!("../prompt.txt").to_string()
+        robocop_core::get_system_prompt()
     }
 
     pub async fn process_code_review_batch(
@@ -454,15 +332,8 @@ impl OpenAIClient {
         metadata: &ReviewMetadata,
         reasoning_effort: &str,
     ) -> Result<String> {
-        // Create user prompt following robocop pattern
-        let mut user_prompt = format!(
-            "Below is a git diff, and then the contents of the altered files after the diff was applied.\n\nDIFF BEGINS:\n{}\nDIFF ENDS\n\nFILE CONTENTS AFTER DIFF APPLIED (omits non-Unicode files and files deleted in the diff):\n\n",
-            diff
-        );
-
-        for (file_path, content) in file_contents {
-            user_prompt.push_str(&format!("\n === {} ===\n\n{}\n\n", file_path, content));
-        }
+        // Create user prompt using robocop_core
+        let user_prompt = robocop_core::create_user_prompt(diff, file_contents, None);
 
         // Create batch request
         let batch_request = BatchRequest {

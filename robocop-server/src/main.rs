@@ -15,13 +15,13 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, Level};
 
-use github_bot::batch_processor::batch_polling_loop;
-use github_bot::config::Config;
-use github_bot::github::GitHubClient;
-use github_bot::openai::OpenAIClient;
-use github_bot::recording::RecordingLogger;
-use github_bot::webhook::webhook_router;
-use github_bot::AppState;
+use robocop_server::batch_processor::batch_polling_loop;
+use robocop_server::config::Config;
+use robocop_server::github::GitHubClient;
+use robocop_server::openai::OpenAIClient;
+use robocop_server::recording::RecordingLogger;
+use robocop_server::webhook::webhook_router;
+use robocop_server::AppState;
 
 async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(json!({
@@ -44,7 +44,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
     }
 
     // Default to JSON
-    let version = github_bot::get_bot_version();
+    let version = robocop_server::get_bot_version();
     let json_data = json!({
         "service": "robocop",
         "version": version,
@@ -104,7 +104,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
 
 fn generate_help_html() -> String {
     const HELP_HTML_TEMPLATE: &str = include_str!("help.html");
-    let version = github_bot::get_bot_version();
+    let version = robocop_server::get_bot_version();
     HELP_HTML_TEMPLATE.replace("{version}", &version)
 }
 

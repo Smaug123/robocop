@@ -1,15 +1,20 @@
 [package]
-name = "github-bot"
+name = "robocop-server"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "robocop-server"
+path = "src/main.rs"
+
 [dependencies]
+robocop-core = { path = "../robocop-core" }
 tokio = { version = "1.0", features = ["full"] }
 axum = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde.workspace = true
+serde_json.workspace = true
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
-anyhow = "1.0"
+anyhow.workspace = true
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tower = "0.5"
