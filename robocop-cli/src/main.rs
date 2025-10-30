@@ -27,7 +27,7 @@ struct Args {
     additional_prompt: String,
 
     /// Additional files to include as context
-    #[arg(long, num_args = 0..)]
+    #[arg(long, num_args = 1..)]
     include_files: Vec<String>,
 
     /// Reasoning effort level
@@ -42,28 +42,40 @@ struct Args {
 /// Get git diff of current working directory against the merge-base
 fn get_git_diff(default_branch: &str) -> Result<GitData> {
     // Get HEAD hash
-    let head_hash = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .context("Failed to execute git rev-parse HEAD")?
-            .stdout,
-    )
-    .context("Failed to parse HEAD hash as UTF-8")?
-    .trim()
-    .to_string();
+    let head_output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("Failed to execute git rev-parse HEAD")?;
+
+    if !head_output.status.success() {
+        let stderr = String::from_utf8_lossy(&head_output.stderr);
+        return Err(anyhow!("git rev-parse HEAD failed: {}", stderr));
+    }
+
+    let head_hash = String::from_utf8(head_output.stdout)
+        .context("Failed to parse HEAD hash as UTF-8")?
+        .trim()
+        .to_string();
 
     // Get merge base
-    let merge_base = String::from_utf8(
-        Command::new("git")
-            .args(["merge-base", "HEAD", default_branch])
-            .output()
-            .context("Failed to execute git merge-base")?
-            .stdout,
-    )
-    .context("Failed to parse merge base as UTF-8")?
-    .trim()
-    .to_string();
+    let merge_base_output = Command::new("git")
+        .args(["merge-base", "HEAD", default_branch])
+        .output()
+        .context("Failed to execute git merge-base")?;
+
+    if !merge_base_output.status.success() {
+        let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
+        return Err(anyhow!(
+            "git merge-base HEAD {} failed: {}",
+            default_branch,
+            stderr
+        ));
+    }
+
+    let merge_base = String::from_utf8(merge_base_output.stdout)
+        .context("Failed to parse merge base as UTF-8")?
+        .trim()
+        .to_string();
 
     // Get branch name
     let branch_output = Command::new("git")
@@ -81,33 +93,40 @@ fn get_git_diff(default_branch: &str) -> Result<GitData> {
     };
 
     // Get diff against merge-base
-    let diff = String::from_utf8(
-        Command::new("git")
-            .args([
-                "diff",
-                "--no-ext-diff",
-                "--unified=5",
-                "--no-color",
-                &merge_base,
-            ])
-            .output()
-            .context("Failed to execute git diff")?
-            .stdout,
-    )
-    .context("Failed to parse diff as UTF-8")?;
+    let diff_output = Command::new("git")
+        .args([
+            "diff",
+            "--no-ext-diff",
+            "--unified=5",
+            "--no-color",
+            &merge_base,
+        ])
+        .output()
+        .context("Failed to execute git diff")?;
+
+    if !diff_output.status.success() {
+        let stderr = String::from_utf8_lossy(&diff_output.stderr);
+        return Err(anyhow!("git diff failed: {}", stderr));
+    }
+
+    let diff = String::from_utf8(diff_output.stdout).context("Failed to parse diff as UTF-8")?;
 
     // Get list of changed files
-    let files_changed = String::from_utf8(
-        Command::new("git")
-            .args(["diff", "--name-only", &merge_base])
-            .output()
-            .context("Failed to execute git diff --name-only")?
-            .stdout,
-    )
-    .context("Failed to parse changed files as UTF-8")?
-    .lines()
-    .map(|s| s.to_string())
-    .collect();
+    let files_output = Command::new("git")
+        .args(["diff", "--no-ext-diff", "--name-only", &merge_base])
+        .output()
+        .context("Failed to execute git diff --name-only")?;
+
+    if !files_output.status.success() {
+        let stderr = String::from_utf8_lossy(&files_output.stderr);
+        return Err(anyhow!("git diff --name-only failed: {}", stderr));
+    }
+
+    let files_changed = String::from_utf8(files_output.stdout)
+        .context("Failed to parse changed files as UTF-8")?
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
 
     // Get repo name from toplevel directory
     let repo_path = String::from_utf8(
