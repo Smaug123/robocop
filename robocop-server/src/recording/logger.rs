@@ -6,6 +6,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+#[derive(Clone)]
 pub struct RecordingLogger {
     sender: mpsc::UnboundedSender<RecordedEvent>,
 }

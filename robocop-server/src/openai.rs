@@ -4,7 +4,10 @@ use reqwest_middleware::ClientWithMiddleware;
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::recording::{RecordingLogger, RecordingMiddleware, ServiceType, CORRELATION_ID_HEADER};
+use crate::recording::{
+    Direction, EventType, RecordedEvent, RecordingLogger, RecordingMiddleware, ServiceType,
+    CORRELATION_ID_HEADER,
+};
 
 // Re-export types from robocop_core for use in the server
 pub use robocop_core::{
@@ -18,6 +21,7 @@ pub use robocop_core::{
 pub struct OpenAIClient {
     client: ClientWithMiddleware,
     api_key: String,
+    recording_logger: Option<RecordingLogger>,
 }
 
 impl OpenAIClient {
@@ -26,19 +30,104 @@ impl OpenAIClient {
     }
 
     pub fn new_with_recording(api_key: String, recording_logger: Option<RecordingLogger>) -> Self {
-        let client = create_openai_client(recording_logger);
+        let client = create_openai_client(recording_logger.clone());
 
-        Self { client, api_key }
+        Self {
+            client,
+            api_key,
+            recording_logger,
+        }
+    }
+
+    /// Helper to get or generate a correlation ID
+    fn get_or_generate_correlation_id(correlation_id: Option<&str>) -> String {
+        correlation_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Record a file upload request
+    fn record_upload_request(
+        &self,
+        correlation_id: &str,
+        filename: &str,
+        file_size: usize,
+        purpose: &str,
+    ) {
+        if let Some(logger) = &self.recording_logger {
+            let event = RecordedEvent {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                correlation_id: correlation_id.to_string(),
+                event_type: EventType::OpenAiApiCall,
+                direction: Direction::Request,
+                operation: "POST /v1/files".to_string(),
+                data: serde_json::json!({
+                    "method": "POST",
+                    "url": "https://api.openai.com/v1/files",
+                    "filename": filename,
+                    "file_size_bytes": file_size,
+                    "purpose": purpose,
+                    "note": "multipart/form-data request body not captured"
+                }),
+                metadata: HashMap::new(),
+            };
+            logger.record(event);
+        }
+    }
+
+    /// Record a file upload response
+    fn record_upload_response(&self, correlation_id: &str, response: &FileUploadResponse) {
+        if let Some(logger) = &self.recording_logger {
+            let event = RecordedEvent {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                correlation_id: correlation_id.to_string(),
+                event_type: EventType::OpenAiApiCall,
+                direction: Direction::Response,
+                operation: "response_200".to_string(),
+                data: serde_json::json!({
+                    "status_code": 200,
+                    "file_id": response.id,
+                    "filename": response.filename,
+                    "bytes": response.bytes,
+                    "purpose": response.purpose
+                }),
+                metadata: HashMap::new(),
+            };
+            logger.record(event);
+        }
+    }
+
+    /// Record a file upload error
+    fn record_upload_error(&self, correlation_id: &str, status: u16, error_text: &str) {
+        if let Some(logger) = &self.recording_logger {
+            let event = RecordedEvent {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                correlation_id: correlation_id.to_string(),
+                event_type: EventType::OpenAiApiCall,
+                direction: Direction::Response,
+                operation: format!("response_{}", status),
+                data: serde_json::json!({
+                    "status_code": status,
+                    "error": error_text
+                }),
+                metadata: HashMap::new(),
+            };
+            logger.record(event);
+        }
     }
 
     pub async fn upload_file(
         &self,
-        _correlation_id: Option<&str>,
+        correlation_id: Option<&str>,
         file_content: &[u8],
         filename: &str,
         purpose: &str,
         expires_after: Option<ExpiresAfter>,
     ) -> Result<FileUploadResponse> {
+        let correlation_id = Self::get_or_generate_correlation_id(correlation_id);
+
+        // Record request
+        self.record_upload_request(&correlation_id, filename, file_content.len(), purpose);
         let form = reqwest::multipart::Form::new()
             .text("purpose", purpose.to_string())
             .part(
@@ -56,12 +145,12 @@ impl OpenAIClient {
         };
 
         // Note: Using reqwest directly because reqwest_middleware doesn't support multipart forms
-        // This bypasses recording middleware for file uploads, so correlation ID cannot be propagated
-        // TODO: Consider implementing a custom solution to record multipart uploads with correlation ID
+        // Manual recording is implemented below to capture file upload operations
         let reqwest_client = reqwest::Client::new();
         let response = reqwest_client
             .post("https://api.openai.com/v1/files")
             .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(CORRELATION_ID_HEADER, &correlation_id)
             .multipart(form)
             .send()
             .await
@@ -74,6 +163,10 @@ impl OpenAIClient {
                 .await
                 .context("Failed to read error response body")?;
             error!("OpenAI Files API error: {} - {}", status, error_text);
+
+            // Record error response
+            self.record_upload_error(&correlation_id, status.as_u16(), &error_text);
+
             return Err(anyhow!(
                 "OpenAI Files API error: {} - {}",
                 status,
@@ -89,6 +182,9 @@ impl OpenAIClient {
             "Successfully uploaded file: {} (id: {}, {} bytes)",
             upload_response.filename, upload_response.id, upload_response.bytes
         );
+
+        // Record successful response
+        self.record_upload_response(&correlation_id, &upload_response);
 
         Ok(upload_response)
     }
@@ -445,4 +541,53 @@ pub fn create_openai_client(recording_logger: Option<RecordingLogger>) -> Client
     }
 
     builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_response_format_schema_consistency() {
+        // Verify that the response format schema is correctly structured
+        // This test ensures the property names in the schema match the required array
+        let response_format = OpenAIClient::create_response_format();
+        let schema = response_format.json_schema.schema;
+
+        // Serialize the schema to JSON to verify the actual property names
+        let schema_json = serde_json::to_value(&schema).expect("Failed to serialize schema");
+        let properties = schema_json["properties"]
+            .as_object()
+            .expect("Properties should be an object");
+
+        // Verify all required properties exist in the properties object
+        for required_field in &schema.required {
+            assert!(
+                properties.contains_key(required_field),
+                "Required field '{}' not found in properties. Available properties: {:?}",
+                required_field,
+                properties.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // Verify the specific property names we expect
+        assert!(
+            properties.contains_key("reasoning"),
+            "Schema should have 'reasoning' property"
+        );
+        assert!(
+            properties.contains_key("substantiveComments"),
+            "Schema should have 'substantiveComments' property (camelCase)"
+        );
+        assert!(
+            properties.contains_key("summary"),
+            "Schema should have 'summary' property"
+        );
+
+        // Verify we don't have the incorrect snake_case version
+        assert!(
+            !properties.contains_key("substantive_comments"),
+            "Schema should not have 'substantive_comments' property (snake_case)"
+        );
+    }
 }
