@@ -230,7 +230,7 @@ cd python/
 - **Response Parsing**: Expects structured JSON with `reasoning`, `substantiveComments`, and `summary` fields
 
 ### Standalone Python Script
-- **Git Operations**: All `git diff` commands use `--no-ext-diff` flag to ensure consistent diff output
+- **Git Operations**: All `git diff` commands use `--no-ext-diff` flag (`git diff --no-ext-diff`; not `git --no-ext-diff`, which doesn't exist) to ensure consistent diff output
 - **File Reading**: Gracefully handles non-existent files and encoding errors
 - **Batch Processing**: Uploads JSONL files to OpenAI batch API with metadata tracking
 - **Error Handling**: Exits on git command failures with descriptive error messages
