@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "robocop-core",
     "robocop-server",
+    "robocop-cli",
 ]
 
 [workspace.dependencies]

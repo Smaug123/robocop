@@ -51,10 +51,41 @@
             maintainers = [ ];
           };
         };
+
+        robocop-cli = pkgs.rustPlatform.buildRustPackage {
+          pname = "robocop";
+          version = "0.1.0";
+
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+          ];
+
+          buildInputs = with pkgs; [
+            openssl
+            libiconv
+          ];
+
+          # Build only the CLI binary
+          buildAndTestSubdir = "robocop-cli";
+
+          meta = with pkgs.lib; {
+            description = "Robocop Code Review CLI";
+            homepage = "https://github.com/Smaug123/robocop";
+            license = licenses.mit;
+            maintainers = [ ];
+          };
+        };
       in
       {
         packages = {
           default = robocop-server;
+          robocop-cli = robocop-cli;
           robocop-server = robocop-server;
           # Alias for backwards compatibility
           github-bot = robocop-server;
