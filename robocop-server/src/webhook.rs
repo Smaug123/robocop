@@ -197,7 +197,7 @@ pub async fn github_webhook_handler(
         serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     match payload.action.as_deref() {
-        Some("opened") | Some("synchronize") => {
+        Some("opened") | Some("synchronize") | Some("edited") => {
             info!("Processing PR event: {:?}", payload.action);
 
             if let Some(pr) = &payload.pull_request {
@@ -222,6 +222,21 @@ pub async fn github_webhook_handler(
 
                         if let Some(repo) = payload.repository.clone() {
                             if let Some(installation) = &payload.installation {
+                                // Invalidate cached review state on PR edits to ensure we rehydrate
+                                // from the potentially updated PR description
+                                if payload.action.as_deref() == Some("edited") {
+                                    let pr_id = crate::PullRequestId {
+                                        repo_owner: repo.owner.login.clone(),
+                                        repo_name: repo.name.clone(),
+                                        pr_number: pr.number,
+                                    };
+                                    state.review_states.write().await.remove(&pr_id);
+                                    info!(
+                                        "Invalidated cached review state for PR #{} due to edit",
+                                        pr.number
+                                    );
+                                }
+
                                 let state_clone = state.clone();
                                 let pr_clone = pr.clone();
                                 let installation_id = installation.id;
@@ -236,6 +251,7 @@ pub async fn github_webhook_handler(
                                         installation_id,
                                         repo,
                                         pr_clone,
+                                        false, // force_review: false for automatic triggers
                                     )
                                     .await
                                     {
@@ -357,6 +373,72 @@ pub async fn github_webhook_handler(
                                         });
                                     } else {
                                         warn!("Missing repository or installation info for cancel command");
+                                    }
+                                }
+                                command::RobocopCommand::EnableReviews => {
+                                    info!("Processing @smaug123-robocop enable-reviews command");
+
+                                    if let (Some(repo), Some(installation)) =
+                                        (payload.repository.clone(), &payload.installation)
+                                    {
+                                        let state_clone = state.clone();
+                                        let issue_number = issue.number;
+                                        let installation_id = installation.id;
+                                        let correlation_id_clone = correlation_id.clone();
+
+                                        tokio::spawn(async move {
+                                            info!(
+                                                "Spawned background task to enable reviews for PR #{}",
+                                                issue_number
+                                            );
+
+                                            if let Err(e) = process_enable_reviews(
+                                                correlation_id_clone.as_deref(),
+                                                state_clone,
+                                                installation_id,
+                                                repo,
+                                                issue_number,
+                                            )
+                                            .await
+                                            {
+                                                error!("Failed to process enable-reviews: {}", e);
+                                            }
+                                        });
+                                    } else {
+                                        warn!("Missing repository or installation info for enable-reviews command");
+                                    }
+                                }
+                                command::RobocopCommand::DisableReviews => {
+                                    info!("Processing @smaug123-robocop disable-reviews command");
+
+                                    if let (Some(repo), Some(installation)) =
+                                        (payload.repository.clone(), &payload.installation)
+                                    {
+                                        let state_clone = state.clone();
+                                        let issue_number = issue.number;
+                                        let installation_id = installation.id;
+                                        let correlation_id_clone = correlation_id.clone();
+
+                                        tokio::spawn(async move {
+                                            info!(
+                                                "Spawned background task to disable reviews for PR #{}",
+                                                issue_number
+                                            );
+
+                                            if let Err(e) = process_disable_reviews(
+                                                correlation_id_clone.as_deref(),
+                                                state_clone,
+                                                installation_id,
+                                                repo,
+                                                issue_number,
+                                            )
+                                            .await
+                                            {
+                                                error!("Failed to process disable-reviews: {}", e);
+                                            }
+                                        });
+                                    } else {
+                                        warn!("Missing repository or installation info for disable-reviews command");
                                     }
                                 }
                             }
@@ -548,6 +630,174 @@ async fn process_cancel_reviews(
     Ok(())
 }
 
+async fn process_enable_reviews(
+    correlation_id: Option<&str>,
+    state: Arc<AppState>,
+    installation_id: u64,
+    repo: Repository,
+    pr_number: u64,
+) -> anyhow::Result<()> {
+    info!(
+        "Enabling reviews for PR #{} in {}",
+        pr_number, repo.full_name
+    );
+
+    let repo_owner = &repo.owner.login;
+    let repo_name = &repo.name;
+    let pr_id = crate::PullRequestId {
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number,
+    };
+
+    // Update state
+    {
+        let mut states = state.review_states.write().await;
+        states.insert(pr_id, crate::ReviewState::Enabled);
+    }
+
+    // Fetch PR details to get current commit
+    let pr_details = state
+        .github_client
+        .get_pull_request(
+            correlation_id,
+            installation_id,
+            repo_owner,
+            repo_name,
+            pr_number,
+        )
+        .await?;
+
+    // Post acknowledgment comment with current commit info
+    let version = crate::get_bot_version();
+    let content = format!(
+        "✅ **Reviews enabled**\n\n\
+        Automatic reviews have been enabled for this PR.\n\n\
+        Submitting review for current commit `{}`...",
+        pr_details.head.sha
+    );
+
+    let pr_info = PullRequestInfo {
+        installation_id,
+        repo_owner: repo_owner.to_string(),
+        repo_name: repo_name.to_string(),
+        pr_number,
+    };
+
+    state
+        .github_client
+        .manage_robocop_comment(correlation_id, &pr_info, &content, &version)
+        .await?;
+
+    // Trigger a review for the current commit
+    let pr = PullRequest {
+        number: pr_details.number,
+        head: PullRequestRef {
+            sha: pr_details.head.sha,
+            ref_name: pr_details.head.ref_name,
+        },
+        base: PullRequestRef {
+            sha: pr_details.base.sha,
+            ref_name: pr_details.base.ref_name,
+        },
+    };
+
+    // Use force_review=false since we just enabled reviews
+    process_code_review(correlation_id, state, installation_id, repo, pr, false).await
+}
+
+async fn process_disable_reviews(
+    correlation_id: Option<&str>,
+    state: Arc<AppState>,
+    installation_id: u64,
+    repo: Repository,
+    pr_number: u64,
+) -> anyhow::Result<()> {
+    info!(
+        "Disabling reviews for PR #{} in {}",
+        pr_number, repo.full_name
+    );
+
+    let repo_owner = &repo.owner.login;
+    let repo_name = &repo.name;
+    let pr_id = crate::PullRequestId {
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number,
+    };
+
+    // Update state
+    {
+        let mut states = state.review_states.write().await;
+        states.insert(pr_id, crate::ReviewState::Disabled);
+    }
+
+    // Cancel any pending reviews for this PR
+    let batches_to_cancel: Vec<(String, crate::PendingBatch)> = {
+        let pending = state.pending_batches.read().await;
+        pending
+            .iter()
+            .filter(|(_, batch)| {
+                batch.pr_number == pr_number
+                    && batch.repo_owner == *repo_owner
+                    && batch.repo_name == *repo_name
+            })
+            .map(|(id, batch)| (id.clone(), batch.clone()))
+            .collect()
+    };
+
+    let cancelled_count = batches_to_cancel.len();
+
+    for (batch_id, _) in &batches_to_cancel {
+        info!("Cancelling batch {} due to disable-reviews", batch_id);
+        if let Err(e) = state
+            .openai_client
+            .cancel_batch(correlation_id, batch_id)
+            .await
+        {
+            warn!("Failed to cancel batch {}: {}", batch_id, e);
+        }
+    }
+
+    // Remove from tracking
+    {
+        let mut pending = state.pending_batches.write().await;
+        for (batch_id, _) in &batches_to_cancel {
+            pending.remove(batch_id);
+        }
+    }
+
+    // Post acknowledgment
+    let version = crate::get_bot_version();
+    let content = if cancelled_count > 0 {
+        format!(
+            "🔕 **Reviews disabled**\n\n\
+            Automatic reviews have been disabled for this PR.\n\n\
+            Cancelled {} pending review{}.",
+            cancelled_count,
+            if cancelled_count == 1 { "" } else { "s" }
+        )
+    } else {
+        "🔕 **Reviews disabled**\n\n\
+        Automatic reviews have been disabled for this PR."
+            .to_string()
+    };
+
+    let pr_info = PullRequestInfo {
+        installation_id,
+        repo_owner: repo_owner.to_string(),
+        repo_name: repo_name.to_string(),
+        pr_number,
+    };
+
+    state
+        .github_client
+        .manage_robocop_comment(correlation_id, &pr_info, &content, &version)
+        .await?;
+
+    Ok(())
+}
+
 async fn process_manual_review(
     correlation_id: Option<&str>,
     state: Arc<AppState>,
@@ -586,8 +836,8 @@ async fn process_manual_review(
         },
     };
 
-    // Use the existing code review logic
-    process_code_review(correlation_id, state, installation_id, repo, pr).await
+    // Use the existing code review logic with force flag
+    process_code_review(correlation_id, state, installation_id, repo, pr, true).await
 }
 
 async fn process_code_review(
@@ -596,10 +846,11 @@ async fn process_code_review(
     installation_id: u64,
     repo: Repository,
     pr: PullRequest,
+    force_review: bool,
 ) -> anyhow::Result<()> {
     info!(
-        "Processing code review for PR #{} in {}",
-        pr.number, repo.full_name
+        "Processing code review for PR #{} in {} (force: {})",
+        pr.number, repo.full_name, force_review
     );
 
     let github_client = &state.github_client;
@@ -611,6 +862,68 @@ async fn process_code_review(
     let base_sha = &pr.base.sha;
     let head_sha = &pr.head.sha;
     let branch_name = Some(pr.head.ref_name.as_str());
+
+    let pr_id = crate::PullRequestId {
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number: pr.number,
+    };
+
+    // Get or rehydrate review state
+    let review_state = {
+        let states = state.review_states.read().await;
+        if let Some(&cached_state) = states.get(&pr_id) {
+            cached_state
+        } else {
+            drop(states); // Release read lock before expensive operation
+
+            // Rehydrate state from PR history
+            let rehydrated_state = crate::review_state::rehydrate_review_state(
+                github_client,
+                correlation_id,
+                installation_id,
+                repo_owner,
+                repo_name,
+                pr.number,
+            )
+            .await?;
+
+            // Store it for future use
+            let mut states = state.review_states.write().await;
+            states.insert(pr_id.clone(), rehydrated_state);
+            rehydrated_state
+        }
+    };
+
+    // Check if reviews are suppressed (unless forced by explicit command)
+    if review_state == crate::ReviewState::Disabled && !force_review {
+        info!(
+            "Reviews are disabled for PR #{}, posting suppression notice",
+            pr.number
+        );
+
+        let version = crate::get_bot_version();
+        let suppression_content = format!(
+            "ℹ️ **Review suppressed**\n\n\
+            Not reviewing commit `{}` due to explicit suppression.\n\n\
+            To enable reviews, comment `@smaug123-robocop enable-reviews` or \
+            request a one-time review with `@smaug123-robocop review`.",
+            pr.head.sha
+        );
+
+        let pr_info = PullRequestInfo {
+            installation_id,
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            pr_number: pr.number,
+        };
+
+        github_client
+            .manage_robocop_comment(correlation_id, &pr_info, &suppression_content, &version)
+            .await?;
+
+        return Ok(());
+    }
 
     // Get the diff
     let diff = github_client

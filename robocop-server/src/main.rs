@@ -15,13 +15,13 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, Level};
 
-use github_bot::batch_processor::batch_polling_loop;
-use github_bot::config::Config;
-use github_bot::github::GitHubClient;
-use github_bot::openai::OpenAIClient;
-use github_bot::recording::RecordingLogger;
-use github_bot::webhook::webhook_router;
-use github_bot::AppState;
+use robocop_server::batch_processor::batch_polling_loop;
+use robocop_server::config::Config;
+use robocop_server::github::GitHubClient;
+use robocop_server::openai::OpenAIClient;
+use robocop_server::recording::RecordingLogger;
+use robocop_server::webhook::webhook_router;
+use robocop_server::AppState;
 
 async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(json!({
@@ -44,7 +44,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
     }
 
     // Default to JSON
-    let version = github_bot::get_bot_version();
+    let version = robocop_server::get_bot_version();
     let json_data = json!({
         "service": "robocop",
         "version": version,
@@ -77,7 +77,9 @@ async fn help_handler(headers: HeaderMap) -> Response {
             "OpenAI batch API integration for cost-effective processing",
             "Superseded commit cancellation using git ancestry",
             "Review status tracking and updates via PR comments",
+            "Review suppression via PR description or commands",
             "Manual review trigger via @smaug123-robocop review comment",
+            "Enable/disable reviews via @smaug123-robocop enable-reviews/disable-reviews",
             "Cancel pending reviews via @smaug123-robocop cancel comment"
         ],
         "configuration": {
@@ -102,7 +104,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
 
 fn generate_help_html() -> String {
     const HELP_HTML_TEMPLATE: &str = include_str!("help.html");
-    let version = github_bot::get_bot_version();
+    let version = robocop_server::get_bot_version();
     HELP_HTML_TEMPLATE.replace("{version}", &version)
 }
 
@@ -151,6 +153,7 @@ async fn main() -> Result<()> {
         webhook_secret: config.github_webhook_secret,
         target_user_id: config.target_user_id,
         pending_batches: Arc::new(RwLock::new(HashMap::new())),
+        review_states: Arc::new(RwLock::new(HashMap::new())),
         recording_logger,
     });
 
