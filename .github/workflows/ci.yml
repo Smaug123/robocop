@@ -36,23 +36,6 @@ jobs:
       run: |
         nix develop --command cargo fmt --check
 
-  python:
-    name: Python lint
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Nix
-      uses: cachix/install-nix-action@v31
-      with:
-        github_access_token: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Lint
-      run: |
-        cd python && nix develop --command make lint
-
   nix-build:
     name: Nix Build
     runs-on: ubuntu-latest
@@ -72,7 +55,7 @@ jobs:
 
   all-required-checks-complete:
     if: ${{ always() }}
-    needs: [nix-build, rust, python]
+    needs: [nix-build, rust]
     runs-on: ubuntu-latest
     steps:
       - uses: G-Research/common-actions/check-required-lite@2b7dc49cb14f3344fbe6019c14a31165e258c059

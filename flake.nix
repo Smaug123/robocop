@@ -98,7 +98,6 @@
             pkgs.pkg-config
             pkgs.openssl
             pkgs.libiconv
-            pkgs.uv
           ];
 
           RUST_BACKTRACE = "1";
