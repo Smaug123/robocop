@@ -4,13 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains five main components:
+This repository contains four main components:
 
 1. **Robocop Core Library** (`robocop-core/`): A synchronous Rust library for OpenAI batch API integration and code review functionality (non-async, suitable for CLI tools)
 2. **Robocop Server** (`robocop-server/`): An async Rust-based GitHub webhook server for automated code reviews
 3. **Robocop CLI** (`robocop-cli/`): A Rust CLI tool for automated code reviews (uses robocop-core library)
-4. **Standalone Python Script** (`python/`): A Python CLI tool for automated code reviews (deprecated, use Rust CLI instead)
-5. **Review Dashboard** (`dashboard.html`): A single HTML file to view the state of all code reviews performed using the tools in the repository
+4. **Review Dashboard** (`dashboard.html`): A single HTML file to view the state of all code reviews performed using the tools in the repository
 
 ## Development Commands
 
@@ -41,23 +40,6 @@ All commands should be run from the project root within the Nix environment:
 - **Build Nix Package**: `nix build`
 
 Before committing, always run Clippy and the formatter on the entire workspace.
-
-### Standalone Python Script (Python)
-
-#### Environment Setup
-```bash
-cd python/
-make venv          # Create virtual environment and install dependencies
-```
-
-#### Code Quality
-```bash
-cd python/
-make lint          # Run ruff check, ruff format --check, and pyright
-make format        # Auto-fix ruff issues and format code
-```
-
-Run these before declaring a change to be complete.
 
 ## Architecture Overview
 
@@ -101,7 +83,7 @@ The system uses OpenAI's batch API for cost-effective async processing. When new
 
 ### Robocop CLI
 
-The Rust CLI tool (`robocop-cli`) is a standalone command-line application that uses the robocop-core library to perform code reviews. It matches the functionality of the Python script but is written in Rust for better performance and type safety.
+The Rust CLI tool (`robocop-cli`) is a standalone command-line application that uses the robocop-core library to perform code reviews.
 
 **Key Features:**
 - **Git Integration**: Automatically extracts diffs and file contents relative to merge-base
@@ -128,16 +110,6 @@ Environment variables required:
 - `RECORDING_ENABLED`: Enable HTTP recording (default: false)
 - `RECORDING_LOG_PATH`: Recording log file path (default: recordings.jsonl)
 
-### Standalone Python Script
-
-The Python script performs the same review as the GitHub bot (analyzing changes against a merge-base and providing structured feedback on potential issues), but is invoked from the command line.
-
-#### Architecture
-
-- **Core Script**: `python/robocop.py` - Single Python file containing all review functionality.
-  - Uses git commands to extract diffs and file changes relative to merge-base
-  - Supports both regular chat completions and batch processing APIs
-  - Returns JSON-formatted reviews (guaranteed by the Structured Outputs API) with reasoning, substantiveComments, and summary
 
 ### Review Dashboard
 
@@ -147,11 +119,11 @@ The `dashboard.html` file provides a web-based interface for monitoring batch re
 - **Real-time Updates**: Auto-refresh functionality with configurable intervals (30s, 1m, 2m, 5m)
 - **Review Results**: Display completed reviews with reasoning, summary, and substantive comments
 
-**Usage**: Open `dashboard.html` in a web browser and enter your OpenAI API key to start monitoring batch reviews. When the Python script was invoked using the `--batch` flag, and when the GitHub bot was used, the script outputs only a batch ID - use the dashboard to monitor progress and retrieve results.
+**Usage**: Open `dashboard.html` in a web browser and enter your OpenAI API key to start monitoring batch reviews. When the Rust CLI is invoked using the `--batch` flag, or when the GitHub bot creates a review, only a batch ID is output - use the dashboard to monitor progress and retrieve results.
 
 ## Tool Usage
 
-### Robocop CLI (Rust)
+### Robocop CLI
 
 #### Basic Review
 ```bash
@@ -180,34 +152,6 @@ export OPENAI_API_KEY=your_api_key_here
 nix develop --command cargo run -p robocop-cli
 ```
 
-### Robocop Python Script (Deprecated)
-
-Note: The Python script is deprecated. Use the Rust CLI instead for better performance and type safety.
-
-#### Basic Review
-```bash
-cd python/
-.venv/bin/python robocop.py --api-key YOUR_API_KEY
-```
-
-#### Advanced Options
-```bash
-cd python/
-.venv/bin/python robocop.py \
-  --api-key YOUR_API_KEY \
-  --default-branch main \
-  --reasoning-effort high \
-  --additional-prompt "Focus on security issues" \
-  --include-files config.py utils.py \
-  --batch  # Use batch API for processing; it's cheaper (prints batch ID - use dashboard to view results)
-```
-
-#### Dry Run (Preview prompts)
-```bash
-cd python/
-.venv/bin/python robocop.py --api-key fake --dry-run
-```
-
 ## Key Implementation Details
 
 ### Robocop Core Library
@@ -227,13 +171,6 @@ cd python/
 - **File Reading**: Gracefully handles non-existent files and encoding errors using Option types
 - **Dual Mode**: Supports both batch processing (via robocop-core) and direct chat completions API
 - **Error Handling**: Uses anyhow for comprehensive error handling with context throughout the application
-- **Response Parsing**: Expects structured JSON with `reasoning`, `substantiveComments`, and `summary` fields
-
-### Standalone Python Script
-- **Git Operations**: All `git diff` commands use `--no-ext-diff` flag (`git diff --no-ext-diff`; not `git --no-ext-diff`, which doesn't exist) to ensure consistent diff output
-- **File Reading**: Gracefully handles non-existent files and encoding errors
-- **Batch Processing**: Uploads JSONL files to OpenAI batch API with metadata tracking
-- **Error Handling**: Exits on git command failures with descriptive error messages
 - **Response Parsing**: Expects structured JSON with `reasoning`, `substantiveComments`, and `summary` fields
 
 ### Review Dashboard
@@ -261,15 +198,9 @@ cd python/
 - **serde/serde_json**: Serialization and deserialization
 - **anyhow**: Error handling
 
-### Standalone Python Script
-- **openai**: OpenAI API client
-- **pyright**: Type checking
-- **ruff**: Linting and formatting
-- **uv**: Package management and virtual environments
-
 ## Nix Support
 
-The repository includes a `flake.nix` for development environment setup with both Rust toolchain and Python 3, uv, and make.
+The repository includes a `flake.nix` for development environment setup with Rust toolchain.
 
 ## Security Guidelines
 
