@@ -4,35 +4,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains four main components:
+This repository contains five main components:
 
 1. **Robocop Core Library** (`robocop-core/`): A synchronous Rust library for OpenAI batch API integration and code review functionality (non-async, suitable for CLI tools)
 2. **Robocop Server** (`robocop-server/`): An async Rust-based GitHub webhook server for automated code reviews
-3. **Standalone Python Script** (`python/`): A Python CLI tool for automated code reviews (being replaced by Rust CLI)
-4. **Review Dashboard** (`dashboard.html`): A single HTML file to view the state of all code reviews performed using the tools in the repository
+3. **Robocop CLI** (`robocop-cli/`): A Rust CLI tool for automated code reviews (uses robocop-core library)
+4. **Standalone Python Script** (`python/`): A Python CLI tool for automated code reviews (deprecated, use Rust CLI instead)
+5. **Review Dashboard** (`dashboard.html`): A single HTML file to view the state of all code reviews performed using the tools in the repository
 
 ## Development Commands
 
 This project uses Nix for reproducible development environments and Cargo workspaces for the Rust crates.
 
-### Rust Workspace (robocop-core + robocop-server)
+### Rust Workspace (robocop-core + robocop-server + robocop-cli)
 
-The repository contains a Cargo workspace with two crates:
+The repository contains a Cargo workspace with three crates:
 - `robocop-core`: Synchronous library for OpenAI integration
 - `robocop-server`: Async GitHub webhook server
+- `robocop-cli`: CLI tool for code reviews
 
 All commands should be run from the project root within the Nix environment:
 
 - **Build All**: `nix develop --command cargo build`
 - **Build Server Only**: `nix develop --command cargo build -p robocop-server`
+- **Build CLI Only**: `nix develop --command cargo build -p robocop-cli`
 - **Build Library Only**: `nix develop --command cargo build -p robocop-core`
 - **Test All**: `nix develop --command cargo test`
 - **Test Server Only**: `nix develop --command cargo test -p robocop-server`
+- **Test CLI Only**: `nix develop --command cargo test -p robocop-cli`
 - **Test Library Only**: `nix develop --command cargo test -p robocop-core`
 - **Lint**: `nix develop --command cargo clippy --all-targets --all-features -- -D warnings`
 - **Format**: `nix develop --command cargo fmt`
 - **Format Check**: `nix develop --command cargo fmt --check`
 - **Run Server**: `nix develop --command cargo run -p robocop-server`
+- **Run CLI**: `nix develop --command cargo run -p robocop-cli -- [ARGS]`
 - **Build Nix Package**: `nix build`
 
 Before committing, always run Clippy and the formatter on the entire workspace.
@@ -94,6 +99,23 @@ This is a GitHub webhook-based bot that provides automated code reviews using Op
 **Batch Processing:**
 The system uses OpenAI's batch API for cost-effective async processing. When new commits supersede existing ones, it automatically cancels obsolete batches using git ancestry checks.
 
+### Robocop CLI
+
+The Rust CLI tool (`robocop-cli`) is a standalone command-line application that uses the robocop-core library to perform code reviews. It matches the functionality of the Python script but is written in Rust for better performance and type safety.
+
+**Key Features:**
+- **Git Integration**: Automatically extracts diffs and file contents relative to merge-base
+- **Dual Mode**: Supports both regular chat completions API and batch processing API
+- **Dry Run**: Preview prompts without making API calls
+- **Flexible Options**: Customize reasoning effort, additional prompts, and included files
+- **Error Handling**: Uses anyhow for comprehensive error handling with context
+
+**Architecture:**
+- Uses clap for CLI argument parsing
+- Leverages robocop-core for OpenAI integration and prompt management
+- Synchronous execution using blocking reqwest for HTTP calls
+- Git operations implemented using std::process::Command
+
 ### Configuration
 
 Environment variables required:
@@ -129,7 +151,38 @@ The `dashboard.html` file provides a web-based interface for monitoring batch re
 
 ## Tool Usage
 
-### Robocop
+### Robocop CLI (Rust)
+
+#### Basic Review
+```bash
+nix develop --command cargo run -p robocop-cli -- --api-key YOUR_API_KEY
+```
+
+#### Advanced Options
+```bash
+nix develop --command cargo run -p robocop-cli -- \
+  --api-key YOUR_API_KEY \
+  --default-branch main \
+  --reasoning-effort high \
+  --additional-prompt "Focus on security issues" \
+  --include-files config.py utils.py \
+  --batch  # Use batch API for processing; it's cheaper (prints batch ID - use dashboard to view results)
+```
+
+#### Dry Run (Preview prompts)
+```bash
+nix develop --command cargo run -p robocop-cli -- --api-key fake --dry-run
+```
+
+#### Using Environment Variable for API Key
+```bash
+export OPENAI_API_KEY=your_api_key_here
+nix develop --command cargo run -p robocop-cli
+```
+
+### Robocop Python Script (Deprecated)
+
+Note: The Python script is deprecated. Use the Rust CLI instead for better performance and type safety.
 
 #### Basic Review
 ```bash
@@ -169,6 +222,13 @@ cd python/
 - **HTTP Recording**: Optional request/response logging for debugging
 - **Async Runtime**: Uses tokio for async webhook handling and polling
 
+### Robocop CLI
+- **Git Operations**: Uses `std::process::Command` to execute git commands with `--no-ext-diff` flag for consistent diff output
+- **File Reading**: Gracefully handles non-existent files and encoding errors using Option types
+- **Dual Mode**: Supports both batch processing (via robocop-core) and direct chat completions API
+- **Error Handling**: Uses anyhow for comprehensive error handling with context throughout the application
+- **Response Parsing**: Expects structured JSON with `reasoning`, `substantiveComments`, and `summary` fields
+
 ### Standalone Python Script
 - **Git Operations**: All `git diff` commands use `--no-ext-diff` flag (`git diff --no-ext-diff`; not `git --no-ext-diff`, which doesn't exist) to ensure consistent diff output
 - **File Reading**: Gracefully handles non-existent files and encoding errors
@@ -193,6 +253,13 @@ cd python/
 - **axum**: Web framework for webhook handling
 - **GitHub API**: JWT authentication and webhook processing
 - **reqwest-middleware**: HTTP middleware for recording
+
+### Robocop CLI
+- **robocop-core**: Core library for OpenAI integration and prompt management
+- **clap**: Command-line argument parsing with derive macros
+- **reqwest**: Blocking HTTP client for OpenAI chat completions API
+- **serde/serde_json**: Serialization and deserialization
+- **anyhow**: Error handling
 
 ### Standalone Python Script
 - **openai**: OpenAI API client
