@@ -21,6 +21,9 @@ Keep your feedback concise and bullet-pointed.
 If you're analysing code that's written in a strongly-typed compiled language, don't provide feedback which the compiler will certainly catch.
 For example, don't identify compile-time type- or syntax-errors in C# or F# which will fail the build whether or not you notice them.
 Do identify syntax errors in languages like Python and Groovy, which often lack easy correctness-checking mechanisms; and do identify likely mistakes in syntax which *silently* have unexpected effects on semantics even in languages that are amenable to static analysis.
+
+If there are tests present, assume they are being run: don't speculate about possible failure modes which you can see are explicitly ruled out by apparently-deterministic tests.
+(Do warn about race conditions you can explicitly see which the user appears not to have noticed, or other evident nondeterminism which would cause a test to be ineffective; and if you can see that a test will certainly fail, do provide the diagnosis.)
 </task>
 
 <languageSpecificNotes>
