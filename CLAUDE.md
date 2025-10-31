@@ -219,3 +219,4 @@ When working with this codebase, always follow these security practices:
 ## Development guidelines
 
 - When fixing a bug, always write the test first that demonstrates the bug, commit it in failing state, and then make the fix to the code.
+- When running `git diff`, always do `git diff --no-ext-diff`.
