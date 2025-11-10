@@ -22,7 +22,15 @@ mod built_info {
 }
 
 pub fn get_bot_version() -> String {
-    if let Some(git_hash) = built_info::GIT_COMMIT_HASH {
+    // First check for git hash from Nix build environment
+    if let Some(git_hash) = option_env!("ROBOCOP_GIT_HASH") {
+        if git_hash.len() >= 8 {
+            git_hash[..8].to_string()
+        } else {
+            git_hash.to_string()
+        }
+    } else if let Some(git_hash) = built_info::GIT_COMMIT_HASH {
+        // Fall back to built crate's git detection (for cargo builds)
         if git_hash.len() >= 8 {
             git_hash[..8].to_string()
         } else {
