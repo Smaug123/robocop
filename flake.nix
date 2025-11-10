@@ -41,6 +41,9 @@
             libiconv
           ];
 
+          # Pass git revision to the build
+          ROBOCOP_GIT_HASH = self.rev or "dirty";
+
           # Build only the server binary
           buildAndTestSubdir = "robocop-server";
 
