@@ -31,8 +31,8 @@ If there are tests present, assume they are being run: don't speculate about pos
 * The `task` computation expression can bind values of type `Task`, `ValueTask`, or F#'s own `Async`.
 * In an async computation expression, returning an exception is often best done with `return (raise someExc)` or `return failwith "some message"`; that works even when the async has non-unit return type.
 * Variable shadowing is idiomatic and normal in F#.
-* It's legal, and I prefer, to supply generic type annotations like `string<int> 3` or `int<MyEnum> MyEnum.Thing`, because that's more type-safe than omitting them.
-* F# can reference multiple modules with the same name from different assemblies at once. For example, a custom `tryMinBy` that's defined in my own library in a module called `Seq` is fine and won't conflict with the existing `Seq` module from the standard library.
+* It's legal, and I prefer, to supply the type annotation in generic functions like `string<int> 3` (rather than `string 3`) or `int<MyEnum> MyEnum.Thing` (rather than `int MyEnum.Thing`), because that's more type-safe than omitting them.
+* F# can reference multiple modules with the same name from different assemblies at once; there's only a conflict if the module defines a member of the same name. For example, a custom `tryMinBy` that's defined in my own library in a module called `Seq` is unambiguous: there's no such method in the standard library, so there's no conflict when I write `Seq.tryMinBy` at a call site.
 </fsharp>
 </languageSpecificNotes>
 
