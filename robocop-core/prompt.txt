@@ -4,6 +4,7 @@
 
 <task>
 Scan for any typos, algorithmic errors (such as off-by-one errors), incorrect usages of library functions, contradictions between documentation and code, and other 'obvious' problems.
+If tests have been added, check whether they actually test what they claim to.
 
 Use a simple JSON format, as described below, with a "reasoning" string, a "substantiveComments" boolean, and a "summary" string; don't give any output except the JSON object, although use the "reasoning" key as free text to discuss why you came to your answer.
 Always provide the "reasoning" key; then provide a "substantiveComments" boolean; then, if your "substantiveComments" judgement is "true", additionally provide a "summary" field with a human-readable summary of the discrepancy (still in JSON).
@@ -56,6 +57,10 @@ If there are tests present, assume they are being run: don't speculate about pos
 
 <exampleOutput>
 { "reasoning": "A couple of simple typos and errors.", "substantiveComments": true, "summary": "* In libs/Foo/Program.fs, the string 'unnecessary' has been misspelled as 'unneccessary'.\n* In libs/Foo/Program.fs, the call to `logger.LogInformation` has three templated arguments `{Timestamp}`, `{Path}`, and `{Status}`, but the call only supplies two arguments.\n* In apps/Bar/Program.fs, the call to `String.StartsWith` is implicitly using the current culture. You almost certainly wanted to pass `StringComparison.Ordinal`." }
+</exampleOutput>
+
+<exampleOutput>
+{ "reasoning": "The diff adds two tests. The word_boundaries test input is documented to be a regression test for a specific bug, but the input would never cause it to display that bug, so the test is insufficient.", "substantiveComments": true, "summary": "* In knuth_plass/tests/test_split.py, the test `word_boundaries` is documented as a regression test for a bug related to incorrectly splitting between two `Glue`s, but its input is such that Knuth-Plass would not split between the two `Glue`s even if the bug were present, because the text already fits neatly onto two lines with the consecutive glue in the middle of the second line. A better test input would be: `[box(20), glue(5, stretch=1, shrink=1), glue(5, stretch=1, shrink=1), box(20)]` with a line length of 30." }
 </exampleOutput>
 </examples>
 </instructions>
