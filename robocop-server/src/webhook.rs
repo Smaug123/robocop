@@ -959,9 +959,9 @@ async fn process_code_review(
         return Ok(());
     }
 
-    // Get file contents with size limits (50KB per file, 1MB total)
+    // Get file contents with size limits (100KB per file, 1MB total)
     let limits = FileSizeLimits {
-        max_file_size: 50_000,     // 50KB
+        max_file_size: 100_000,    // 100KB
         max_total_size: 1_000_000, // 1MB
     };
 
@@ -989,7 +989,7 @@ async fn process_code_review(
             **Files changed:** {}\n\
             **Files skipped:** {}\n\n\
             **Skipped files:**\n{}\n\n\
-            **Limits:** Max 50KB per file, 1MB total\n\n\
+            **Limits:** Max 100KB per file, 1MB total\n\n\
             Please consider splitting this into smaller, more focused changes for automated review.",
             total_files,
             skipped_files.len(),
