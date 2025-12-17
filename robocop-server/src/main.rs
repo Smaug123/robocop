@@ -19,9 +19,8 @@ use robocop_server::batch_processor::batch_polling_loop;
 use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
-use robocop_server::recording::RecordingLogger;
 use robocop_server::webhook::webhook_router;
-use robocop_server::AppState;
+use robocop_server::{AppState, RecordingLogger};
 
 async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(json!({
@@ -139,12 +138,16 @@ async fn main() -> Result<()> {
     let github_client = GitHubClient::new_with_recording(
         config.github_app_id,
         config.github_private_key,
-        recording_logger.as_ref().map(|l| l.clone_for_middleware()),
+        recording_logger
+            .as_ref()
+            .map(|l: &RecordingLogger| l.clone_for_middleware()),
     );
 
     let openai_client = OpenAIClient::new_with_recording(
         config.openai_api_key,
-        recording_logger.as_ref().map(|l| l.clone_for_middleware()),
+        recording_logger
+            .as_ref()
+            .map(|l: &RecordingLogger| l.clone_for_middleware()),
     );
 
     let app_state = Arc::new(AppState {

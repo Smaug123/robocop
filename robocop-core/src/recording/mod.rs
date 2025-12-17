@@ -6,4 +6,5 @@ pub mod types;
 
 pub use logger::RecordingLogger;
 pub use middleware::RecordingMiddleware;
+pub use sanitizer::Sanitizer;
 pub use types::*;

@@ -1,7 +1,6 @@
 use super::sanitizer::Sanitizer;
 use super::types::{CorrelationId, CORRELATION_ID_HEADER};
 use super::{Direction, EventType, RecordedEvent, RecordingLogger, ServiceType};
-use axum::http;
 use reqwest::{Request, Response};
 use reqwest_middleware::{Middleware, Next, Result as MiddlewareResult};
 use std::collections::HashMap;

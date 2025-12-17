@@ -18,10 +18,8 @@ use crate::command;
 use crate::git::GitOps;
 use crate::github::{FileContentRequest, FileSizeLimits, PullRequestInfo};
 use crate::openai::ReviewMetadata;
-use crate::recording::sanitizer::Sanitizer;
-use crate::recording::types::CorrelationId;
-use crate::recording::{Direction, EventType, RecordedEvent};
 use crate::AppState;
+use crate::{CorrelationId, Direction, EventType, RecordedEvent, Sanitizer};
 
 #[derive(Debug, Deserialize)]
 pub struct GitHubWebhookPayload {
@@ -1061,6 +1059,7 @@ async fn process_code_review(
         pull_request_url: Some(pull_request_url),
     };
 
+    let version = crate::get_bot_version();
     let batch_id = openai_client
         .process_code_review_batch(
             correlation_id,
@@ -1068,6 +1067,8 @@ async fn process_code_review(
             &file_contents,
             &metadata,
             "high", // reasoning_effort - could be configurable
+            Some(&version),
+            None, // additional_prompt
         )
         .await?;
 
@@ -1075,9 +1076,6 @@ async fn process_code_review(
         "Successfully submitted batch request {} for PR #{} in {}",
         batch_id, pr.number, repo.full_name
     );
-
-    // Create or update PR comment to show review is in progress
-    let version = crate::get_bot_version();
     let in_progress_content = format!(
         "🤖 **Code review in progress...**\n\n\
         I'm analyzing the changes in this pull request. This may take a long time depending on current OpenAI load.\n\n\

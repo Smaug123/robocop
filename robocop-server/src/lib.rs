@@ -4,7 +4,6 @@ pub mod config;
 pub mod git;
 pub mod github;
 pub mod openai;
-pub mod recording;
 pub mod review_state;
 pub mod webhook;
 
@@ -14,8 +13,13 @@ use tokio::sync::RwLock;
 
 pub use github::*;
 pub use openai::*;
-pub use recording::RecordingLogger;
 pub use review_state::{PullRequestId, ReviewState};
+
+// Re-export recording types from robocop_core
+pub use robocop_core::{
+    CorrelationId, Direction, EventType, RecordedEvent, RecordingLogger, RecordingMiddleware,
+    Sanitizer, ServiceType, CORRELATION_ID_HEADER,
+};
 
 mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));

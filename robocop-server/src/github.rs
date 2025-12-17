@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::recording::{RecordingLogger, RecordingMiddleware, ServiceType, CORRELATION_ID_HEADER};
+use crate::{RecordingLogger, RecordingMiddleware, ServiceType, CORRELATION_ID_HEADER};
 
 #[derive(Clone)]
 pub struct GitHubClient {

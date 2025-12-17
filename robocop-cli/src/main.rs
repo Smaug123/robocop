@@ -230,13 +230,13 @@ struct Message {
 }
 
 /// Process request using regular chat completions API
-fn process_chat_completion(
+async fn process_chat_completion(
     api_key: &str,
     system_prompt: &str,
     user_prompt: &str,
     reasoning_effort: &str,
 ) -> Result<String> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::Client::new();
 
     let request_body = serde_json::json!({
         "model": "gpt-5-2025-08-07",
@@ -270,16 +270,21 @@ fn process_chat_completion(
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
+        .await
         .context("Failed to send request to OpenAI")?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let error_text = response.text().context("Failed to read error response")?;
+        let error_text = response
+            .text()
+            .await
+            .context("Failed to read error response")?;
         return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
     }
 
     let chat_response: ChatCompletionResponse = response
         .json()
+        .await
         .context("Failed to parse chat completion response")?;
 
     if chat_response.choices.len() != 1 {
@@ -304,7 +309,8 @@ fn process_chat_completion(
         .context("No content in message")
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Get API key from args or environment
@@ -313,7 +319,7 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .context("OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable")?;
 
-    // Get git diff
+    // Get git diff (sync operations are fine here)
     let git_data = get_git_diff(&args.default_branch)?;
 
     // Check if there are any changes
@@ -371,14 +377,17 @@ fn main() -> Result<()> {
         let client = OpenAIClient::new(api_key);
         let metadata = ReviewMetadata::from_git_data(&git_data, None);
 
-        let batch_id = client.process_code_review_batch(
-            &git_data.diff,
-            &file_contents,
-            &metadata,
-            &args.reasoning_effort,
-            None, // version
-            additional_prompt,
-        )?;
+        let batch_id = client
+            .process_code_review_batch(
+                None, // correlation_id
+                &git_data.diff,
+                &file_contents,
+                &metadata,
+                &args.reasoning_effort,
+                None, // version
+                additional_prompt,
+            )
+            .await?;
 
         println!("{}", batch_id);
     } else {
@@ -388,7 +397,8 @@ fn main() -> Result<()> {
             &system_prompt,
             &user_prompt,
             &args.reasoning_effort,
-        )?;
+        )
+        .await?;
 
         println!("{}", result.trim());
     }
