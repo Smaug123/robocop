@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository contains four main components:
 
-1. **Robocop Core Library** (`robocop-core/`): A synchronous Rust library for OpenAI batch API integration and code review functionality (non-async, suitable for CLI tools)
+1. **Robocop Core Library** (`robocop-core/`): An async Rust library for OpenAI batch API integration and code review functionality
 2. **Robocop Server** (`robocop-server/`): An async Rust-based GitHub webhook server for automated code reviews
 3. **Robocop CLI** (`robocop-cli/`): A Rust CLI tool for automated code reviews (uses robocop-core library)
 4. **Review Dashboard** (`dashboard.html`): A single HTML file to view the state of all code reviews performed using the tools in the repository
@@ -18,7 +18,7 @@ This project uses Nix for reproducible development environments and Cargo worksp
 ### Rust Workspace (robocop-core + robocop-server + robocop-cli)
 
 The repository contains a Cargo workspace with three crates:
-- `robocop-core`: Synchronous library for OpenAI integration
+- `robocop-core`: Async library for OpenAI integration
 - `robocop-server`: Async GitHub webhook server
 - `robocop-cli`: CLI tool for code reviews
 
@@ -45,10 +45,10 @@ Before committing, always run Clippy and the formatter on the entire workspace.
 
 ### Robocop Core Library
 
-The `robocop-core` library provides synchronous, non-async OpenAI batch API integration. It is designed to be used by CLI tools and other non-async contexts.
+The `robocop-core` library provides async OpenAI batch API integration using tokio and reqwest.
 
 **Key Components:**
-- **OpenAI Client** (`src/openai.rs`): Synchronous client using blocking reqwest for file uploads, batch creation, status checking, and cancellation
+- **OpenAI Client** (`src/openai.rs`): Async client using reqwest with reqwest-middleware for file uploads, batch creation, status checking, and cancellation
 - **Review Types** (`src/review.rs`): ReviewMetadata, system prompt generation, and user prompt creation
 - **Git Data Types** (`src/git.rs`): GitData struct for representing repository information
 
@@ -86,16 +86,18 @@ The system uses OpenAI's batch API for cost-effective async processing. When new
 The Rust CLI tool (`robocop-cli`) is a standalone command-line application that uses the robocop-core library to perform code reviews.
 
 **Key Features:**
+- **Subcommands**: `review` for code review, `list-models` to list available OpenAI models
 - **Git Integration**: Automatically extracts diffs and file contents relative to merge-base
 - **Dual Mode**: Supports both regular chat completions API and batch processing API
+- **Model Selection**: Configure which OpenAI model to use via `--model` flag
 - **Dry Run**: Preview prompts without making API calls
 - **Flexible Options**: Customize reasoning effort, additional prompts, and included files
 - **Error Handling**: Uses anyhow for comprehensive error handling with context
 
 **Architecture:**
-- Uses clap for CLI argument parsing
+- Uses clap for CLI argument parsing with subcommands
 - Leverages robocop-core for OpenAI integration and prompt management
-- Synchronous execution using blocking reqwest for HTTP calls
+- Async execution using tokio runtime with reqwest for HTTP calls
 - Git operations implemented using std::process::Command
 
 ### Configuration
@@ -125,17 +127,22 @@ The `dashboard.html` file provides a web-based interface for monitoring batch re
 
 ### Robocop CLI
 
+The CLI uses subcommands. Available commands:
+- `review`: Run a code review on the current git branch
+- `list-models`: List available OpenAI models
+
 #### Basic Review
 ```bash
-nix develop --command cargo run -p robocop-cli -- --api-key YOUR_API_KEY
+nix develop --command cargo run -p robocop-cli -- review --api-key YOUR_API_KEY
 ```
 
 #### Advanced Options
 ```bash
-nix develop --command cargo run -p robocop-cli -- \
+nix develop --command cargo run -p robocop-cli -- review \
   --api-key YOUR_API_KEY \
   --default-branch main \
   --reasoning-effort high \
+  --model gpt-5-2025-08-07 \
   --additional-prompt "Focus on security issues" \
   --include-files config.py utils.py \
   --batch  # Use batch API for processing; it's cheaper (prints batch ID - use dashboard to view results)
@@ -143,19 +150,24 @@ nix develop --command cargo run -p robocop-cli -- \
 
 #### Dry Run (Preview prompts)
 ```bash
-nix develop --command cargo run -p robocop-cli -- --api-key fake --dry-run
+nix develop --command cargo run -p robocop-cli -- review --dry-run
 ```
 
 #### Using Environment Variable for API Key
 ```bash
 export OPENAI_API_KEY=your_api_key_here
-nix develop --command cargo run -p robocop-cli
+nix develop --command cargo run -p robocop-cli -- review
+```
+
+#### List Available Models
+```bash
+nix develop --command cargo run -p robocop-cli -- list-models
 ```
 
 ## Key Implementation Details
 
 ### Robocop Core Library
-- **Synchronous Design**: Uses blocking reqwest for all HTTP operations (no async/await)
+- **Async Design**: Uses tokio with reqwest and reqwest-middleware for all HTTP operations
 - **Type Safety**: Strongly typed request/response structures with serde
 - **Prompt Management**: System prompt loaded from prompt.txt, user prompt generation utilities
 - **Metadata Tracking**: Captures git commit info, branch names, and PR URLs in batch metadata
@@ -167,6 +179,7 @@ nix develop --command cargo run -p robocop-cli
 - **Async Runtime**: Uses tokio for async webhook handling and polling
 
 ### Robocop CLI
+- **Async Runtime**: Uses tokio with single-threaded runtime for async operations
 - **Git Operations**: Uses `std::process::Command` to execute git commands with `--no-ext-diff` flag for consistent diff output
 - **File Reading**: Gracefully handles non-existent files and encoding errors using Option types
 - **Dual Mode**: Supports both batch processing (via robocop-core) and direct chat completions API
@@ -180,7 +193,9 @@ nix develop --command cargo run -p robocop-cli
 ## Dependencies
 
 ### Robocop Core Library
-- **reqwest**: Blocking HTTP client for OpenAI API
+- **tokio**: Async runtime
+- **reqwest**: Async HTTP client for OpenAI API
+- **reqwest-middleware**: HTTP middleware for request/response recording
 - **serde/serde_json**: Serialization and deserialization
 - **anyhow**: Error handling
 
@@ -193,8 +208,9 @@ nix develop --command cargo run -p robocop-cli
 
 ### Robocop CLI
 - **robocop-core**: Core library for OpenAI integration and prompt management
+- **tokio**: Async runtime
 - **clap**: Command-line argument parsing with derive macros
-- **reqwest**: Blocking HTTP client for OpenAI chat completions API
+- **reqwest**: Async HTTP client for OpenAI chat completions API
 - **serde/serde_json**: Serialization and deserialization
 - **anyhow**: Error handling
 

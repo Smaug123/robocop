@@ -1069,6 +1069,7 @@ async fn process_code_review(
             "high", // reasoning_effort - could be configurable
             Some(&version),
             None, // additional_prompt
+            None, // model - use default
         )
         .await?;
 

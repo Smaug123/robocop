@@ -542,6 +542,7 @@ impl OpenAIClient {
         reasoning_effort: &str,
         version: Option<&str>,
         additional_prompt: Option<&str>,
+        model: Option<&str>,
     ) -> Result<String> {
         // Create user prompt
         let user_prompt = create_user_prompt(diff, file_contents, additional_prompt);
@@ -552,7 +553,7 @@ impl OpenAIClient {
             method: "POST".to_string(),
             url: "/v1/chat/completions".to_string(),
             body: BatchRequestBody {
-                model: "gpt-5-2025-08-07".to_string(),
+                model: model.unwrap_or("gpt-5-2025-08-07").to_string(),
                 reasoning_effort: reasoning_effort.to_string(),
                 messages: vec![
                     BatchRequestMessage {

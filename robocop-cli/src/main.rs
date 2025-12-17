@@ -1,15 +1,31 @@
 use anyhow::{anyhow, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use robocop_core::{create_user_prompt, get_system_prompt, GitData, OpenAIClient, ReviewMetadata};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+const DEFAULT_MODEL: &str = "gpt-5-2025-08-07";
+
 /// Robocop: AI-powered code review tool
 #[derive(Parser, Debug)]
 #[command(name = "robocop")]
 #[command(about = "AI-powered code review tool", long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run a code review on the current git branch
+    Review(ReviewArgs),
+    /// List available OpenAI models
+    ListModels(ListModelsArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ReviewArgs {
     /// Default branch name to compare against
     #[arg(long, default_value = "main")]
     default_branch: String,
@@ -37,6 +53,17 @@ struct Args {
     /// Use OpenAI batch processing API
     #[arg(long)]
     batch: bool,
+
+    /// OpenAI model to use for the review
+    #[arg(long, default_value = DEFAULT_MODEL)]
+    model: String,
+}
+
+#[derive(Parser, Debug)]
+struct ListModelsArgs {
+    /// OpenAI API key (if not provided, will use OPENAI_API_KEY environment variable)
+    #[arg(long)]
+    api_key: Option<String>,
 }
 
 /// Get git diff of current working directory against the merge-base
@@ -229,17 +256,29 @@ struct Message {
     content: Option<String>,
 }
 
+/// Response from OpenAI models list API
+#[derive(serde::Deserialize, Debug)]
+struct ModelsResponse {
+    data: Vec<ModelInfo>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct ModelInfo {
+    id: String,
+}
+
 /// Process request using regular chat completions API
 async fn process_chat_completion(
     api_key: &str,
     system_prompt: &str,
     user_prompt: &str,
     reasoning_effort: &str,
+    model: &str,
 ) -> Result<String> {
     let client = reqwest::Client::new();
 
     let request_body = serde_json::json!({
-        "model": "gpt-5-2025-08-07",
+        "model": model,
         "reasoning_effort": reasoning_effort,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -309,16 +348,35 @@ async fn process_chat_completion(
         .context("No content in message")
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+/// List available OpenAI models
+async fn list_models(api_key: &str) -> Result<Vec<ModelInfo>> {
+    let client = reqwest::Client::new();
 
-    // Get API key from args or environment
-    let api_key = args
-        .api_key
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .context("OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable")?;
+    let response = client
+        .get("https://api.openai.com/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .context("Failed to send request to OpenAI")?;
 
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .context("Failed to read error response")?;
+        return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
+    }
+
+    let models_response: ModelsResponse = response
+        .json()
+        .await
+        .context("Failed to parse models response")?;
+
+    Ok(models_response.data)
+}
+
+async fn run_review(args: ReviewArgs) -> Result<()> {
     // Get git diff (sync operations are fine here)
     let git_data = get_git_diff(&args.default_branch)?;
 
@@ -368,8 +426,15 @@ async fn main() -> Result<()> {
         println!("{}", system_prompt);
         println!("\nUser prompt:");
         println!("{}", user_prompt);
+        println!("\nModel: {}", args.model);
         return Ok(());
     }
+
+    // Get API key from args or environment (only needed for actual API calls)
+    let api_key = args
+        .api_key
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .context("OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable")?;
 
     // Process the review
     if args.batch {
@@ -386,6 +451,7 @@ async fn main() -> Result<()> {
                 &args.reasoning_effort,
                 None, // version
                 additional_prompt,
+                Some(&args.model),
             )
             .await?;
 
@@ -397,6 +463,7 @@ async fn main() -> Result<()> {
             &system_prompt,
             &user_prompt,
             &args.reasoning_effort,
+            &args.model,
         )
         .await?;
 
@@ -404,4 +471,33 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_list_models(args: ListModelsArgs) -> Result<()> {
+    // Get API key from args or environment
+    let api_key = args
+        .api_key
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .context("OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable")?;
+
+    let mut models = list_models(&api_key).await?;
+
+    // Sort by id for consistent output
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+
+    for model in models {
+        println!("{}", model.id);
+    }
+
+    Ok(())
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Review(args) => run_review(args).await,
+        Commands::ListModels(args) => run_list_models(args).await,
+    }
 }
