@@ -47,7 +47,7 @@ struct ReviewArgs {
     include_files: Vec<String>,
 
     /// Reasoning effort level
-    #[arg(long, default_value = "high", value_parser = ["low", "medium", "high"])]
+    #[arg(long, default_value = "high", value_parser = ["none", "minimal", "low", "medium", "high", "xhigh"])]
     reasoning_effort: String,
 
     /// Use OpenAI batch processing API
