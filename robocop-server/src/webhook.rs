@@ -250,6 +250,7 @@ pub async fn github_webhook_handler(
                                         repo,
                                         pr_clone,
                                         false, // force_review: false for automatic triggers
+                                        None, // review_options: use defaults for automatic triggers
                                     )
                                     .await
                                     {
@@ -307,7 +308,7 @@ pub async fn github_webhook_handler(
                             );
 
                             match robocop_command {
-                                command::RobocopCommand::Review => {
+                                command::RobocopCommand::Review(opts) => {
                                     info!("Processing @smaug123-robocop review command");
 
                                     if let (Some(repo), Some(installation)) =
@@ -330,6 +331,7 @@ pub async fn github_webhook_handler(
                                                 installation_id,
                                                 repo,
                                                 issue_number,
+                                                opts,
                                             )
                                             .await
                                             {
@@ -700,8 +702,17 @@ async fn process_enable_reviews(
         },
     };
 
-    // Use force_review=false since we just enabled reviews
-    process_code_review(correlation_id, state, installation_id, repo, pr, false).await
+    // Use force_review=false since we just enabled reviews, use default options
+    process_code_review(
+        correlation_id,
+        state,
+        installation_id,
+        repo,
+        pr,
+        false,
+        None,
+    )
+    .await
 }
 
 async fn process_disable_reviews(
@@ -802,10 +813,11 @@ async fn process_manual_review(
     installation_id: u64,
     repo: Repository,
     pr_number: u64,
+    review_options: command::ReviewOptions,
 ) -> anyhow::Result<()> {
     info!(
-        "Processing manual review request for PR #{} in {}",
-        pr_number, repo.full_name
+        "Processing manual review request for PR #{} in {} (model: {:?}, reasoning: {:?})",
+        pr_number, repo.full_name, review_options.model, review_options.reasoning_effort
     );
 
     let github_client = &state.github_client;
@@ -834,8 +846,17 @@ async fn process_manual_review(
         },
     };
 
-    // Use the existing code review logic with force flag
-    process_code_review(correlation_id, state, installation_id, repo, pr, true).await
+    // Use the existing code review logic with force flag and review options
+    process_code_review(
+        correlation_id,
+        state,
+        installation_id,
+        repo,
+        pr,
+        true,
+        Some(review_options),
+    )
+    .await
 }
 
 async fn process_code_review(
@@ -845,10 +866,11 @@ async fn process_code_review(
     repo: Repository,
     pr: PullRequest,
     force_review: bool,
+    review_options: Option<command::ReviewOptions>,
 ) -> anyhow::Result<()> {
     info!(
-        "Processing code review for PR #{} in {} (force: {})",
-        pr.number, repo.full_name, force_review
+        "Processing code review for PR #{} in {} (force: {}, options: {:?})",
+        pr.number, repo.full_name, force_review, review_options
     );
 
     let github_client = &state.github_client;
@@ -1060,16 +1082,26 @@ async fn process_code_review(
     };
 
     let version = crate::get_bot_version();
+
+    // Extract options or use defaults
+    let reasoning_effort = review_options
+        .as_ref()
+        .and_then(|opts| opts.reasoning_effort.as_deref())
+        .unwrap_or("high");
+    let model = review_options
+        .as_ref()
+        .and_then(|opts| opts.model.as_deref());
+
     let batch_id = openai_client
         .process_code_review_batch(
             correlation_id,
             &diff,
             &file_contents,
             &metadata,
-            "high", // reasoning_effort - could be configurable
+            reasoning_effort,
             Some(&version),
             None, // additional_prompt
-            None, // model - use default
+            model,
         )
         .await?;
 
