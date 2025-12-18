@@ -1,20 +1,35 @@
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Headers that contain security-sensitive values and must be redacted.
+pub const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "openai-api-key",
+    "set-cookie",
+    "x-github-token",
+    "x-hub-signature",
+    "x-hub-signature-256",
+];
+
 pub struct Sanitizer;
 
 impl Sanitizer {
+    /// Check if a header name is sensitive and should be redacted.
+    pub fn is_sensitive_header(header_name: &str) -> bool {
+        let lower = header_name.to_lowercase();
+        SENSITIVE_HEADERS.contains(&lower.as_str())
+    }
+
     /// Remove sensitive data from headers
     pub fn sanitize_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
         let mut sanitized = HashMap::new();
 
         for (key, value) in headers {
-            let key_lower = key.to_lowercase();
-            let sanitized_value = match key_lower.as_str() {
-                "authorization" => "[REDACTED]".to_string(),
-                "x-hub-signature-256" => "[REDACTED]".to_string(),
-                "cookie" => "[REDACTED]".to_string(),
-                _ => value.clone(),
+            let sanitized_value = if Self::is_sensitive_header(key) {
+                "[REDACTED]".to_string()
+            } else {
+                value.clone()
             };
             sanitized.insert(key.clone(), sanitized_value);
         }

@@ -1,5 +1,5 @@
 ---
-source: tests/snapshot_tests.rs
+source: robocop-server/tests/snapshot_tests.rs
 description: "Webhook events from recordings: tests/recordings/sample1.jsonl"
 ---
 Object {
@@ -139,7 +139,7 @@ Object {
                     "x-github-hook-id": String("574738780"),
                     "x-github-hook-installation-target-id": String("2102163"),
                     "x-github-hook-installation-target-type": String("integration"),
-                    "x-hub-signature": String("sha1=6ba9b64eea78f27a45323f5682826b772dafe5d2"),
+                    "x-hub-signature": String("[REDACTED]"),
                     "x-hub-signature-256": String("[REDACTED]"),
                     "x-original-url": String("/fUXCCSi0ansR5rh7"),
                     "x-site-deployment-id": String("smee-io-production"),
@@ -321,7 +321,7 @@ Object {
                     "x-github-hook-id": String("574738780"),
                     "x-github-hook-installation-target-id": String("2102163"),
                     "x-github-hook-installation-target-type": String("integration"),
-                    "x-hub-signature": String("sha1=c7fb428248cf0627eb8c43cdbcbac04439c9c57f"),
+                    "x-hub-signature": String("[REDACTED]"),
                     "x-hub-signature-256": String("[REDACTED]"),
                     "x-original-url": String("/fUXCCSi0ansR5rh7"),
                     "x-site-deployment-id": String("smee-io-production"),
@@ -776,7 +776,7 @@ Object {
                     "x-github-hook-id": String("574738780"),
                     "x-github-hook-installation-target-id": String("2102163"),
                     "x-github-hook-installation-target-type": String("integration"),
-                    "x-hub-signature": String("sha1=9f5e4307482b6e7c812c0b1ae4214874e93f861e"),
+                    "x-hub-signature": String("[REDACTED]"),
                     "x-hub-signature-256": String("[REDACTED]"),
                     "x-original-url": String("/fUXCCSi0ansR5rh7"),
                     "x-site-deployment-id": String("smee-io-production"),

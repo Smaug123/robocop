@@ -1,5 +1,5 @@
 ---
-source: tests/snapshot_tests.rs
+source: robocop-server/tests/snapshot_tests.rs
 description: "Request/response pairs from recordings: tests/recordings/sample1.jsonl"
 ---
 Array [
@@ -338,7 +338,7 @@ Array [
                     "openai-project": String("proj_6wTwiRUWJMtX13kVZHqQWEK0"),
                     "openai-version": String("2020-10-01"),
                     "server": String("cloudflare"),
-                    "set-cookie": String("_cfuvid=VxKzUdrleFs5O6mCsSsIFdiWTVQDF4Fw7EQ.5ZGcqR4-1760254680314-0.0.1.1-604800000; path=/; domain=.api.openai.com; HttpOnly; Secure; SameSite=None"),
+                    "set-cookie": String("[REDACTED]"),
                     "strict-transport-security": String("max-age=31536000; includeSubDomains; preload"),
                     "x-content-type-options": String("nosniff"),
                     "x-envoy-upstream-service-time": String("382"),
@@ -567,7 +567,7 @@ Array [
                     "openai-project": String("proj_6wTwiRUWJMtX13kVZHqQWEK0"),
                     "openai-version": String("2020-10-01"),
                     "server": String("cloudflare"),
-                    "set-cookie": String("_cfuvid=aVxpxg.HAVczlwtEY13DoCALoEpz2vIEr8EWBFSMKyY-1760254717696-0.0.1.1-604800000; path=/; domain=.api.openai.com; HttpOnly; Secure; SameSite=None"),
+                    "set-cookie": String("[REDACTED]"),
                     "strict-transport-security": String("max-age=31536000; includeSubDomains; preload"),
                     "x-content-type-options": String("nosniff"),
                     "x-envoy-upstream-service-time": String("29"),
@@ -621,7 +621,7 @@ Array [
                     "openai-project": String("proj_6wTwiRUWJMtX13kVZHqQWEK0"),
                     "openai-version": String("2020-10-01"),
                     "server": String("cloudflare"),
-                    "set-cookie": String("_cfuvid=suaidMw6.pCkblIft0NSJ_AcGLHGBppKhT02AQZ0R7U-1760254777701-0.0.1.1-604800000; path=/; domain=.api.openai.com; HttpOnly; Secure; SameSite=None"),
+                    "set-cookie": String("[REDACTED]"),
                     "strict-transport-security": String("max-age=31536000; includeSubDomains; preload"),
                     "x-content-type-options": String("nosniff"),
                     "x-envoy-upstream-service-time": String("30"),
@@ -675,7 +675,7 @@ Array [
                     "openai-project": String("proj_6wTwiRUWJMtX13kVZHqQWEK0"),
                     "openai-version": String("2020-10-01"),
                     "server": String("cloudflare"),
-                    "set-cookie": String("_cfuvid=w9XHnLpDCZRwm.LGc9bNJwqiHdvHsvg8DtSu.A_zI3U-1760254837706-0.0.1.1-604800000; path=/; domain=.api.openai.com; HttpOnly; Secure; SameSite=None"),
+                    "set-cookie": String("[REDACTED]"),
                     "strict-transport-security": String("max-age=31536000; includeSubDomains; preload"),
                     "x-content-type-options": String("nosniff"),
                     "x-envoy-upstream-service-time": String("27"),
@@ -729,7 +729,7 @@ Array [
                     "openai-project": String("proj_6wTwiRUWJMtX13kVZHqQWEK0"),
                     "openai-version": String("2020-10-01"),
                     "server": String("cloudflare"),
-                    "set-cookie": String("_cfuvid=X3JdXRRPZ_.v35fS9tC8HO0MyllKDhawSJfJ8wEGZAY-1760254897750-0.0.1.1-604800000; path=/; domain=.api.openai.com; HttpOnly; Secure; SameSite=None"),
+                    "set-cookie": String("[REDACTED]"),
                     "strict-transport-security": String("max-age=31536000; includeSubDomains; preload"),
                     "x-content-type-options": String("nosniff"),
                     "x-envoy-upstream-service-time": String("70"),
@@ -784,7 +784,7 @@ Array [
                     "openai-project": String("proj_6wTwiRUWJMtX13kVZHqQWEK0"),
                     "openai-version": String("2020-10-01"),
                     "server": String("cloudflare"),
-                    "set-cookie": String("_cfuvid=Wer8tavSD_e8dFKPb6N28A7Qg8kONrRPWz7VcWTlPdY-1760254898016-0.0.1.1-604800000; path=/; domain=.api.openai.com; HttpOnly; Secure; SameSite=None"),
+                    "set-cookie": String("[REDACTED]"),
                     "strict-transport-security": String("max-age=31536000; includeSubDomains; preload"),
                     "x-content-type-options": String("nosniff"),
                     "x-envoy-upstream-service-time": String("103"),

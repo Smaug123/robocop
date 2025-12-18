@@ -1,5 +1,6 @@
 use insta::{assert_debug_snapshot, with_settings};
 use robocop_core::recording::test_utils::{MockGenerator, TestSuite};
+use robocop_core::recording::Sanitizer;
 use robocop_core::{Direction, EventType, RecordedEvent};
 use serde_json::json;
 use std::fs;
@@ -428,11 +429,13 @@ fn sanitize_webhook_data(data: &serde_json::Value) -> serde_json::Value {
     // Remove/redact sensitive information in headers
     if let Some(headers) = sanitized.get_mut("headers") {
         if let Some(headers_obj) = headers.as_object_mut() {
-            // Redact sensitive headers
-            for sensitive_header in ["x-hub-signature-256", "authorization", "x-github-token"] {
-                if headers_obj.contains_key(sensitive_header) {
-                    headers_obj.insert(sensitive_header.to_string(), json!("[REDACTED]"));
-                }
+            let keys_to_redact: Vec<String> = headers_obj
+                .keys()
+                .filter(|k| Sanitizer::is_sensitive_header(k))
+                .cloned()
+                .collect();
+            for key in keys_to_redact {
+                headers_obj.insert(key, json!("[REDACTED]"));
             }
         }
     }
@@ -454,13 +457,16 @@ fn sanitize_webhook_data(data: &serde_json::Value) -> serde_json::Value {
 fn sanitize_api_data(data: &serde_json::Value) -> serde_json::Value {
     let mut sanitized = data.clone();
 
-    // Redact authorization headers
+    // Redact sensitive headers
     if let Some(headers) = sanitized.get_mut("headers") {
         if let Some(headers_obj) = headers.as_object_mut() {
-            for auth_header in ["authorization", "x-github-token", "openai-api-key"] {
-                if headers_obj.contains_key(auth_header) {
-                    headers_obj.insert(auth_header.to_string(), json!("[REDACTED]"));
-                }
+            let keys_to_redact: Vec<String> = headers_obj
+                .keys()
+                .filter(|k| Sanitizer::is_sensitive_header(k))
+                .cloned()
+                .collect();
+            for key in keys_to_redact {
+                headers_obj.insert(key, json!("[REDACTED]"));
             }
         }
     }
