@@ -3,9 +3,9 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-use crate::github::PullRequestInfo;
+use crate::github::{CommitStatusRequest, CommitStatusState, PullRequestInfo};
 use crate::openai::BatchResponse;
-use crate::{AppState, PendingBatch};
+use crate::{AppState, PendingBatch, COMMIT_STATUS_CONTEXT};
 
 pub async fn batch_polling_loop(state: Arc<AppState>) {
     let mut interval = interval(Duration::from_secs(60)); // Poll every minute
@@ -155,6 +155,40 @@ async fn handle_completed_batch(
                 "Successfully updated comment {} with review results for batch {}",
                 comment_id, batch_response.id
             );
+
+            // Post commit status based on review result
+            let status_state = determine_review_status(review_result.substantive_comments);
+            let status_description = if review_result.substantive_comments {
+                "Code review found issues"
+            } else {
+                "Code review passed"
+            };
+
+            let status_target_url = format!(
+                "https://github.com/{}/{}/pull/{}#issuecomment-{}",
+                pending.repo_owner, pending.repo_name, pending.pr_number, comment_id
+            );
+
+            let status_request = CommitStatusRequest {
+                installation_id: pending.installation_id,
+                repo_owner: &pending.repo_owner,
+                repo_name: &pending.repo_name,
+                sha: &pending.head_sha,
+                state: status_state,
+                target_url: Some(&status_target_url),
+                description: Some(status_description),
+                context: COMMIT_STATUS_CONTEXT,
+            };
+
+            if let Err(e) = github_client
+                .post_commit_status(None, &status_request)
+                .await
+            {
+                error!(
+                    "Failed to post commit status for completed batch {}: {}",
+                    batch_response.id, e
+                );
+            }
         }
         Err(e) => {
             error!(
@@ -214,6 +248,35 @@ async fn handle_failed_batch(
     {
         error!(
             "Failed to update comment for failed batch {}: {}",
+            pending.batch_id, e
+        );
+    }
+
+    // Post error commit status
+    let status_desc = match status {
+        "failed" => "Review failed during processing",
+        "expired" => "Review timed out",
+        "cancelled" => "Review was cancelled",
+        _ => "Review encountered an error",
+    };
+
+    let status_request = CommitStatusRequest {
+        installation_id: pending.installation_id,
+        repo_owner: &pending.repo_owner,
+        repo_name: &pending.repo_name,
+        sha: &pending.head_sha,
+        state: CommitStatusState::Error,
+        target_url: None,
+        description: Some(status_desc),
+        context: COMMIT_STATUS_CONTEXT,
+    };
+
+    if let Err(e) = github_client
+        .post_commit_status(None, &status_request)
+        .await
+    {
+        error!(
+            "Failed to post error commit status for batch {}: {}",
             pending.batch_id, e
         );
     }
@@ -286,6 +349,18 @@ fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
     Ok(review_result)
 }
 
+/// Determine the commit status state based on the review result.
+///
+/// - Returns `Success` if no substantive comments were found
+/// - Returns `Failure` if substantive comments were found
+fn determine_review_status(substantive_comments: bool) -> CommitStatusState {
+    if substantive_comments {
+        CommitStatusState::Failure
+    } else {
+        CommitStatusState::Success
+    }
+}
+
 fn format_review_comment(review: &ReviewResult, batch_id: &str, commit_sha: &str) -> String {
     if review.substantive_comments {
         format!(
@@ -305,5 +380,83 @@ fn format_review_comment(review: &ReviewResult, batch_id: &str, commit_sha: &str
             **Status:** Completed",
             commit_sha, batch_id
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_determine_review_status_with_issues() {
+        // When there are substantive comments, the status should be Failure
+        let status = determine_review_status(true);
+        assert_eq!(status, CommitStatusState::Failure);
+    }
+
+    #[test]
+    fn test_determine_review_status_without_issues() {
+        // When there are no substantive comments, the status should be Success
+        let status = determine_review_status(false);
+        assert_eq!(status, CommitStatusState::Success);
+    }
+
+    #[test]
+    fn test_format_review_comment_with_issues() {
+        let review = ReviewResult {
+            substantive_comments: true,
+            summary: "Found a potential null pointer issue".to_string(),
+        };
+        let comment = format_review_comment(&review, "batch_123", "abc1234");
+
+        assert!(comment.contains("🤖 **Code Review Complete**"));
+        assert!(comment.contains("Found a potential null pointer issue"));
+        assert!(comment.contains("`abc1234`"));
+        assert!(comment.contains("`batch_123`"));
+    }
+
+    #[test]
+    fn test_format_review_comment_without_issues() {
+        let review = ReviewResult {
+            substantive_comments: false,
+            summary: "This shouldn't be shown".to_string(),
+        };
+        let comment = format_review_comment(&review, "batch_456", "def5678");
+
+        assert!(comment.contains("✅ **Code Review Complete**"));
+        assert!(comment.contains("No issues found"));
+        assert!(comment.contains("`def5678`"));
+        assert!(comment.contains("`batch_456`"));
+        // Summary is not shown when no issues
+        assert!(!comment.contains("This shouldn't be shown"));
+    }
+
+    #[test]
+    fn test_parse_batch_output_success() {
+        let jsonl = r#"{"response":{"status_code":200,"body":{"choices":[{"message":{"content":"{\"substantiveComments\":false,\"summary\":\"All good\"}"}}]}},"error":null}"#;
+        let result = parse_batch_output(jsonl).unwrap();
+        assert!(!result.substantive_comments);
+        assert_eq!(result.summary, "All good");
+    }
+
+    #[test]
+    fn test_parse_batch_output_with_issues() {
+        let jsonl = r#"{"response":{"status_code":200,"body":{"choices":[{"message":{"content":"{\"substantiveComments\":true,\"summary\":\"Found issues\"}"}}]}},"error":null}"#;
+        let result = parse_batch_output(jsonl).unwrap();
+        assert!(result.substantive_comments);
+        assert_eq!(result.summary, "Found issues");
+    }
+
+    #[test]
+    fn test_parse_batch_output_empty() {
+        let result = parse_batch_output("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_batch_output_non_200() {
+        let jsonl = r#"{"response":{"status_code":500,"body":{"choices":[]}},"error":null}"#;
+        let result = parse_batch_output(jsonl);
+        assert!(result.is_err());
     }
 }

@@ -21,6 +21,10 @@ pub use robocop_core::{
     Sanitizer, ServiceType, CORRELATION_ID_HEADER,
 };
 
+/// The context string used for GitHub commit statuses posted by robocop.
+/// This is used with GitHub branch protection rules to require reviews.
+pub const COMMIT_STATUS_CONTEXT: &str = "robocop/code-review";
+
 mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }

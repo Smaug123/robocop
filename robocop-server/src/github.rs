@@ -53,6 +53,62 @@ pub struct CompareResult {
     pub total_commits: u32,
 }
 
+/// GitHub commit status state
+///
+/// See: https://docs.github.com/en/rest/commits/statuses
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitStatusState {
+    /// The check is in progress
+    Pending,
+    /// The check was successful
+    Success,
+    /// The check found issues (e.g., substantive review comments)
+    Failure,
+    /// The check encountered an error (e.g., cancelled, expired)
+    Error,
+}
+
+impl CommitStatusState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CommitStatusState::Pending => "pending",
+            CommitStatusState::Success => "success",
+            CommitStatusState::Failure => "failure",
+            CommitStatusState::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CreateStatusRequest {
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    context: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitStatusResponse {
+    pub id: u64,
+    pub state: String,
+    pub context: String,
+}
+
+/// Request to create a commit status
+#[derive(Debug, Clone)]
+pub struct CommitStatusRequest<'a> {
+    pub installation_id: u64,
+    pub repo_owner: &'a str,
+    pub repo_name: &'a str,
+    pub sha: &'a str,
+    pub state: CommitStatusState,
+    pub target_url: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub context: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequestInfo {
     pub installation_id: u64,
@@ -1097,6 +1153,84 @@ impl GitHubClient {
 
         Ok(result)
     }
+
+    /// Post a commit status to a specific commit SHA
+    ///
+    /// This is used to report the status of the code review as a GitHub commit status,
+    /// which can be used with branch protection rules to require reviews before merging.
+    ///
+    /// See: https://docs.github.com/en/rest/commits/statuses#create-a-commit-status
+    pub async fn post_commit_status(
+        &self,
+        correlation_id: Option<&str>,
+        request: &CommitStatusRequest<'_>,
+    ) -> Result<CommitStatusResponse> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/statuses/{}",
+            request.repo_owner, request.repo_name, request.sha
+        );
+
+        info!(
+            "Posting commit status '{}' for {} in {}/{}",
+            request.state.as_str(),
+            request.sha,
+            request.repo_owner,
+            request.repo_name
+        );
+
+        let token = self.get_installation_token(request.installation_id).await?;
+        let request_body = CreateStatusRequest {
+            state: request.state.as_str().to_string(),
+            target_url: request.target_url.map(|s| s.to_string()),
+            description: request.description.map(|s| s.to_string()),
+            context: request.context.to_string(),
+        };
+
+        let mut request_builder = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github.v3+json")
+            .body(serde_json::to_string(&request_body)?)
+            .header("Content-Type", "application/json");
+
+        if let Some(cid) = correlation_id {
+            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .context("Failed to send commit status request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .context("Failed to read error response body")?;
+            error!(
+                "GitHub API error posting commit status: {} - {}",
+                status, error_text
+            );
+            return Err(anyhow!(
+                "GitHub API error posting commit status: {} - {}",
+                status,
+                error_text
+            ));
+        }
+
+        let status_response: CommitStatusResponse = response
+            .json()
+            .await
+            .context("Failed to parse commit status response")?;
+        info!(
+            "Successfully posted commit status {} (id: {}, context: {})",
+            status_response.state, status_response.id, status_response.context
+        );
+
+        Ok(status_response)
+    }
 }
 
 /// Check if a PR description or comment contains the disable-reviews marker
@@ -1138,6 +1272,62 @@ pub fn create_github_client(recording_logger: Option<RecordingLogger>) -> Client
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_commit_status_state_as_str() {
+        assert_eq!(CommitStatusState::Pending.as_str(), "pending");
+        assert_eq!(CommitStatusState::Success.as_str(), "success");
+        assert_eq!(CommitStatusState::Failure.as_str(), "failure");
+        assert_eq!(CommitStatusState::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn test_commit_status_state_equality() {
+        assert_eq!(CommitStatusState::Pending, CommitStatusState::Pending);
+        assert_ne!(CommitStatusState::Pending, CommitStatusState::Success);
+        assert_ne!(CommitStatusState::Success, CommitStatusState::Failure);
+        assert_ne!(CommitStatusState::Failure, CommitStatusState::Error);
+    }
+
+    #[test]
+    fn test_commit_status_request_creation() {
+        let request = CommitStatusRequest {
+            installation_id: 12345,
+            repo_owner: "test-owner",
+            repo_name: "test-repo",
+            sha: "abc123",
+            state: CommitStatusState::Success,
+            target_url: Some("https://example.com"),
+            description: Some("Test passed"),
+            context: "robocop/code-review",
+        };
+
+        assert_eq!(request.installation_id, 12345);
+        assert_eq!(request.repo_owner, "test-owner");
+        assert_eq!(request.repo_name, "test-repo");
+        assert_eq!(request.sha, "abc123");
+        assert_eq!(request.state, CommitStatusState::Success);
+        assert_eq!(request.target_url, Some("https://example.com"));
+        assert_eq!(request.description, Some("Test passed"));
+        assert_eq!(request.context, "robocop/code-review");
+    }
+
+    #[test]
+    fn test_commit_status_request_with_none_values() {
+        let request = CommitStatusRequest {
+            installation_id: 1,
+            repo_owner: "owner",
+            repo_name: "repo",
+            sha: "sha",
+            state: CommitStatusState::Pending,
+            target_url: None,
+            description: None,
+            context: "test",
+        };
+
+        assert!(request.target_url.is_none());
+        assert!(request.description.is_none());
+    }
 
     #[test]
     fn test_contains_disable_reviews_marker_present() {

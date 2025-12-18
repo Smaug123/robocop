@@ -16,9 +16,11 @@ use uuid::Uuid;
 
 use crate::command;
 use crate::git::GitOps;
-use crate::github::{FileContentRequest, FileSizeLimits, PullRequestInfo};
+use crate::github::{
+    CommitStatusRequest, CommitStatusState, FileContentRequest, FileSizeLimits, PullRequestInfo,
+};
 use crate::openai::ReviewMetadata;
-use crate::AppState;
+use crate::{AppState, COMMIT_STATUS_CONTEXT};
 use crate::{CorrelationId, Direction, EventType, RecordedEvent, Sanitizer};
 
 #[derive(Debug, Deserialize)]
@@ -591,7 +593,7 @@ async fn process_cancel_reviews(
     let mut failed_cancellations = Vec::new();
     let mut batches_to_remove = Vec::new();
 
-    for (batch_id, _batch) in &batches_to_cancel {
+    for (batch_id, batch) in &batches_to_cancel {
         info!("Attempting to cancel batch {}", batch_id);
 
         match state
@@ -606,6 +608,28 @@ async fn process_cancel_reviews(
                 );
                 cancelled_count += 1;
                 batches_to_remove.push(batch_id.clone());
+
+                // Post error status for the cancelled batch
+                let status_request = CommitStatusRequest {
+                    installation_id,
+                    repo_owner,
+                    repo_name,
+                    sha: &batch.head_sha,
+                    state: CommitStatusState::Error,
+                    target_url: None,
+                    description: Some("Review cancelled by user"),
+                    context: COMMIT_STATUS_CONTEXT,
+                };
+                if let Err(e) = state
+                    .github_client
+                    .post_commit_status(correlation_id, &status_request)
+                    .await
+                {
+                    error!(
+                        "Failed to post cancelled commit status for batch {}: {}",
+                        batch_id, e
+                    );
+                }
             }
             Err(e) => {
                 warn!("Failed to cancel batch {}: {}", batch_id, e);
@@ -819,7 +843,7 @@ async fn process_disable_reviews(
 
     let cancelled_count = batches_to_cancel.len();
 
-    for (batch_id, _) in &batches_to_cancel {
+    for (batch_id, batch) in &batches_to_cancel {
         info!("Cancelling batch {} due to disable-reviews", batch_id);
         if let Err(e) = state
             .openai_client
@@ -827,6 +851,28 @@ async fn process_disable_reviews(
             .await
         {
             warn!("Failed to cancel batch {}: {}", batch_id, e);
+        } else {
+            // Post error status for the disabled review
+            let status_request = CommitStatusRequest {
+                installation_id,
+                repo_owner,
+                repo_name,
+                sha: &batch.head_sha,
+                state: CommitStatusState::Error,
+                target_url: None,
+                description: Some("Reviews disabled for this PR"),
+                context: COMMIT_STATUS_CONTEXT,
+            };
+            if let Err(e) = state
+                .github_client
+                .post_commit_status(correlation_id, &status_request)
+                .await
+            {
+                error!(
+                    "Failed to post disabled commit status for batch {}: {}",
+                    batch_id, e
+                );
+            }
         }
     }
 
@@ -1246,6 +1292,32 @@ async fn process_code_review(
         comment_id, batch_id, pr.number, repo.full_name
     );
 
+    // Post pending commit status
+    let status_target_url = format!(
+        "https://github.com/{}/pull/{}#issuecomment-{}",
+        repo.full_name, pr.number, comment_id
+    );
+    let status_request = CommitStatusRequest {
+        installation_id,
+        repo_owner,
+        repo_name,
+        sha: head_sha,
+        state: CommitStatusState::Pending,
+        target_url: Some(&status_target_url),
+        description: Some("Code review in progress"),
+        context: COMMIT_STATUS_CONTEXT,
+    };
+    if let Err(e) = github_client
+        .post_commit_status(correlation_id, &status_request)
+        .await
+    {
+        // Log but don't fail the review - status posting is best-effort
+        error!(
+            "Failed to post pending commit status for PR #{}: {}",
+            pr.number, e
+        );
+    }
+
     // Store batch for polling
     let pending_batch = crate::PendingBatch {
         batch_id: batch_id.clone(),
@@ -1388,6 +1460,31 @@ async fn cancel_superseded_batches(
                         {
                             error!(
                                 "Failed to update comment for cancelled batch {}: {}",
+                                batch_id, e
+                            );
+                        }
+
+                        // Post error status for the superseded commit
+                        let status_description = format!(
+                            "Review superseded by commit {}",
+                            &new_head_sha[..7.min(new_head_sha.len())]
+                        );
+                        let status_request = CommitStatusRequest {
+                            installation_id: batch.installation_id,
+                            repo_owner: &batch.repo_owner,
+                            repo_name: &batch.repo_name,
+                            sha: &batch.head_sha,
+                            state: CommitStatusState::Error,
+                            target_url: None,
+                            description: Some(&status_description),
+                            context: COMMIT_STATUS_CONTEXT,
+                        };
+                        if let Err(e) = github_client
+                            .post_commit_status(correlation_id, &status_request)
+                            .await
+                        {
+                            error!(
+                                "Failed to post superseded commit status for batch {}: {}",
                                 batch_id, e
                             );
                         }
