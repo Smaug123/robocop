@@ -605,6 +605,11 @@ impl OpenAIClient {
         );
         batch_metadata.insert("metadata_schema".to_string(), "1".to_string());
         batch_metadata.insert("repo_name".to_string(), metadata.repo_name.clone());
+        batch_metadata.insert(
+            "model".to_string(),
+            model.unwrap_or("gpt-5-2025-08-07").to_string(),
+        );
+        batch_metadata.insert("reasoning_effort".to_string(), reasoning_effort.to_string());
 
         if let Some(ver) = version {
             batch_metadata.insert("version".to_string(), ver.to_string());

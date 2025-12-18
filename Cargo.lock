@@ -1420,6 +1420,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "built",
  "chrono",
  "http",
  "insta",
@@ -1441,7 +1442,6 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
- "built",
  "chrono",
  "hex",
  "hmac",

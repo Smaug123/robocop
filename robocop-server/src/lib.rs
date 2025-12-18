@@ -25,28 +25,9 @@ pub use robocop_core::{
 /// This is used with GitHub branch protection rules to require reviews.
 pub const COMMIT_STATUS_CONTEXT: &str = "robocop/code-review";
 
-mod built_info {
-    include!(concat!(env!("OUT_DIR"), "/built.rs"));
-}
-
+/// Returns the bot version (delegates to robocop_core::get_library_version).
 pub fn get_bot_version() -> String {
-    // First check for git hash from Nix build environment
-    if let Some(git_hash) = option_env!("ROBOCOP_GIT_HASH") {
-        if git_hash.len() >= 8 {
-            git_hash[..8].to_string()
-        } else {
-            git_hash.to_string()
-        }
-    } else if let Some(git_hash) = built_info::GIT_COMMIT_HASH {
-        // Fall back to built crate's git detection (for cargo builds)
-        if git_hash.len() >= 8 {
-            git_hash[..8].to_string()
-        } else {
-            git_hash.to_string()
-        }
-    } else {
-        "unknown".to_string()
-    }
+    robocop_core::get_library_version()
 }
 
 #[derive(Debug, Clone)]

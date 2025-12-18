@@ -172,7 +172,7 @@ function renderBatches(batches) {
     if (filteredBatches.length === 0) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="8" class="px-6 py-4 text-center text-gray-500">
+                <td colspan="9" class="px-6 py-4 text-center text-gray-500">
                     No robocop review batches found
                 </td>
             </tr>
@@ -220,6 +220,11 @@ function renderBatches(batches) {
             <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-900">
                 <span title="${escapeHtml(batch.metadata?.target_commit || 'N/A')}">
                     ${formatCommitHash(batch.metadata?.target_commit)}
+                </span>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                <span title="Reasoning effort: ${escapeHtml(batch.metadata?.reasoning_effort || 'N/A')}&#10;Robocop version: ${escapeHtml(batch.metadata?.version || 'N/A')}">
+                    ${escapeHtml(batch.metadata?.model || 'N/A')}
                 </span>
             </td>
             <td class="px-6 py-4 text-sm">

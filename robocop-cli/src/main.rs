@@ -441,6 +441,7 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
         // Use batch API
         let client = OpenAIClient::new(api_key);
         let metadata = ReviewMetadata::from_git_data(&git_data, None);
+        let version = robocop_core::get_library_version();
 
         let batch_id = client
             .process_code_review_batch(
@@ -449,7 +450,7 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
                 &file_contents,
                 &metadata,
                 &args.reasoning_effort,
-                None, // version
+                Some(&version),
                 additional_prompt,
                 Some(&args.model),
             )
