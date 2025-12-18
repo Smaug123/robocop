@@ -296,157 +296,219 @@ pub async fn github_webhook_handler(
                     );
 
                     // Parse the comment for robocop commands
-                    if let Some(robocop_command) = command::parse_comment(&comment.body) {
-                        info!("Found robocop command: {}", robocop_command);
+                    match command::parse_comment(&comment.body) {
+                        command::ParseResult::Command(robocop_command) => {
+                            info!("Found robocop command: {}", robocop_command);
 
-                        // SECURITY: Only process commands from the configured target user
-                        // to prevent unauthorized users from depleting OpenAI credits
-                        if comment.user.id == state.target_user_id {
+                            // SECURITY: Only process commands from the configured target user
+                            // to prevent unauthorized users from depleting OpenAI credits
+                            if comment.user.id == state.target_user_id {
+                                info!(
+                                    "Command from target user detected (ID: {}, username: {}), processing...",
+                                    comment.user.id, comment.user.login
+                                );
+
+                                match robocop_command {
+                                    command::RobocopCommand::Review(opts) => {
+                                        info!("Processing @smaug123-robocop review command");
+
+                                        if let (Some(repo), Some(installation)) =
+                                            (payload.repository.clone(), &payload.installation)
+                                        {
+                                            let state_clone = state.clone();
+                                            let issue_number = issue.number;
+                                            let installation_id = installation.id;
+                                            let correlation_id_clone = correlation_id.clone();
+
+                                            tokio::spawn(async move {
+                                                info!(
+                                                    "Spawned background task for manual review of PR #{}",
+                                                    issue_number
+                                                );
+
+                                                if let Err(e) = process_manual_review(
+                                                    correlation_id_clone.as_deref(),
+                                                    state_clone,
+                                                    installation_id,
+                                                    repo,
+                                                    issue_number,
+                                                    opts,
+                                                )
+                                                .await
+                                                {
+                                                    error!(
+                                                        "Failed to process manual review: {}",
+                                                        e
+                                                    );
+                                                }
+                                            });
+                                        } else {
+                                            warn!("Missing repository or installation info for review command");
+                                        }
+                                    }
+                                    command::RobocopCommand::Cancel => {
+                                        info!("Processing @smaug123-robocop cancel command");
+
+                                        if let (Some(repo), Some(installation)) =
+                                            (payload.repository.clone(), &payload.installation)
+                                        {
+                                            let state_clone = state.clone();
+                                            let issue_number = issue.number;
+                                            let installation_id = installation.id;
+                                            let correlation_id_clone = correlation_id.clone();
+
+                                            tokio::spawn(async move {
+                                                info!(
+                                                    "Spawned background task to cancel reviews for PR #{}",
+                                                    issue_number
+                                                );
+
+                                                if let Err(e) = process_cancel_reviews(
+                                                    correlation_id_clone.as_deref(),
+                                                    state_clone,
+                                                    installation_id,
+                                                    repo,
+                                                    issue_number,
+                                                )
+                                                .await
+                                                {
+                                                    error!("Failed to cancel reviews: {}", e);
+                                                }
+                                            });
+                                        } else {
+                                            warn!("Missing repository or installation info for cancel command");
+                                        }
+                                    }
+                                    command::RobocopCommand::EnableReviews => {
+                                        info!(
+                                            "Processing @smaug123-robocop enable-reviews command"
+                                        );
+
+                                        if let (Some(repo), Some(installation)) =
+                                            (payload.repository.clone(), &payload.installation)
+                                        {
+                                            let state_clone = state.clone();
+                                            let issue_number = issue.number;
+                                            let installation_id = installation.id;
+                                            let correlation_id_clone = correlation_id.clone();
+
+                                            tokio::spawn(async move {
+                                                info!(
+                                                    "Spawned background task to enable reviews for PR #{}",
+                                                    issue_number
+                                                );
+
+                                                if let Err(e) = process_enable_reviews(
+                                                    correlation_id_clone.as_deref(),
+                                                    state_clone,
+                                                    installation_id,
+                                                    repo,
+                                                    issue_number,
+                                                )
+                                                .await
+                                                {
+                                                    error!(
+                                                        "Failed to process enable-reviews: {}",
+                                                        e
+                                                    );
+                                                }
+                                            });
+                                        } else {
+                                            warn!("Missing repository or installation info for enable-reviews command");
+                                        }
+                                    }
+                                    command::RobocopCommand::DisableReviews => {
+                                        info!(
+                                            "Processing @smaug123-robocop disable-reviews command"
+                                        );
+
+                                        if let (Some(repo), Some(installation)) =
+                                            (payload.repository.clone(), &payload.installation)
+                                        {
+                                            let state_clone = state.clone();
+                                            let issue_number = issue.number;
+                                            let installation_id = installation.id;
+                                            let correlation_id_clone = correlation_id.clone();
+
+                                            tokio::spawn(async move {
+                                                info!(
+                                                    "Spawned background task to disable reviews for PR #{}",
+                                                    issue_number
+                                                );
+
+                                                if let Err(e) = process_disable_reviews(
+                                                    correlation_id_clone.as_deref(),
+                                                    state_clone,
+                                                    installation_id,
+                                                    repo,
+                                                    issue_number,
+                                                )
+                                                .await
+                                                {
+                                                    error!(
+                                                        "Failed to process disable-reviews: {}",
+                                                        e
+                                                    );
+                                                }
+                                            });
+                                        } else {
+                                            warn!("Missing repository or installation info for disable-reviews command");
+                                        }
+                                    }
+                                }
+                            } else {
+                                info!(
+                                    "Command from different user (ID: {}, username: {}), ignoring",
+                                    comment.user.id, comment.user.login
+                                );
+                            }
+                        }
+                        command::ParseResult::UnrecognizedCommand { attempted } => {
                             info!(
-                                "Command from target user detected (ID: {}, username: {}), processing...",
-                                comment.user.id, comment.user.login
+                                "Unrecognized command '{}' from user {} (ID: {})",
+                                attempted, comment.user.login, comment.user.id
                             );
 
-                            match robocop_command {
-                                command::RobocopCommand::Review(opts) => {
-                                    info!("Processing @smaug123-robocop review command");
+                            // Only respond to unrecognized commands from the target user
+                            if comment.user.id == state.target_user_id {
+                                if let (Some(repo), Some(installation)) =
+                                    (payload.repository.clone(), &payload.installation)
+                                {
+                                    let state_clone = state.clone();
+                                    let issue_number = issue.number;
+                                    let installation_id = installation.id;
+                                    let correlation_id_clone = correlation_id.clone();
+                                    let attempted_clone = attempted.clone();
 
-                                    if let (Some(repo), Some(installation)) =
-                                        (payload.repository.clone(), &payload.installation)
-                                    {
-                                        let state_clone = state.clone();
-                                        let issue_number = issue.number;
-                                        let installation_id = installation.id;
-                                        let correlation_id_clone = correlation_id.clone();
+                                    tokio::spawn(async move {
+                                        info!(
+                                            "Spawned background task to respond to unrecognized command on PR #{}",
+                                            issue_number
+                                        );
 
-                                        tokio::spawn(async move {
-                                            info!(
-                                                "Spawned background task for manual review of PR #{}",
-                                                issue_number
+                                        if let Err(e) = process_unrecognized_command(
+                                            correlation_id_clone.as_deref(),
+                                            state_clone,
+                                            installation_id,
+                                            repo,
+                                            issue_number,
+                                            &attempted_clone,
+                                        )
+                                        .await
+                                        {
+                                            error!(
+                                                "Failed to respond to unrecognized command: {}",
+                                                e
                                             );
-
-                                            if let Err(e) = process_manual_review(
-                                                correlation_id_clone.as_deref(),
-                                                state_clone,
-                                                installation_id,
-                                                repo,
-                                                issue_number,
-                                                opts,
-                                            )
-                                            .await
-                                            {
-                                                error!("Failed to process manual review: {}", e);
-                                            }
-                                        });
-                                    } else {
-                                        warn!("Missing repository or installation info for review command");
-                                    }
-                                }
-                                command::RobocopCommand::Cancel => {
-                                    info!("Processing @smaug123-robocop cancel command");
-
-                                    if let (Some(repo), Some(installation)) =
-                                        (payload.repository.clone(), &payload.installation)
-                                    {
-                                        let state_clone = state.clone();
-                                        let issue_number = issue.number;
-                                        let installation_id = installation.id;
-                                        let correlation_id_clone = correlation_id.clone();
-
-                                        tokio::spawn(async move {
-                                            info!(
-                                                "Spawned background task to cancel reviews for PR #{}",
-                                                issue_number
-                                            );
-
-                                            if let Err(e) = process_cancel_reviews(
-                                                correlation_id_clone.as_deref(),
-                                                state_clone,
-                                                installation_id,
-                                                repo,
-                                                issue_number,
-                                            )
-                                            .await
-                                            {
-                                                error!("Failed to cancel reviews: {}", e);
-                                            }
-                                        });
-                                    } else {
-                                        warn!("Missing repository or installation info for cancel command");
-                                    }
-                                }
-                                command::RobocopCommand::EnableReviews => {
-                                    info!("Processing @smaug123-robocop enable-reviews command");
-
-                                    if let (Some(repo), Some(installation)) =
-                                        (payload.repository.clone(), &payload.installation)
-                                    {
-                                        let state_clone = state.clone();
-                                        let issue_number = issue.number;
-                                        let installation_id = installation.id;
-                                        let correlation_id_clone = correlation_id.clone();
-
-                                        tokio::spawn(async move {
-                                            info!(
-                                                "Spawned background task to enable reviews for PR #{}",
-                                                issue_number
-                                            );
-
-                                            if let Err(e) = process_enable_reviews(
-                                                correlation_id_clone.as_deref(),
-                                                state_clone,
-                                                installation_id,
-                                                repo,
-                                                issue_number,
-                                            )
-                                            .await
-                                            {
-                                                error!("Failed to process enable-reviews: {}", e);
-                                            }
-                                        });
-                                    } else {
-                                        warn!("Missing repository or installation info for enable-reviews command");
-                                    }
-                                }
-                                command::RobocopCommand::DisableReviews => {
-                                    info!("Processing @smaug123-robocop disable-reviews command");
-
-                                    if let (Some(repo), Some(installation)) =
-                                        (payload.repository.clone(), &payload.installation)
-                                    {
-                                        let state_clone = state.clone();
-                                        let issue_number = issue.number;
-                                        let installation_id = installation.id;
-                                        let correlation_id_clone = correlation_id.clone();
-
-                                        tokio::spawn(async move {
-                                            info!(
-                                                "Spawned background task to disable reviews for PR #{}",
-                                                issue_number
-                                            );
-
-                                            if let Err(e) = process_disable_reviews(
-                                                correlation_id_clone.as_deref(),
-                                                state_clone,
-                                                installation_id,
-                                                repo,
-                                                issue_number,
-                                            )
-                                            .await
-                                            {
-                                                error!("Failed to process disable-reviews: {}", e);
-                                            }
-                                        });
-                                    } else {
-                                        warn!("Missing repository or installation info for disable-reviews command");
-                                    }
+                                        }
+                                    });
+                                } else {
+                                    warn!("Missing repository or installation info for unrecognized command response");
                                 }
                             }
-                        } else {
-                            info!(
-                                "Command from different user (ID: {}, username: {}), ignoring",
-                                comment.user.id, comment.user.login
-                            );
+                        }
+                        command::ParseResult::NoMention => {
+                            // Comment doesn't mention the bot, ignore it
                         }
                     }
                 } else {
@@ -807,6 +869,56 @@ async fn process_disable_reviews(
     Ok(())
 }
 
+async fn process_unrecognized_command(
+    correlation_id: Option<&str>,
+    state: Arc<AppState>,
+    installation_id: u64,
+    repo: Repository,
+    pr_number: u64,
+    attempted_command: &str,
+) -> anyhow::Result<()> {
+    info!(
+        "Responding to unrecognized command '{}' on PR #{} in {}",
+        attempted_command, pr_number, repo.full_name
+    );
+
+    let repo_owner = &repo.owner.login;
+    let repo_name = &repo.name;
+
+    let version = crate::get_bot_version();
+    let attempted_display = if attempted_command.is_empty() {
+        "(no command provided)".to_string()
+    } else {
+        format!("`{}`", attempted_command)
+    };
+
+    let content = format!(
+        "❓ **Unrecognized command**\n\n\
+        I didn't recognize the command {}.\n\n\
+        **Available commands:**\n\
+        - `@smaug123-robocop review` — Request a code review\n\
+        - `@smaug123-robocop review model:<model> reasoning:<level>` — Review with custom options\n\
+        - `@smaug123-robocop cancel` — Cancel all pending reviews for this PR\n\
+        - `@smaug123-robocop enable-reviews` — Enable automatic reviews\n\
+        - `@smaug123-robocop disable-reviews` — Disable automatic reviews",
+        attempted_display
+    );
+
+    let pr_info = PullRequestInfo {
+        installation_id,
+        repo_owner: repo_owner.to_string(),
+        repo_name: repo_name.to_string(),
+        pr_number,
+    };
+
+    state
+        .github_client
+        .manage_robocop_comment(correlation_id, &pr_info, &content, &version)
+        .await?;
+
+    Ok(())
+}
+
 async fn process_manual_review(
     correlation_id: Option<&str>,
     state: Arc<AppState>,
@@ -905,6 +1017,7 @@ async fn process_code_review(
                 repo_owner,
                 repo_name,
                 pr.number,
+                state.target_user_id,
             )
             .await?;
 
@@ -1442,11 +1555,17 @@ mod tests {
         assert_eq!(payload_from_target.action, Some("created".to_string()));
         let comment_target = payload_from_target.comment.as_ref().unwrap();
         assert_eq!(comment_target.user.id, target_user_id);
-        assert!(command::parse_comment(&comment_target.body).is_some());
+        assert!(matches!(
+            command::parse_comment(&comment_target.body),
+            command::ParseResult::Command(_)
+        ));
 
         let comment_unauthorized = payload_from_unauthorized.comment.as_ref().unwrap();
         assert_eq!(comment_unauthorized.user.id, unauthorized_user_id);
-        assert!(command::parse_comment(&comment_unauthorized.body).is_some());
+        assert!(matches!(
+            command::parse_comment(&comment_unauthorized.body),
+            command::ParseResult::Command(_)
+        ));
 
         // The actual authorization check happens in the webhook handler:
         // comment.user.id == state.target_user_id

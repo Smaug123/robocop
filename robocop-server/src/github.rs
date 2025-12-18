@@ -41,6 +41,7 @@ pub struct UpdateCommentRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct CommentUser {
+    pub id: u64,
     pub login: String,
 }
 

@@ -23,6 +23,74 @@ pub enum RobocopCommand {
     DisableReviews,
 }
 
+/// A review state change that has been verified to come from an authorized user.
+///
+/// This type can only be constructed via [`try_authorize_state_change`], which requires
+/// the comment's user ID to match the target user ID. This enforces at the type level
+/// that state changes can only come from authorized users.
+///
+/// # Security
+/// This type exists to prevent accidentally processing unauthorized commands.
+/// By requiring this type in functions that change review state, we make it
+/// a compile-time error to forget the authorization check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizedStateChange {
+    /// Reviews should be enabled
+    Enable,
+    /// Reviews should be disabled
+    Disable,
+}
+
+/// Try to extract an authorized state change from a comment.
+///
+/// Returns `Some(AuthorizedStateChange)` only if:
+/// 1. The comment contains a valid enable-reviews or disable-reviews command
+/// 2. The comment author's user ID matches the target user ID
+///
+/// # Arguments
+/// * `comment_body` - The comment text to parse
+/// * `comment_user_id` - The GitHub user ID of the comment author
+/// * `target_user_id` - The authorized user's GitHub ID
+///
+/// # Security
+/// This function is the only way to construct an `AuthorizedStateChange`,
+/// ensuring that authorization is always checked before processing state changes.
+pub fn try_authorize_state_change(
+    comment_body: &str,
+    comment_user_id: u64,
+    target_user_id: u64,
+) -> Option<AuthorizedStateChange> {
+    // Authorization check: only the target user can change state
+    if comment_user_id != target_user_id {
+        return None;
+    }
+
+    // Parse the comment for a command
+    if let ParseResult::Command(command) = parse_comment(comment_body) {
+        match command {
+            RobocopCommand::EnableReviews => Some(AuthorizedStateChange::Enable),
+            RobocopCommand::DisableReviews => Some(AuthorizedStateChange::Disable),
+            _ => None, // Other commands don't affect state
+        }
+    } else {
+        None
+    }
+}
+
+/// Result of parsing a comment for robocop commands
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseResult {
+    /// No mention of the bot in the comment
+    NoMention,
+    /// Bot was mentioned but the command was not recognized
+    UnrecognizedCommand {
+        /// The unrecognized command text that was attempted
+        attempted: String,
+    },
+    /// A valid command was found
+    Command(RobocopCommand),
+}
+
 impl fmt::Display for RobocopCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -72,16 +140,46 @@ fn parse_review_options(options_str: &str) -> ReviewOptions {
 
 /// Parse a comment body for robocop commands
 ///
-/// Returns the first valid command found in the comment, or None if no command is found.
-/// Commands must start with @smaug123-robocop at the beginning of a line (after trimming leading and trailing whitespace),
+/// Returns a `ParseResult` indicating:
+/// - `NoMention` if the bot was not mentioned
+/// - `UnrecognizedCommand` if the bot was mentioned but the command was not recognized
+/// - `Command` if a valid command was found
+///
+/// # Command Format
+///
+/// Commands must be on a single line. The format is:
+/// `@smaug123-robocop <command> [options...]`
+///
+/// The mention must be at the beginning of a line (after trimming leading and trailing whitespace),
 /// followed by whitespace and then the command name.
+///
+/// # First Mention Wins
+///
+/// The parser stops at the **first** line that starts with `@smaug123-robocop` (case-insensitive).
+/// This applies even if the first mention is incomplete or has an unrecognized command:
+///
+/// - `@smaug123-robocop` alone (no command) returns `UnrecognizedCommand`
+/// - `@smaug123-robocop typo` returns `UnrecognizedCommand { attempted: "typo" }`
+///
+/// In both cases, subsequent lines are **not scanned**, even if they contain valid commands.
+/// This is intentional: it prevents confusion about which command will be executed when
+/// a comment contains multiple mentions.
+///
+/// # Available Commands
+///
+/// - `review` - Request a code review
+/// - `cancel` - Cancel pending reviews
+/// - `enable-reviews` - Enable automatic reviews
+/// - `disable-reviews` - Disable automatic reviews
+///
+/// # Review Options
 ///
 /// The review command supports optional key:value parameters:
 /// - `model:<model-name>` - OpenAI model to use
 /// - `reasoning:<level>` - Reasoning effort level
 ///
 /// Example: `@smaug123-robocop review model:gpt-5-2025-08-07 reasoning:xhigh`
-pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
+pub fn parse_comment(body: &str) -> ParseResult {
     const MENTION: &str = "@smaug123-robocop";
 
     for line in body.lines() {
@@ -99,11 +197,12 @@ pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
         // Safe to slice here because we already verified the boundary exists
         let rest = &trimmed[MENTION.len()..];
 
-        // Require whitespace boundary after the mention
-        // Accept only if rest is empty (just the mention) or starts with whitespace
+        // Require whitespace boundary after the mention, and a command must follow
+        // Just "@smaug123-robocop" alone (rest is empty) is treated as unrecognized
         if rest.is_empty() {
-            // Just "@smaug123-robocop" with no command
-            continue;
+            return ParseResult::UnrecognizedCommand {
+                attempted: String::new(),
+            };
         }
 
         // Check if the first character after the mention is whitespace
@@ -124,53 +223,65 @@ pub fn parse_comment(body: &str) -> Option<RobocopCommand> {
 
         if command_word.eq_ignore_ascii_case("review") {
             if options_part.is_empty() {
-                return Some(RobocopCommand::Review(ReviewOptions::default()));
+                return ParseResult::Command(RobocopCommand::Review(ReviewOptions::default()));
             } else {
                 let opts = parse_review_options(options_part);
-                return Some(RobocopCommand::Review(opts));
+                return ParseResult::Command(RobocopCommand::Review(opts));
             }
         } else if command_word.eq_ignore_ascii_case("cancel") {
-            return Some(RobocopCommand::Cancel);
+            return ParseResult::Command(RobocopCommand::Cancel);
         } else if command_word.eq_ignore_ascii_case("enable-reviews") {
-            return Some(RobocopCommand::EnableReviews);
+            return ParseResult::Command(RobocopCommand::EnableReviews);
         } else if command_word.eq_ignore_ascii_case("disable-reviews") {
-            return Some(RobocopCommand::DisableReviews);
+            return ParseResult::Command(RobocopCommand::DisableReviews);
+        } else {
+            // Bot was mentioned but command is unrecognized
+            return ParseResult::UnrecognizedCommand {
+                attempted: command_word.to_string(),
+            };
         }
     }
 
-    None
+    ParseResult::NoMention
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn review() -> RobocopCommand {
-        RobocopCommand::Review(ReviewOptions::default())
+    fn review() -> ParseResult {
+        ParseResult::Command(RobocopCommand::Review(ReviewOptions::default()))
     }
 
-    fn review_with(model: Option<&str>, reasoning: Option<&str>) -> RobocopCommand {
-        RobocopCommand::Review(ReviewOptions {
+    fn review_with(model: Option<&str>, reasoning: Option<&str>) -> ParseResult {
+        ParseResult::Command(RobocopCommand::Review(ReviewOptions {
             model: model.map(|s| s.to_string()),
             reasoning_effort: reasoning.map(|s| s.to_string()),
-        })
+        }))
+    }
+
+    fn command(cmd: RobocopCommand) -> ParseResult {
+        ParseResult::Command(cmd)
+    }
+
+    fn unrecognized(attempted: &str) -> ParseResult {
+        ParseResult::UnrecognizedCommand {
+            attempted: attempted.to_string(),
+        }
     }
 
     #[test]
     fn test_parse_review_command() {
-        assert_eq!(parse_comment("@smaug123-robocop review"), Some(review()));
-        assert_eq!(parse_comment("@smaug123-robocop Review"), Some(review()));
-        assert_eq!(
-            parse_comment("  @smaug123-robocop review  "),
-            Some(review())
-        );
+        assert_eq!(parse_comment("@smaug123-robocop review"), review());
+        assert_eq!(parse_comment("@smaug123-robocop Review"), review());
+        assert_eq!(parse_comment("  @smaug123-robocop review  "), review());
     }
 
     #[test]
     fn test_parse_review_with_model() {
         assert_eq!(
             parse_comment("@smaug123-robocop review model:gpt-5-2025-08-07"),
-            Some(review_with(Some("gpt-5-2025-08-07"), None))
+            review_with(Some("gpt-5-2025-08-07"), None)
         );
     }
 
@@ -178,7 +289,7 @@ mod tests {
     fn test_parse_review_with_reasoning() {
         assert_eq!(
             parse_comment("@smaug123-robocop review reasoning:xhigh"),
-            Some(review_with(None, Some("xhigh")))
+            review_with(None, Some("xhigh"))
         );
     }
 
@@ -186,12 +297,12 @@ mod tests {
     fn test_parse_review_with_both_options() {
         assert_eq!(
             parse_comment("@smaug123-robocop review model:gpt-5-2025-08-07 reasoning:xhigh"),
-            Some(review_with(Some("gpt-5-2025-08-07"), Some("xhigh")))
+            review_with(Some("gpt-5-2025-08-07"), Some("xhigh"))
         );
         // Order shouldn't matter
         assert_eq!(
             parse_comment("@smaug123-robocop review reasoning:low model:gpt-4"),
-            Some(review_with(Some("gpt-4"), Some("low")))
+            review_with(Some("gpt-4"), Some("low"))
         );
     }
 
@@ -199,7 +310,7 @@ mod tests {
     fn test_parse_review_options_case_insensitive_keys() {
         assert_eq!(
             parse_comment("@smaug123-robocop review MODEL:gpt-5 REASONING:high"),
-            Some(review_with(Some("gpt-5"), Some("high")))
+            review_with(Some("gpt-5"), Some("high"))
         );
     }
 
@@ -208,7 +319,7 @@ mod tests {
         // Unknown keys should be silently ignored for forward compatibility
         assert_eq!(
             parse_comment("@smaug123-robocop review unknown:value model:gpt-5"),
-            Some(review_with(Some("gpt-5"), None))
+            review_with(Some("gpt-5"), None)
         );
     }
 
@@ -216,18 +327,18 @@ mod tests {
     fn test_parse_cancel_command() {
         assert_eq!(
             parse_comment("@smaug123-robocop cancel"),
-            Some(RobocopCommand::Cancel)
+            command(RobocopCommand::Cancel)
         );
         assert_eq!(
             parse_comment("@smaug123-robocop Cancel"),
-            Some(RobocopCommand::Cancel)
+            command(RobocopCommand::Cancel)
         );
     }
 
     #[test]
     fn test_parse_multiline_comment() {
         let comment = "Hey there,\n\n@smaug123-robocop review\n\nThanks!";
-        assert_eq!(parse_comment(comment), Some(review()));
+        assert_eq!(parse_comment(comment), review());
     }
 
     #[test]
@@ -236,22 +347,86 @@ mod tests {
             "Hey there,\n\n@smaug123-robocop review model:gpt-5 reasoning:high\n\nThanks!";
         assert_eq!(
             parse_comment(comment),
-            Some(review_with(Some("gpt-5"), Some("high")))
+            review_with(Some("gpt-5"), Some("high"))
         );
     }
 
     #[test]
-    fn test_no_command() {
-        assert_eq!(parse_comment("This is just a regular comment"), None);
-        assert_eq!(parse_comment("smaug123-robocop review"), None); // Missing @
-        assert_eq!(parse_comment("@smaug123-robocop"), None); // No command
-        assert_eq!(parse_comment("@smaug123-robocop unknown"), None); // Invalid command
+    fn test_no_mention() {
+        assert_eq!(
+            parse_comment("This is just a regular comment"),
+            ParseResult::NoMention
+        );
+        assert_eq!(
+            parse_comment("smaug123-robocop review"),
+            ParseResult::NoMention
+        ); // Missing @
+    }
+
+    #[test]
+    fn test_unrecognized_command() {
+        // Bot mentioned but command not recognized
+        assert_eq!(parse_comment("@smaug123-robocop"), unrecognized("")); // No command
+        assert_eq!(
+            parse_comment("@smaug123-robocop unknown"),
+            unrecognized("unknown")
+        ); // Invalid command
+        assert_eq!(
+            parse_comment("@smaug123-robocop help"),
+            unrecognized("help")
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop reveiw"),
+            unrecognized("reveiw")
+        ); // Typo
     }
 
     #[test]
     fn test_first_command_wins() {
         let comment = "@smaug123-robocop review\n@smaug123-robocop cancel";
-        assert_eq!(parse_comment(comment), Some(review()));
+        assert_eq!(parse_comment(comment), review());
+    }
+
+    #[test]
+    fn test_first_mention_wins_even_if_unrecognized() {
+        // If the first mention has an unrecognized command, subsequent valid commands are NOT scanned.
+        // This is intentional: it prevents confusion about which command will be executed.
+        let comment = "@smaug123-robocop typo\n@smaug123-robocop review";
+        assert_eq!(
+            parse_comment(comment),
+            unrecognized("typo"),
+            "First mention with unrecognized command should stop scanning; valid command on second line is ignored"
+        );
+    }
+
+    #[test]
+    fn test_first_mention_wins_even_if_empty() {
+        // If the first mention has no command at all, subsequent valid commands are NOT scanned.
+        let comment = "@smaug123-robocop\n@smaug123-robocop review";
+        assert_eq!(
+            parse_comment(comment),
+            unrecognized(""),
+            "First mention with no command should stop scanning; valid command on second line is ignored"
+        );
+    }
+
+    #[test]
+    fn test_commands_must_be_on_single_line() {
+        // The command must be on the same line as the mention - you cannot split across lines
+        let comment = "@smaug123-robocop\nreview";
+        assert_eq!(
+            parse_comment(comment),
+            unrecognized(""),
+            "Command must be on same line as mention; 'review' on next line should not be recognized"
+        );
+
+        // Even with extra whitespace, the command must follow the mention on the same line
+        let comment_with_space = "@smaug123-robocop   \n   review";
+        assert_eq!(
+            parse_comment(comment_with_space),
+            unrecognized(""),
+            "Command cannot be on a separate line even with whitespace"
+        );
     }
 
     #[test]
@@ -259,19 +434,19 @@ mod tests {
         // @smaug123-robocop must be at the start of a line
         assert_eq!(
             parse_comment("I think @smaug123-robocop review would be great"),
-            None
+            ParseResult::NoMention
         );
     }
 
     #[test]
     fn test_case_insensitive_mention() {
         // The mention should be case-insensitive
-        assert_eq!(parse_comment("@Smaug123-Robocop review"), Some(review()));
+        assert_eq!(parse_comment("@Smaug123-Robocop review"), review());
         assert_eq!(
             parse_comment("@SMAUG123-ROBOCOP cancel"),
-            Some(RobocopCommand::Cancel)
+            command(RobocopCommand::Cancel)
         );
-        assert_eq!(parse_comment("@SmAuG123-RoBoCop review"), Some(review()));
+        assert_eq!(parse_comment("@SmAuG123-RoBoCop review"), review());
     }
 
     #[test]
@@ -279,34 +454,34 @@ mod tests {
         // Mention must be followed by whitespace before the command
         assert_eq!(
             parse_comment("@smaug123-robocopreview"),
-            None,
+            ParseResult::NoMention,
             "Should reject mention without whitespace separator"
         );
         assert_eq!(
             parse_comment("@smaug123-robocopcancel"),
-            None,
+            ParseResult::NoMention,
             "Should reject mention without whitespace separator"
         );
         assert_eq!(
             parse_comment("@smaug123-robocop-review"),
-            None,
-            "Should reject mention with hyphen separator instead of whitespace"
+            ParseResult::NoMention,
+            "Should treat hyphenated suffix as different username, not a bot mention"
         );
 
         // Valid commands with whitespace
         assert_eq!(
             parse_comment("@smaug123-robocop review"),
-            Some(review()),
+            review(),
             "Should accept command with space separator"
         );
         assert_eq!(
             parse_comment("@smaug123-robocop\treview"),
-            Some(review()),
+            review(),
             "Should accept command with tab separator"
         );
         assert_eq!(
             parse_comment("@smaug123-robocop  review"),
-            Some(review()),
+            review(),
             "Should accept command with multiple spaces"
         );
     }
@@ -315,15 +490,15 @@ mod tests {
     fn test_parse_enable_reviews_command() {
         assert_eq!(
             parse_comment("@smaug123-robocop enable-reviews"),
-            Some(RobocopCommand::EnableReviews)
+            command(RobocopCommand::EnableReviews)
         );
         assert_eq!(
             parse_comment("@smaug123-robocop Enable-Reviews"),
-            Some(RobocopCommand::EnableReviews)
+            command(RobocopCommand::EnableReviews)
         );
         assert_eq!(
             parse_comment("  @smaug123-robocop ENABLE-REVIEWS  "),
-            Some(RobocopCommand::EnableReviews)
+            command(RobocopCommand::EnableReviews)
         );
     }
 
@@ -331,32 +506,44 @@ mod tests {
     fn test_parse_disable_reviews_command() {
         assert_eq!(
             parse_comment("@smaug123-robocop disable-reviews"),
-            Some(RobocopCommand::DisableReviews)
+            command(RobocopCommand::DisableReviews)
         );
         assert_eq!(
             parse_comment("@smaug123-robocop Disable-Reviews"),
-            Some(RobocopCommand::DisableReviews)
+            command(RobocopCommand::DisableReviews)
         );
     }
 
     #[test]
     fn test_enable_disable_multiline() {
         let comment = "Please review this.\n\n@smaug123-robocop enable-reviews";
-        assert_eq!(parse_comment(comment), Some(RobocopCommand::EnableReviews));
+        assert_eq!(
+            parse_comment(comment),
+            command(RobocopCommand::EnableReviews)
+        );
     }
 
     #[test]
     fn test_display_review_with_options() {
-        let cmd = review_with(Some("gpt-5"), Some("xhigh"));
+        let cmd = RobocopCommand::Review(ReviewOptions {
+            model: Some("gpt-5".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+        });
         assert_eq!(cmd.to_string(), "review model:gpt-5 reasoning:xhigh");
 
-        let cmd = review_with(Some("gpt-5"), None);
+        let cmd = RobocopCommand::Review(ReviewOptions {
+            model: Some("gpt-5".to_string()),
+            reasoning_effort: None,
+        });
         assert_eq!(cmd.to_string(), "review model:gpt-5");
 
-        let cmd = review_with(None, Some("high"));
+        let cmd = RobocopCommand::Review(ReviewOptions {
+            model: None,
+            reasoning_effort: Some("high".to_string()),
+        });
         assert_eq!(cmd.to_string(), "review reasoning:high");
 
-        let cmd = review();
+        let cmd = RobocopCommand::Review(ReviewOptions::default());
         assert_eq!(cmd.to_string(), "review");
     }
 
@@ -365,13 +552,13 @@ mod tests {
         // Multiple spaces between "review" and options should work
         assert_eq!(
             parse_comment("@smaug123-robocop review  model:gpt-5"),
-            Some(review_with(Some("gpt-5"), None)),
+            review_with(Some("gpt-5"), None),
             "Should accept multiple spaces between review and options"
         );
         // Tab between "review" and options should work
         assert_eq!(
             parse_comment("@smaug123-robocop review\tmodel:gpt-5"),
-            Some(review_with(Some("gpt-5"), None)),
+            review_with(Some("gpt-5"), None),
             "Should accept tab between review and options"
         );
     }
@@ -381,12 +568,12 @@ mod tests {
         // Model names can be case-sensitive
         assert_eq!(
             parse_comment("@smaug123-robocop review model:GPT-5-Turbo"),
-            Some(review_with(Some("GPT-5-Turbo"), None)),
+            review_with(Some("GPT-5-Turbo"), None),
             "Option values should preserve their original case"
         );
         assert_eq!(
             parse_comment("@smaug123-robocop review reasoning:XHIGH"),
-            Some(review_with(None, Some("XHIGH"))),
+            review_with(None, Some("XHIGH")),
             "Reasoning values should preserve their original case"
         );
     }
@@ -398,24 +585,24 @@ mod tests {
         // This tests for UTF-8 safety in the prefix check
         assert_eq!(
             parse_comment("🔥🔥🔥🔥🔥 review"),
-            None,
-            "Non-ASCII line should return None, not panic"
+            ParseResult::NoMention,
+            "Non-ASCII line should return NoMention, not panic"
         );
         assert_eq!(
             parse_comment("日本語テスト"),
-            None,
-            "Non-ASCII line should return None, not panic"
+            ParseResult::NoMention,
+            "Non-ASCII line should return NoMention, not panic"
         );
         // Multi-byte characters with length > MENTION.len() in bytes but fewer chars
         assert_eq!(
             parse_comment("🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥"),
-            None,
-            "Line of emojis should return None, not panic"
+            ParseResult::NoMention,
+            "Line of emojis should return NoMention, not panic"
         );
         // Mix of ASCII and non-ASCII that could trip up byte slicing
         assert_eq!(
             parse_comment("@日本語 review"),
-            None,
+            ParseResult::NoMention,
             "Line with non-ASCII after @ should not panic"
         );
     }
@@ -428,7 +615,7 @@ mod tests {
         // It should NOT return Some("") for model
         let result = parse_comment("@smaug123-robocop review model: gpt-5");
         match &result {
-            Some(RobocopCommand::Review(opts)) => {
+            ParseResult::Command(RobocopCommand::Review(opts)) => {
                 // Either model is None (empty value ignored) or model is Some("gpt-5")
                 assert!(
                     opts.model.is_none() || opts.model.as_deref() == Some("gpt-5"),
@@ -436,7 +623,88 @@ mod tests {
                     opts.model
                 );
             }
-            _ => panic!("Expected Some(Review(...)), got {:?}", result),
+            _ => panic!("Expected Command(Review(...)), got {:?}", result),
         }
+    }
+
+    // Tests for AuthorizedStateChange type-safe authorization
+
+    #[test]
+    fn test_authorized_state_change_enable_from_target_user() {
+        let target_user_id = 12345u64;
+        let result = try_authorize_state_change(
+            "@smaug123-robocop enable-reviews",
+            target_user_id,
+            target_user_id,
+        );
+        assert_eq!(result, Some(AuthorizedStateChange::Enable));
+    }
+
+    #[test]
+    fn test_authorized_state_change_disable_from_target_user() {
+        let target_user_id = 12345u64;
+        let result = try_authorize_state_change(
+            "@smaug123-robocop disable-reviews",
+            target_user_id,
+            target_user_id,
+        );
+        assert_eq!(result, Some(AuthorizedStateChange::Disable));
+    }
+
+    #[test]
+    fn test_authorized_state_change_rejected_for_unauthorized_user() {
+        let target_user_id = 12345u64;
+        let unauthorized_user_id = 99999u64;
+
+        // Enable command from unauthorized user should be rejected
+        let result = try_authorize_state_change(
+            "@smaug123-robocop enable-reviews",
+            unauthorized_user_id,
+            target_user_id,
+        );
+        assert_eq!(
+            result, None,
+            "Unauthorized user's enable-reviews should be rejected"
+        );
+
+        // Disable command from unauthorized user should be rejected
+        let result = try_authorize_state_change(
+            "@smaug123-robocop disable-reviews",
+            unauthorized_user_id,
+            target_user_id,
+        );
+        assert_eq!(
+            result, None,
+            "Unauthorized user's disable-reviews should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_authorized_state_change_non_state_commands_return_none() {
+        let target_user_id = 12345u64;
+
+        // Review command doesn't affect state
+        let result =
+            try_authorize_state_change("@smaug123-robocop review", target_user_id, target_user_id);
+        assert_eq!(
+            result, None,
+            "review command should not return state change"
+        );
+
+        // Cancel command doesn't affect state
+        let result =
+            try_authorize_state_change("@smaug123-robocop cancel", target_user_id, target_user_id);
+        assert_eq!(
+            result, None,
+            "cancel command should not return state change"
+        );
+    }
+
+    #[test]
+    fn test_authorized_state_change_no_mention_returns_none() {
+        let target_user_id = 12345u64;
+        let result =
+            try_authorize_state_change("Just a regular comment", target_user_id, target_user_id);
+        assert_eq!(result, None);
     }
 }

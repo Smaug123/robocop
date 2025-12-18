@@ -1,4 +1,4 @@
-use crate::command::{parse_comment, RobocopCommand};
+use crate::command::{try_authorize_state_change, AuthorizedStateChange};
 use crate::github::{contains_disable_reviews_marker, GitHubClient};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -30,9 +30,14 @@ pub struct PullRequestId {
 /// This function is called on-demand when we need the review state for a PR that
 /// isn't currently in our in-memory cache. It reconstructs the state by:
 /// 1. Checking the PR description for the disable-reviews marker
-/// 2. Applying all enable-reviews/disable-reviews commands chronologically
+/// 2. Applying all enable-reviews/disable-reviews commands chronologically from the target user
 ///
-/// The last command wins (chronologically by comment creation time).
+/// The last authorized command wins (chronologically by comment creation time).
+///
+/// # Security
+/// Only commands from `target_user_id` are processed. This is enforced at the type level
+/// via [`AuthorizedStateChange`], making it impossible to accidentally process unauthorized
+/// commands.
 pub async fn rehydrate_review_state(
     github_client: &GitHubClient,
     correlation_id: Option<&str>,
@@ -40,6 +45,7 @@ pub async fn rehydrate_review_state(
     repo_owner: &str,
     repo_name: &str,
     pr_number: u64,
+    target_user_id: u64,
 ) -> Result<ReviewState> {
     info!(
         "Rehydrating review state for PR #{} in {}/{}",
@@ -69,7 +75,7 @@ pub async fn rehydrate_review_state(
         ReviewState::Enabled
     };
 
-    // 3. Fetch all comments and apply them chronologically
+    // 3. Fetch all comments and apply authorized state changes chronologically
     let comments = github_client
         .get_pr_comments(
             correlation_id,
@@ -81,18 +87,26 @@ pub async fn rehydrate_review_state(
         .await?;
 
     // Comments are already sorted by creation time (oldest first) from GitHub API
+    // Only process state changes from authorized users via type-safe AuthorizedStateChange
     for comment in comments {
-        if let Some(command) = parse_comment(&comment.body) {
-            match command {
-                RobocopCommand::EnableReviews => {
-                    info!("Found enable-reviews command in comment {}", comment.id);
+        if let Some(authorized_change) =
+            try_authorize_state_change(&comment.body, comment.user.id, target_user_id)
+        {
+            match authorized_change {
+                AuthorizedStateChange::Enable => {
+                    info!(
+                        "Found authorized enable-reviews command in comment {} from user {}",
+                        comment.id, comment.user.login
+                    );
                     state = ReviewState::Enabled;
                 }
-                RobocopCommand::DisableReviews => {
-                    info!("Found disable-reviews command in comment {}", comment.id);
+                AuthorizedStateChange::Disable => {
+                    info!(
+                        "Found authorized disable-reviews command in comment {} from user {}",
+                        comment.id, comment.user.login
+                    );
                     state = ReviewState::Disabled;
                 }
-                _ => {} // Other commands don't affect review state
             }
         }
     }
