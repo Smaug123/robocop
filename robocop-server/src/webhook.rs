@@ -1268,7 +1268,7 @@ async fn process_code_review(
     let reasoning_effort = review_options
         .as_ref()
         .and_then(|opts| opts.reasoning_effort.as_deref())
-        .unwrap_or("high");
+        .unwrap_or("xhigh");
     let model = review_options
         .as_ref()
         .and_then(|opts| opts.model.as_deref());

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-const DEFAULT_MODEL: &str = "gpt-5-2025-08-07";
+const DEFAULT_MODEL: &str = "gpt-5.2-2025-12-11 ";
 
 /// Robocop: AI-powered code review tool
 #[derive(Parser, Debug)]

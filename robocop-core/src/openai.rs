@@ -566,7 +566,7 @@ impl OpenAIClient {
             method: "POST".to_string(),
             url: "/v1/responses".to_string(),
             body: BatchRequestBody {
-                model: model.unwrap_or("gpt-5-2025-08-07").to_string(),
+                model: model.unwrap_or("gpt-5.2-2025-12-11").to_string(),
                 instructions: get_system_prompt(),
                 input: vec![ResponsesInputMessage {
                     role: "user".to_string(),
