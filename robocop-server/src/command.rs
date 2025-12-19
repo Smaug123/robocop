@@ -138,6 +138,31 @@ fn parse_review_options(options_str: &str) -> ReviewOptions {
     opts
 }
 
+/// Extract review options from text (e.g., PR description)
+///
+/// This function parses the text for a `@smaug123-robocop review` command and extracts
+/// any options (model, reasoning) if present. It returns `None` if:
+/// - No robocop mention is found
+/// - The command is not `review`
+/// - The command is unrecognized
+///
+/// This is useful for extracting default review options from a PR description
+/// without treating it as a command that needs to be executed.
+///
+/// # Example
+///
+/// ```ignore
+/// let body = "This PR adds feature X.\n\n@smaug123-robocop review model:gpt-5 reasoning:high";
+/// let options = extract_review_options(body);
+/// assert_eq!(options.unwrap().model, Some("gpt-5".to_string()));
+/// ```
+pub fn extract_review_options(text: &str) -> Option<ReviewOptions> {
+    match parse_comment(text) {
+        ParseResult::Command(RobocopCommand::Review(opts)) => Some(opts),
+        _ => None,
+    }
+}
+
 /// Parse a comment body for robocop commands
 ///
 /// Returns a `ParseResult` indicating:
@@ -706,5 +731,93 @@ mod tests {
         let result =
             try_authorize_state_change("Just a regular comment", target_user_id, target_user_id);
         assert_eq!(result, None);
+    }
+
+    // Tests for extract_review_options
+
+    #[test]
+    fn test_extract_review_options_with_model_and_reasoning() {
+        let body =
+            "This PR adds a new feature.\n\n@smaug123-robocop review model:gpt-5.2 reasoning:xhigh";
+        let opts = extract_review_options(body);
+        assert!(opts.is_some());
+        let opts = opts.unwrap();
+        assert_eq!(opts.model, Some("gpt-5.2".to_string()));
+        assert_eq!(opts.reasoning_effort, Some("xhigh".to_string()));
+    }
+
+    #[test]
+    fn test_extract_review_options_with_model_only() {
+        let body = "@smaug123-robocop review model:gpt-4-turbo";
+        let opts = extract_review_options(body);
+        assert!(opts.is_some());
+        let opts = opts.unwrap();
+        assert_eq!(opts.model, Some("gpt-4-turbo".to_string()));
+        assert_eq!(opts.reasoning_effort, None);
+    }
+
+    #[test]
+    fn test_extract_review_options_with_reasoning_only() {
+        let body = "@smaug123-robocop review reasoning:low";
+        let opts = extract_review_options(body);
+        assert!(opts.is_some());
+        let opts = opts.unwrap();
+        assert_eq!(opts.model, None);
+        assert_eq!(opts.reasoning_effort, Some("low".to_string()));
+    }
+
+    #[test]
+    fn test_extract_review_options_plain_review() {
+        let body = "@smaug123-robocop review";
+        let opts = extract_review_options(body);
+        assert!(opts.is_some());
+        let opts = opts.unwrap();
+        assert_eq!(opts.model, None);
+        assert_eq!(opts.reasoning_effort, None);
+    }
+
+    #[test]
+    fn test_extract_review_options_no_mention() {
+        let body = "Just a regular PR description without any bot mention.";
+        let opts = extract_review_options(body);
+        assert!(opts.is_none());
+    }
+
+    #[test]
+    fn test_extract_review_options_disable_reviews() {
+        // disable-reviews should return None, not options
+        let body = "@smaug123-robocop disable-reviews";
+        let opts = extract_review_options(body);
+        assert!(opts.is_none());
+    }
+
+    #[test]
+    fn test_extract_review_options_unrecognized_command() {
+        let body = "@smaug123-robocop typo";
+        let opts = extract_review_options(body);
+        assert!(opts.is_none());
+    }
+
+    #[test]
+    fn test_extract_review_options_in_multiline_pr_body() {
+        let body = r#"## Summary
+
+This PR implements feature X.
+
+## Test Plan
+
+- Run unit tests
+- Manual testing
+
+@smaug123-robocop review model:o1 reasoning:high
+
+## Notes
+
+Some additional notes here."#;
+        let opts = extract_review_options(body);
+        assert!(opts.is_some());
+        let opts = opts.unwrap();
+        assert_eq!(opts.model, Some("o1".to_string()));
+        assert_eq!(opts.reasoning_effort, Some("high".to_string()));
     }
 }

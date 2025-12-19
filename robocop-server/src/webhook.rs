@@ -62,6 +62,7 @@ pub struct PullRequest {
     pub number: u64,
     pub head: PullRequestRef,
     pub base: PullRequestRef,
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -237,6 +238,19 @@ pub async fn github_webhook_handler(
                                     );
                                 }
 
+                                // Extract review options from PR description if present
+                                let review_options = pr
+                                    .body
+                                    .as_ref()
+                                    .and_then(|body| command::extract_review_options(body));
+
+                                if review_options.is_some() {
+                                    info!(
+                                        "Found review options in PR description: {:?}",
+                                        review_options
+                                    );
+                                }
+
                                 let state_clone = state.clone();
                                 let pr_clone = pr.clone();
                                 let installation_id = installation.id;
@@ -252,7 +266,7 @@ pub async fn github_webhook_handler(
                                         repo,
                                         pr_clone,
                                         false, // force_review: false for automatic triggers
-                                        None, // review_options: use defaults for automatic triggers
+                                        review_options,
                                     )
                                     .await
                                     {
@@ -776,6 +790,12 @@ async fn process_enable_reviews(
         .await?;
 
     // Trigger a review for the current commit
+    // Extract review options from PR body if present
+    let review_options = pr_details
+        .body
+        .as_ref()
+        .and_then(|body| command::extract_review_options(body));
+
     let pr = PullRequest {
         number: pr_details.number,
         head: PullRequestRef {
@@ -786,9 +806,10 @@ async fn process_enable_reviews(
             sha: pr_details.base.sha,
             ref_name: pr_details.base.ref_name,
         },
+        body: pr_details.body,
     };
 
-    // Use force_review=false since we just enabled reviews, use default options
+    // Use force_review=false since we just enabled reviews
     process_code_review(
         correlation_id,
         state,
@@ -796,7 +817,7 @@ async fn process_enable_reviews(
         repo,
         pr,
         false,
-        None,
+        review_options,
     )
     .await
 }
@@ -1002,6 +1023,7 @@ async fn process_manual_review(
             sha: pr_details.base.sha,
             ref_name: pr_details.base.ref_name,
         },
+        body: pr_details.body,
     };
 
     // Use the existing code review logic with force flag and review options
