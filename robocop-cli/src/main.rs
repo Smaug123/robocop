@@ -239,21 +239,28 @@ fn read_file(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-/// Response from OpenAI chat completions API
+/// Response from OpenAI responses API
 #[derive(serde::Deserialize, Debug)]
-struct ChatCompletionResponse {
-    choices: Vec<Choice>,
+struct ResponsesApiResponse {
+    status: String,
+    output: Vec<ResponseOutput>,
 }
 
 #[derive(serde::Deserialize, Debug)]
-struct Choice {
-    finish_reason: String,
-    message: Message,
+struct ResponseOutput {
+    #[serde(rename = "type")]
+    output_type: String,
+    /// Content is optional because some output types (like reasoning) don't have it
+    #[serde(default)]
+    content: Vec<ResponseContent>,
 }
 
 #[derive(serde::Deserialize, Debug)]
-struct Message {
-    content: Option<String>,
+struct ResponseContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    /// Text is optional because some content types (e.g., refusal) may not have it
+    text: Option<String>,
 }
 
 /// Response from OpenAI models list API
@@ -267,8 +274,8 @@ struct ModelInfo {
     id: String,
 }
 
-/// Process request using regular chat completions API
-async fn process_chat_completion(
+/// Process request using the responses API
+async fn process_response(
     api_key: &str,
     system_prompt: &str,
     user_prompt: &str,
@@ -279,14 +286,16 @@ async fn process_chat_completion(
 
     let request_body = serde_json::json!({
         "model": model,
-        "reasoning_effort": reasoning_effort,
-        "messages": [
-            {"role": "system", "content": system_prompt},
+        "instructions": system_prompt,
+        "input": [
             {"role": "user", "content": user_prompt}
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
+        "reasoning": {
+            "effort": reasoning_effort
+        },
+        "text": {
+            "format": {
+                "type": "json_schema",
                 "schema": {
                     "type": "object",
                     "properties": {
@@ -304,7 +313,7 @@ async fn process_chat_completion(
     });
 
     let response = client
-        .post("https://api.openai.com/v1/chat/completions")
+        .post("https://api.openai.com/v1/responses")
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&request_body)
@@ -321,31 +330,33 @@ async fn process_chat_completion(
         return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
     }
 
-    let chat_response: ChatCompletionResponse = response
+    let api_response: ResponsesApiResponse = response
         .json()
         .await
-        .context("Failed to parse chat completion response")?;
+        .context("Failed to parse responses API response")?;
 
-    if chat_response.choices.len() != 1 {
+    if api_response.status != "completed" {
         return Err(anyhow!(
-            "Unexpected number of choices: {}",
-            chat_response.choices.len()
+            "Unexpected response status: {}",
+            api_response.status
         ));
     }
 
-    let choice = &chat_response.choices[0];
-    if choice.finish_reason != "stop" {
-        return Err(anyhow!(
-            "Unexpected finish reason: {}",
-            choice.finish_reason
-        ));
-    }
+    // Find the message output (there may be other outputs like reasoning)
+    let message_output = api_response
+        .output
+        .iter()
+        .find(|o| o.output_type == "message")
+        .context("No message output found in response")?;
 
-    choice
-        .message
+    // Find the output_text content with text
+    let text_content = message_output
         .content
-        .clone()
-        .context("No content in message")
+        .iter()
+        .find(|c| c.content_type == "output_text" && c.text.is_some())
+        .context("No output_text content found in message")?;
+
+    Ok(text_content.text.clone().unwrap())
 }
 
 /// List available OpenAI models
@@ -458,8 +469,8 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
 
         println!("{}", batch_id);
     } else {
-        // Use regular chat completions API
-        let result = process_chat_completion(
+        // Use responses API
+        let result = process_response(
             &api_key,
             &system_prompt,
             &user_prompt,

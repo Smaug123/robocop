@@ -39,7 +39,19 @@ function parseReviewFromOutput(outputText) {
                     };
                 }
 
-                // Check for successful response with content
+                // Check for successful response - responses API format
+                // Find the message output (there may be other outputs like reasoning)
+                if (result.response?.body?.output) {
+                    const messageOutput = result.response.body.output.find(o => o.type === 'message');
+                    if (messageOutput?.content) {
+                        const textContent = messageOutput.content.find(c => c.type === 'output_text');
+                        if (textContent?.text) {
+                            return parseJsonContent(textContent.text);
+                        }
+                    }
+                }
+
+                // Fallback: legacy chat completions format (for backwards compatibility)
                 if (result.response?.body?.choices?.[0]?.message?.content) {
                     const content = result.response.body.choices[0].message.content;
                     return parseJsonContent(content);

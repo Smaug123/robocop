@@ -284,31 +284,43 @@ async fn handle_failed_batch(
     Ok(())
 }
 
+/// Batch output line from OpenAI responses API
 #[derive(Debug, serde::Deserialize)]
 struct BatchOutputLine {
     response: BatchOutputResponse,
     error: Option<serde_json::Value>,
 }
 
+/// Response wrapper from batch API
 #[derive(Debug, serde::Deserialize)]
 struct BatchOutputResponse {
     status_code: u16,
-    body: BatchOutputBody,
+    body: ResponsesApiBody,
 }
 
+/// Body structure from responses API
 #[derive(Debug, serde::Deserialize)]
-struct BatchOutputBody {
-    choices: Vec<BatchOutputChoice>,
+struct ResponsesApiBody {
+    output: Vec<ResponsesApiOutput>,
 }
 
+/// Output item from responses API
 #[derive(Debug, serde::Deserialize)]
-struct BatchOutputChoice {
-    message: BatchOutputMessage,
+struct ResponsesApiOutput {
+    #[serde(rename = "type")]
+    output_type: String,
+    /// Content is optional because some output types (like reasoning) don't have it
+    #[serde(default)]
+    content: Vec<ResponsesApiContent>,
 }
 
+/// Content item from responses API output
 #[derive(Debug, serde::Deserialize)]
-struct BatchOutputMessage {
-    content: String,
+struct ResponsesApiContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    /// Text is optional because some content types (e.g., refusal) may not have it
+    text: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -338,13 +350,25 @@ fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
         ));
     }
 
-    if batch_output.response.body.choices.is_empty() {
-        return Err(anyhow::anyhow!("No choices in batch output"));
-    }
+    // Extract content from responses API format
+    // Find the message output (there may be other outputs like reasoning)
+    let message_output = batch_output
+        .response
+        .body
+        .output
+        .iter()
+        .find(|o| o.output_type == "message")
+        .context("No message output found in response")?;
 
-    let content = &batch_output.response.body.choices[0].message.content;
-    let review_result: ReviewResult =
-        serde_json::from_str(content).context("Failed to parse review result JSON")?;
+    // Find the output_text content with text
+    let text_content = message_output
+        .content
+        .iter()
+        .find(|c| c.content_type == "output_text" && c.text.is_some())
+        .context("No output_text content found in message")?;
+
+    let review_result: ReviewResult = serde_json::from_str(text_content.text.as_ref().unwrap())
+        .context("Failed to parse review result JSON")?;
 
     Ok(review_result)
 }
@@ -433,7 +457,9 @@ mod tests {
 
     #[test]
     fn test_parse_batch_output_success() {
-        let jsonl = r#"{"response":{"status_code":200,"body":{"choices":[{"message":{"content":"{\"substantiveComments\":false,\"summary\":\"All good\"}"}}]}},"error":null}"#;
+        // Responses API format: output[].content[].text
+        // Includes reasoning field as required by the strict schema
+        let jsonl = r#"{"response":{"status_code":200,"body":{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"reasoning\":\"No issues found in the code.\",\"substantiveComments\":false,\"summary\":\"All good\"}"}]}]}},"error":null}"#;
         let result = parse_batch_output(jsonl).unwrap();
         assert!(!result.substantive_comments);
         assert_eq!(result.summary, "All good");
@@ -441,7 +467,9 @@ mod tests {
 
     #[test]
     fn test_parse_batch_output_with_issues() {
-        let jsonl = r#"{"response":{"status_code":200,"body":{"choices":[{"message":{"content":"{\"substantiveComments\":true,\"summary\":\"Found issues\"}"}}]}},"error":null}"#;
+        // Responses API format: output[].content[].text
+        // Includes reasoning field as required by the strict schema
+        let jsonl = r#"{"response":{"status_code":200,"body":{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"reasoning\":\"Found a potential null pointer dereference.\",\"substantiveComments\":true,\"summary\":\"Found issues\"}"}]}]}},"error":null}"#;
         let result = parse_batch_output(jsonl).unwrap();
         assert!(result.substantive_comments);
         assert_eq!(result.summary, "Found issues");
@@ -455,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_parse_batch_output_non_200() {
-        let jsonl = r#"{"response":{"status_code":500,"body":{"choices":[]}},"error":null}"#;
+        let jsonl = r#"{"response":{"status_code":500,"body":{"output":[]}},"error":null}"#;
         let result = parse_batch_output(jsonl);
         assert!(result.is_err());
     }

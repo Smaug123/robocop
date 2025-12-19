@@ -78,34 +78,37 @@ pub struct BatchResponse {
     pub metadata: Option<HashMap<String, String>>,
 }
 
+/// Input message for responses API.
+/// See https://platform.openai.com/docs/guides/text?api-mode=responses
 #[derive(Debug, Serialize)]
-pub struct BatchRequestMessage {
+pub struct ResponsesInputMessage {
     pub role: String,
     pub content: String,
 }
 
+/// Reasoning configuration for responses API
 #[derive(Debug, Serialize)]
-pub struct BatchRequestBody {
-    pub model: String,
-    pub reasoning_effort: String,
-    pub messages: Vec<BatchRequestMessage>,
-    pub response_format: ResponseFormat,
+pub struct ReasoningConfig {
+    pub effort: String,
 }
 
+/// Text format configuration for responses API
 #[derive(Debug, Serialize)]
-pub struct ResponseFormat {
+pub struct TextFormat {
+    pub format: TextFormatType,
+}
+
+/// Text format type for JSON schema
+#[derive(Debug, Serialize)]
+pub struct TextFormatType {
     #[serde(rename = "type")]
     pub format_type: String,
-    pub json_schema: JsonSchema,
-}
-
-#[derive(Debug, Serialize)]
-pub struct JsonSchema {
     pub schema: Schema,
-    pub strict: bool,
     pub name: String,
+    pub strict: bool,
 }
 
+/// Schema definition for structured output
 #[derive(Debug, Serialize)]
 pub struct Schema {
     #[serde(rename = "type")]
@@ -128,6 +131,16 @@ pub struct SchemaProperties {
 pub struct SchemaProperty {
     #[serde(rename = "type")]
     pub property_type: String,
+}
+
+/// Request body for the responses API
+#[derive(Debug, Serialize)]
+pub struct BatchRequestBody {
+    pub model: String,
+    pub instructions: String,
+    pub input: Vec<ResponsesInputMessage>,
+    pub reasoning: ReasoningConfig,
+    pub text: TextFormat,
 }
 
 #[derive(Debug, Serialize)]
@@ -500,10 +513,10 @@ impl OpenAIClient {
         Ok(content)
     }
 
-    pub fn create_response_format() -> ResponseFormat {
-        ResponseFormat {
-            format_type: "json_schema".to_string(),
-            json_schema: JsonSchema {
+    pub fn create_text_format() -> TextFormat {
+        TextFormat {
+            format: TextFormatType {
+                format_type: "json_schema".to_string(),
                 schema: Schema {
                     schema_type: "object".to_string(),
                     properties: SchemaProperties {
@@ -547,25 +560,22 @@ impl OpenAIClient {
         // Create user prompt
         let user_prompt = create_user_prompt(diff, file_contents, additional_prompt);
 
-        // Create batch request
+        // Create batch request using the responses API format
         let batch_request = BatchRequest {
             custom_id: "robocop-review-1".to_string(),
             method: "POST".to_string(),
-            url: "/v1/chat/completions".to_string(),
+            url: "/v1/responses".to_string(),
             body: BatchRequestBody {
                 model: model.unwrap_or("gpt-5-2025-08-07").to_string(),
-                reasoning_effort: reasoning_effort.to_string(),
-                messages: vec![
-                    BatchRequestMessage {
-                        role: "system".to_string(),
-                        content: get_system_prompt(),
-                    },
-                    BatchRequestMessage {
-                        role: "user".to_string(),
-                        content: user_prompt,
-                    },
-                ],
-                response_format: Self::create_response_format(),
+                instructions: get_system_prompt(),
+                input: vec![ResponsesInputMessage {
+                    role: "user".to_string(),
+                    content: user_prompt,
+                }],
+                reasoning: ReasoningConfig {
+                    effort: reasoning_effort.to_string(),
+                },
+                text: Self::create_text_format(),
             },
         };
 
@@ -623,12 +633,12 @@ impl OpenAIClient {
             batch_metadata.insert("pull_request_url".to_string(), url.clone());
         }
 
-        // Create batch
+        // Create batch using responses API endpoint
         let batch_response = self
             .create_batch(
                 correlation_id,
                 file_response.id,
-                "/v1/chat/completions".to_string(),
+                "/v1/responses".to_string(),
                 "24h".to_string(),
                 Some(batch_metadata),
                 None, // No output expiration

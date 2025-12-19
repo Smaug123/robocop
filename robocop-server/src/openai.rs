@@ -1,18 +1,19 @@
 // Re-export all OpenAI types and client from robocop-core
 pub use robocop_core::{
-    create_openai_client, BatchCreateRequest, BatchRequest, BatchRequestBody, BatchRequestMessage,
-    BatchResponse, ExpiresAfter, FileUploadResponse, JsonSchema, OpenAIClient, RequestCounts,
-    ResponseFormat, ReviewMetadata, Schema, SchemaProperties, SchemaProperty,
+    create_openai_client, BatchCreateRequest, BatchRequest, BatchRequestBody, BatchResponse,
+    ExpiresAfter, FileUploadResponse, OpenAIClient, ReasoningConfig, RequestCounts,
+    ResponsesInputMessage, ReviewMetadata, Schema, SchemaProperties, SchemaProperty, TextFormat,
+    TextFormatType,
 };
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn test_response_format_schema_consistency() {
-        // Verify that the response format schema is correctly structured
+    fn test_text_format_schema_consistency() {
+        // Verify that the text format schema is correctly structured
         // This test ensures the property names in the schema match the required array
-        let response_format = robocop_core::openai::OpenAIClient::create_response_format();
-        let schema = response_format.json_schema.schema;
+        let text_format = robocop_core::openai::OpenAIClient::create_text_format();
+        let schema = text_format.format.schema;
 
         // Serialize the schema to JSON to verify the actual property names
         let schema_json = serde_json::to_value(&schema).expect("Failed to serialize schema");
