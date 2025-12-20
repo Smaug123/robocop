@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use robocop_core::{
     create_user_prompt, get_system_prompt, GitData, OpenAIClient, ReviewMetadata, DEFAULT_MODEL,
 };
@@ -22,6 +23,10 @@ enum Commands {
     Review(ReviewArgs),
     /// List available OpenAI models
     ListModels(ListModelsArgs),
+    /// Poll for a response by ID (use after stream interruption)
+    Poll(PollArgs),
+    /// Cancel an in-progress background response
+    Cancel(CancelArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -61,6 +66,30 @@ struct ReviewArgs {
 
 #[derive(Parser, Debug)]
 struct ListModelsArgs {
+    /// OpenAI API key (if not provided, will use OPENAI_API_KEY environment variable)
+    #[arg(long)]
+    api_key: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct PollArgs {
+    /// Response ID to poll (e.g., resp_67c9fdce...)
+    response_id: String,
+
+    /// Sequence number to resume from (for partial responses)
+    #[arg(long)]
+    sequence: Option<u64>,
+
+    /// OpenAI API key (if not provided, will use OPENAI_API_KEY environment variable)
+    #[arg(long)]
+    api_key: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct CancelArgs {
+    /// Response ID to cancel (e.g., resp_67c9fdce...)
+    response_id: String,
+
     /// OpenAI API key (if not provided, will use OPENAI_API_KEY environment variable)
     #[arg(long)]
     api_key: Option<String>,
@@ -239,30 +268,6 @@ fn read_file(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-/// Response from OpenAI responses API
-#[derive(serde::Deserialize, Debug)]
-struct ResponsesApiResponse {
-    status: String,
-    output: Vec<ResponseOutput>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct ResponseOutput {
-    #[serde(rename = "type")]
-    output_type: String,
-    /// Content is optional because some output types (like reasoning) don't have it
-    #[serde(default)]
-    content: Vec<ResponseContent>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct ResponseContent {
-    #[serde(rename = "type")]
-    content_type: String,
-    /// Text is optional because some content types (e.g., refusal) may not have it
-    text: Option<String>,
-}
-
 /// Response from OpenAI models list API
 #[derive(serde::Deserialize, Debug)]
 struct ModelsResponse {
@@ -274,7 +279,186 @@ struct ModelInfo {
     id: String,
 }
 
-/// Process request using the responses API
+/// SSE stream processor that handles UTF-8 chunk boundaries correctly
+struct SseProcessor {
+    buffer: Vec<u8>,
+}
+
+impl SseProcessor {
+    fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    /// Add a chunk of bytes to the buffer
+    fn push(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+    }
+
+    /// Try to extract the next complete SSE event from the buffer.
+    /// Returns None if no complete event is available yet.
+    fn next_event(&mut self) -> Option<Result<(String, String)>> {
+        // Loop to skip comment/empty events without recursion
+        loop {
+            // Look for event boundary: \n\n or \r\n\r\n
+            let boundary = self.find_event_boundary()?;
+
+            // Extract the event bytes
+            let event_bytes: Vec<u8> = self.buffer.drain(..boundary.end).collect();
+
+            // Decode as UTF-8
+            let event_str = match std::str::from_utf8(&event_bytes[..boundary.start]) {
+                Ok(s) => s.to_string(),
+                Err(e) => return Some(Err(anyhow!("Invalid UTF-8 in SSE event: {}", e))),
+            };
+
+            // Parse the event - if parsing fails (no data), continue to next event
+            if let Some(parsed) = Self::parse_event(&event_str) {
+                return Some(Ok(parsed));
+            }
+            // Otherwise loop to try next event (e.g., skip comments, keepalives)
+        }
+    }
+
+    /// Find the next event boundary, returning the range to consume
+    /// (start = end of event content, end = end including delimiter)
+    fn find_event_boundary(&self) -> Option<std::ops::Range<usize>> {
+        // Check for \r\n\r\n first (4 bytes)
+        for i in 0..self.buffer.len().saturating_sub(3) {
+            if &self.buffer[i..i + 4] == b"\r\n\r\n" {
+                return Some(i..i + 4);
+            }
+        }
+        // Check for \n\n (2 bytes)
+        for i in 0..self.buffer.len().saturating_sub(1) {
+            if &self.buffer[i..i + 2] == b"\n\n" {
+                return Some(i..i + 2);
+            }
+        }
+        None
+    }
+
+    /// Parse an SSE event string into event type and data.
+    /// Per SSE spec: space after colon is optional, multiple data lines are concatenated with newlines.
+    /// If no event: line is present, defaults to "message" per SSE spec.
+    fn parse_event(event_str: &str) -> Option<(String, String)> {
+        let mut event_type = None;
+        let mut data_lines: Vec<String> = Vec::new();
+
+        for line in event_str.lines() {
+            // Handle potential \r at end of line (for mixed line endings)
+            let line = line.trim_end_matches('\r');
+
+            // Parse "event:" - space after colon is optional per SSE spec
+            if let Some(rest) = line.strip_prefix("event:") {
+                // Skip optional leading space
+                let value = rest.strip_prefix(' ').unwrap_or(rest);
+                event_type = Some(value.to_string());
+            }
+            // Parse "data:" - space after colon is optional, multiple lines concatenated
+            else if let Some(rest) = line.strip_prefix("data:") {
+                let value = rest.strip_prefix(' ').unwrap_or(rest);
+                data_lines.push(value.to_string());
+            }
+            // SSE also supports "id:" and "retry:" but we don't need them
+        }
+
+        // Must have at least one data line to be a valid event
+        if data_lines.is_empty() {
+            None
+        } else {
+            // Concatenate multiple data lines with newlines per SSE spec
+            let data = data_lines.join("\n");
+            // Default event type is "message" per SSE spec
+            let event_type = event_type.unwrap_or_else(|| "message".to_string());
+            Some((event_type, data))
+        }
+    }
+
+    /// Check if there's any remaining data in the buffer
+    fn has_remaining(&self) -> bool {
+        // Check if there's non-whitespace content remaining
+        self.buffer.iter().any(|&b| !b.is_ascii_whitespace())
+    }
+
+    /// Get remaining buffer content as string (for error reporting)
+    fn remaining_as_string(&self) -> String {
+        String::from_utf8_lossy(&self.buffer).to_string()
+    }
+}
+
+/// Extract response ID from a response.created event data
+fn extract_response_id(data: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
+    parsed
+        .get("response")?
+        .get("id")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Extract error information from a response.failed or error event
+fn extract_error_info(data: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+        // Try response.failed format
+        if let Some(error) = parsed.get("response").and_then(|r| r.get("error")) {
+            if let Ok(formatted) = serde_json::to_string_pretty(error) {
+                return formatted;
+            }
+        }
+        // Try direct error format
+        if let Some(error) = parsed.get("error") {
+            if let Ok(formatted) = serde_json::to_string_pretty(error) {
+                return formatted;
+            }
+        }
+        // Try message field
+        if let Some(msg) = parsed.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+    }
+    data.to_string()
+}
+
+/// Extract the final text from a response.completed event data
+fn extract_final_text(data: &str) -> Result<String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(data).context("Failed to parse response.completed data")?;
+
+    let response = parsed
+        .get("response")
+        .context("No response field in response.completed")?;
+
+    let output = response
+        .get("output")
+        .context("No output field in response")?
+        .as_array()
+        .context("output is not an array")?;
+
+    let message = output
+        .iter()
+        .find(|o| o.get("type").and_then(|t| t.as_str()) == Some("message"))
+        .context("No message output found")?;
+
+    let content = message
+        .get("content")
+        .context("No content in message")?
+        .as_array()
+        .context("content is not an array")?;
+
+    let text_content = content
+        .iter()
+        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("output_text"))
+        .context("No output_text content found")?;
+
+    text_content
+        .get("text")
+        .context("No text field in output_text")?
+        .as_str()
+        .context("text is not a string")
+        .map(|s| s.to_string())
+}
+
+/// Process request using the responses API with streaming
 async fn process_response(
     client: &reqwest::Client,
     api_key: &str,
@@ -292,6 +476,9 @@ async fn process_response(
         "reasoning": {
             "effort": reasoning_effort
         },
+        "stream": true,
+        "store": true,
+        "background": true,
         "text": {
             "format": {
                 "type": "json_schema",
@@ -329,33 +516,64 @@ async fn process_response(
         return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
     }
 
-    let api_response: ResponsesApiResponse = response
-        .json()
-        .await
-        .context("Failed to parse responses API response")?;
+    // Stream the response and parse SSE events
+    let mut stream = response.bytes_stream();
+    let mut sse = SseProcessor::new();
+    let mut final_result: Option<String> = None;
+    let mut response_id: Option<String> = None;
 
-    if api_response.status != "completed" {
-        return Err(anyhow!(
-            "Unexpected response status: {}",
-            api_response.status
-        ));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read chunk from stream")?;
+        sse.push(&chunk);
+
+        // Process all complete events in the buffer
+        while let Some(event_result) = sse.next_event() {
+            let (event_type, data) = event_result?;
+
+            match event_type.as_str() {
+                "response.created" => {
+                    if let Some(id) = extract_response_id(&data) {
+                        response_id = Some(id.clone());
+                        eprintln!("Response ID: {}", id);
+                    }
+                }
+                "response.completed" => {
+                    final_result = Some(extract_final_text(&data)?);
+                }
+                "response.failed" => {
+                    let error_info = extract_error_info(&data);
+                    return Err(anyhow!("Response failed: {}", error_info));
+                }
+                "error" => {
+                    let error_info = extract_error_info(&data);
+                    return Err(anyhow!("Stream error: {}", error_info));
+                }
+                _ => {}
+            }
+        }
     }
 
-    // Find the message output (there may be other outputs like reasoning)
-    let message_output = api_response
-        .output
-        .iter()
-        .find(|o| o.output_type == "message")
-        .context("No message output found in response")?;
+    // Check for incomplete data in buffer
+    if sse.has_remaining() {
+        let remaining = sse.remaining_as_string();
+        eprintln!(
+            "Warning: stream ended with unparsed data: {}",
+            remaining.chars().take(100).collect::<String>()
+        );
+    }
 
-    // Find the output_text content with text
-    let text_content = message_output
-        .content
-        .iter()
-        .find(|c| c.content_type == "output_text" && c.text.is_some())
-        .context("No output_text content found in message")?;
-
-    Ok(text_content.text.clone().unwrap())
+    match final_result {
+        Some(result) => Ok(result),
+        None => {
+            let id_info = response_id
+                .map(|id| format!(" (Response ID: {})", id))
+                .unwrap_or_default();
+            Err(anyhow!(
+                "Stream ended without response.completed event{}",
+                id_info
+            ))
+        }
+    }
 }
 
 /// List available OpenAI models
@@ -502,6 +720,146 @@ async fn run_list_models(client: &reqwest::Client, args: ListModelsArgs) -> Resu
     Ok(())
 }
 
+async fn run_poll(client: &reqwest::Client, args: PollArgs) -> Result<()> {
+    // Get API key from args or environment
+    let api_key = args
+        .api_key
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .context("OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable")?;
+
+    // Build URL with stream=true to get SSE events
+    let mut url = format!(
+        "https://api.openai.com/v1/responses/{}?stream=true",
+        args.response_id
+    );
+    if let Some(seq) = args.sequence {
+        url.push_str(&format!("&starting_after={}", seq));
+    }
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .context("Failed to send request to OpenAI")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .context("Failed to read error response")?;
+        return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
+    }
+
+    // Stream the response and parse SSE events
+    let mut stream = response.bytes_stream();
+    let mut sse = SseProcessor::new();
+    let mut last_sequence: Option<u64> = None;
+    let mut final_result: Option<String> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read chunk from stream")?;
+        sse.push(&chunk);
+
+        // Process all complete events in the buffer
+        while let Some(event_result) = sse.next_event() {
+            let (event_type, data) = event_result?;
+
+            // Extract and print sequence number with event type
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(seq) = parsed.get("sequence_number").and_then(|s| s.as_u64()) {
+                    last_sequence = Some(seq);
+                    eprintln!("Sequence: {} ({})", seq, event_type);
+                }
+            }
+
+            match event_type.as_str() {
+                "response.completed" => {
+                    final_result = Some(extract_final_text(&data)?);
+                }
+                "response.failed" => {
+                    let error_info = extract_error_info(&data);
+                    return Err(anyhow!("Response failed: {}", error_info));
+                }
+                "error" => {
+                    let error_info = extract_error_info(&data);
+                    return Err(anyhow!("Stream error: {}", error_info));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Check for incomplete data in buffer
+    if sse.has_remaining() {
+        let remaining = sse.remaining_as_string();
+        eprintln!(
+            "Warning: stream ended with unparsed data: {}",
+            remaining.chars().take(100).collect::<String>()
+        );
+    }
+
+    if let Some(seq) = last_sequence {
+        eprintln!("Final sequence: {}", seq);
+    }
+
+    match final_result {
+        Some(text) => {
+            println!("{}", text.trim());
+            Ok(())
+        }
+        None => Err(anyhow!(
+            "Stream ended without response.completed event. Last sequence: {:?}",
+            last_sequence
+        )),
+    }
+}
+
+async fn run_cancel(client: &reqwest::Client, args: CancelArgs) -> Result<()> {
+    // Get API key from args or environment
+    let api_key = args
+        .api_key
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .context("OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable")?;
+
+    let url = format!(
+        "https://api.openai.com/v1/responses/{}/cancel",
+        args.response_id
+    );
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .context("Failed to send cancel request to OpenAI")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .context("Failed to read error response")?;
+        return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
+    }
+
+    let response_data: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to parse cancel response")?;
+
+    let status = response_data
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    eprintln!("Status: {}", status);
+
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -514,5 +872,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Review(args) => run_review(&client, args).await,
         Commands::ListModels(args) => run_list_models(&client, args).await,
+        Commands::Poll(args) => run_poll(&client, args).await,
+        Commands::Cancel(args) => run_cancel(&client, args).await,
     }
 }
