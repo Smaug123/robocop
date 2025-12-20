@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use robocop_core::{create_user_prompt, get_system_prompt, GitData, OpenAIClient, ReviewMetadata};
+use robocop_core::{
+    create_user_prompt, get_system_prompt, GitData, OpenAIClient, ReviewMetadata, DEFAULT_MODEL,
+};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
-
-const DEFAULT_MODEL: &str = "gpt-5.2-2025-12-11 ";
 
 /// Robocop: AI-powered code review tool
 #[derive(Parser, Debug)]
@@ -276,14 +276,13 @@ struct ModelInfo {
 
 /// Process request using the responses API
 async fn process_response(
+    client: &reqwest::Client,
     api_key: &str,
     system_prompt: &str,
     user_prompt: &str,
     reasoning_effort: &str,
     model: &str,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
-
     let request_body = serde_json::json!({
         "model": model,
         "instructions": system_prompt,
@@ -360,9 +359,7 @@ async fn process_response(
 }
 
 /// List available OpenAI models
-async fn list_models(api_key: &str) -> Result<Vec<ModelInfo>> {
-    let client = reqwest::Client::new();
-
+async fn list_models(client: &reqwest::Client, api_key: &str) -> Result<Vec<ModelInfo>> {
     let response = client
         .get("https://api.openai.com/v1/models")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -387,7 +384,7 @@ async fn list_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     Ok(models_response.data)
 }
 
-async fn run_review(args: ReviewArgs) -> Result<()> {
+async fn run_review(client: &reqwest::Client, args: ReviewArgs) -> Result<()> {
     // Get git diff (sync operations are fine here)
     let git_data = get_git_diff(&args.default_branch)?;
 
@@ -471,6 +468,7 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
     } else {
         // Use responses API
         let result = process_response(
+            client,
             &api_key,
             &system_prompt,
             &user_prompt,
@@ -485,14 +483,14 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_list_models(args: ListModelsArgs) -> Result<()> {
+async fn run_list_models(client: &reqwest::Client, args: ListModelsArgs) -> Result<()> {
     // Get API key from args or environment
     let api_key = args
         .api_key
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .context("OpenAI API key must be provided via --api-key argument or OPENAI_API_KEY environment variable")?;
 
-    let mut models = list_models(&api_key).await?;
+    let mut models = list_models(client, &api_key).await?;
 
     // Sort by id for consistent output
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -508,8 +506,13 @@ async fn run_list_models(args: ListModelsArgs) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+        .context("Failed to create HTTP client")?;
+
     match cli.command {
-        Commands::Review(args) => run_review(args).await,
-        Commands::ListModels(args) => run_list_models(args).await,
+        Commands::Review(args) => run_review(&client, args).await,
+        Commands::ListModels(args) => run_list_models(&client, args).await,
     }
 }

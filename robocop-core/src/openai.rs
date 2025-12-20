@@ -11,6 +11,9 @@ use crate::recording::{
 };
 use crate::review::{create_user_prompt, get_system_prompt, ReviewMetadata};
 
+/// Default model to use for code reviews when none is specified
+pub const DEFAULT_MODEL: &str = "gpt-5.2-2025-12-11";
+
 /// Async OpenAI client for code review batch processing
 #[derive(Clone)]
 pub struct OpenAIClient {
@@ -273,7 +276,10 @@ impl OpenAIClient {
         }
 
         // Note: Using reqwest directly for multipart because reqwest_middleware doesn't support it well
-        let reqwest_client = reqwest::Client::new();
+        let reqwest_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3600))
+            .build()
+            .context("Failed to create HTTP client")?;
         let response = reqwest_client
             .post("https://api.openai.com/v1/files")
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -566,7 +572,7 @@ impl OpenAIClient {
             method: "POST".to_string(),
             url: "/v1/responses".to_string(),
             body: BatchRequestBody {
-                model: model.unwrap_or("gpt-5.2-2025-12-11").to_string(),
+                model: model.unwrap_or(DEFAULT_MODEL).to_string(),
                 instructions: get_system_prompt(),
                 input: vec![ResponsesInputMessage {
                     role: "user".to_string(),
@@ -617,7 +623,7 @@ impl OpenAIClient {
         batch_metadata.insert("repo_name".to_string(), metadata.repo_name.clone());
         batch_metadata.insert(
             "model".to_string(),
-            model.unwrap_or("gpt-5-2025-08-07").to_string(),
+            model.unwrap_or(DEFAULT_MODEL).to_string(),
         );
         batch_metadata.insert("reasoning_effort".to_string(), reasoning_effort.to_string());
 
@@ -660,6 +666,7 @@ pub fn create_openai_client(recording_logger: Option<RecordingLogger>) -> Client
 
     let client = Client::builder()
         .user_agent("Smaug123-robocop/0.1.0")
+        .timeout(std::time::Duration::from_secs(3600))
         .build()
         .expect("Failed to create HTTP client");
 

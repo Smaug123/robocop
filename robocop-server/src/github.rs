@@ -1256,6 +1256,7 @@ pub fn create_github_client(recording_logger: Option<RecordingLogger>) -> Client
 
     let client = Client::builder()
         .user_agent("Smaug123-robocop/0.1.0")
+        .timeout(std::time::Duration::from_secs(3600))
         .build()
         .expect("Failed to create HTTP client");
 
