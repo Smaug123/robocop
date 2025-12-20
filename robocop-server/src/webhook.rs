@@ -19,7 +19,7 @@ use crate::git::GitOps;
 use crate::github::{
     CommitStatusRequest, CommitStatusState, FileContentRequest, FileSizeLimits, PullRequestInfo,
 };
-use crate::openai::ReviewMetadata;
+use crate::openai::{ReviewMetadata, DEFAULT_MODEL};
 use crate::{AppState, COMMIT_STATUS_CONTEXT};
 use crate::{CorrelationId, Direction, EventType, RecordedEvent, Sanitizer};
 
@@ -1286,6 +1286,9 @@ async fn process_code_review(
         )
         .await?;
 
+    // Determine the actual model used (specified or default)
+    let actual_model = model.unwrap_or(DEFAULT_MODEL);
+
     info!(
         "Successfully submitted batch request {} for PR #{} in {}",
         batch_id, pr.number, repo.full_name
@@ -1295,8 +1298,10 @@ async fn process_code_review(
         I'm analyzing the changes in this pull request. This may take a long time depending on current OpenAI load.\n\n\
         **Commit:** `{}`\n\
         **Batch ID:** `{}`\n\
+        **Model:** `{}`\n\
+        **Reasoning effort:** `{}`\n\
         **Status:** Processing",
-        head_sha, batch_id
+        head_sha, batch_id, actual_model, reasoning_effort
     );
 
     let pr_info = PullRequestInfo {

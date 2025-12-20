@@ -3,7 +3,7 @@ pub use robocop_core::{
     create_openai_client, BatchCreateRequest, BatchRequest, BatchRequestBody, BatchResponse,
     ExpiresAfter, FileUploadResponse, OpenAIClient, ReasoningConfig, RequestCounts,
     ResponsesInputMessage, ReviewMetadata, Schema, SchemaProperties, SchemaProperty, TextFormat,
-    TextFormatType,
+    TextFormatType, DEFAULT_MODEL,
 };
 
 #[cfg(test)]
