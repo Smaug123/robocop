@@ -1219,6 +1219,25 @@ async fn process_code_review(
     let head_sha = &pr.head.sha;
     let branch_name = Some(pr.head.ref_name.as_str());
 
+    // Check if there's already a pending batch for this exact commit
+    {
+        let pending = state.pending_batches.read().await;
+        let existing_batch = pending.values().find(|batch| {
+            batch.pr_number == pr.number
+                && batch.repo_owner == *repo_owner
+                && batch.repo_name == *repo_name
+                && batch.head_sha == *head_sha
+        });
+
+        if let Some(batch) = existing_batch {
+            info!(
+                "Skipping review for PR #{}: batch {} already pending for commit {}",
+                pr.number, batch.batch_id, head_sha
+            );
+            return Ok(());
+        }
+    }
+
     let pr_id = crate::PullRequestId {
         repo_owner: repo_owner.clone(),
         repo_name: repo_name.clone(),
@@ -2039,5 +2058,102 @@ mod tests {
         assert_eq!(request.repo_owner, "test-owner");
         assert_eq!(request.repo_name, "test-repo");
         assert_eq!(request.head_sha, "abc123def456");
+    }
+
+    fn create_pending_batch(
+        batch_id: &str,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: u64,
+        head_sha: &str,
+    ) -> crate::PendingBatch {
+        crate::PendingBatch {
+            batch_id: batch_id.to_string(),
+            installation_id: 12345,
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            pr_number,
+            comment_id: 999,
+            check_run_id: 888,
+            version: "1.0.0".to_string(),
+            created_at: 1234567890,
+            head_sha: head_sha.to_string(),
+            base_sha: "base123".to_string(),
+        }
+    }
+
+    /// Helper function that mirrors the detection logic in process_code_review.
+    /// Returns true if a matching batch exists.
+    fn has_existing_batch(
+        pending: &HashMap<String, crate::PendingBatch>,
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: u64,
+        head_sha: &str,
+    ) -> bool {
+        pending.values().any(|batch| {
+            batch.pr_number == pr_number
+                && batch.repo_owner == repo_owner
+                && batch.repo_name == repo_name
+                && batch.head_sha == head_sha
+        })
+    }
+
+    #[test]
+    fn test_duplicate_batch_detection() {
+        // This test verifies that we correctly detect when a batch already exists
+        // for a given PR and commit, preventing duplicate reviews.
+        //
+        // This is important because:
+        // 1. PR edit events (pull_request.edited) can trigger reviews for commits
+        //    that are already being reviewed
+        // 2. Multiple webhooks can arrive in quick succession for the same commit
+        // 3. Duplicate batches waste OpenAI API credits
+
+        let mut pending_batches: HashMap<String, crate::PendingBatch> = HashMap::new();
+
+        // Add a pending batch for PR #16 in owner/repo at commit abc123
+        pending_batches.insert(
+            "batch_existing".to_string(),
+            create_pending_batch("batch_existing", "owner", "repo", 16, "abc123"),
+        );
+
+        // Test 1: Exact match should be detected as duplicate
+        assert!(
+            has_existing_batch(&pending_batches, "owner", "repo", 16, "abc123"),
+            "Should detect existing batch for same PR and commit"
+        );
+
+        // Test 2: Different PR number should NOT be detected as duplicate
+        assert!(
+            !has_existing_batch(&pending_batches, "owner", "repo", 17, "abc123"),
+            "Different PR number should not match"
+        );
+
+        // Test 3: Different repo owner should NOT be detected as duplicate
+        assert!(
+            !has_existing_batch(&pending_batches, "other", "repo", 16, "abc123"),
+            "Different repo owner should not match"
+        );
+
+        // Test 4: Different repo name should NOT be detected as duplicate
+        assert!(
+            !has_existing_batch(&pending_batches, "owner", "other", 16, "abc123"),
+            "Different repo name should not match"
+        );
+
+        // Test 5: Different commit SHA should NOT be detected as duplicate
+        // This is the key case: a new commit on the same PR should trigger a new review
+        assert!(
+            !has_existing_batch(&pending_batches, "owner", "repo", 16, "def456"),
+            "Different commit SHA should not match - new commits need new reviews"
+        );
+
+        // Test 6: Empty pending batches should not find anything
+        let empty_batches: HashMap<String, crate::PendingBatch> = HashMap::new();
+        assert!(
+            !has_existing_batch(&empty_batches, "owner", "repo", 16, "abc123"),
+            "Empty pending batches should not find anything"
+        );
     }
 }
