@@ -144,6 +144,8 @@ pub struct BatchRequestBody {
     pub input: Vec<ResponsesInputMessage>,
     pub reasoning: ReasoningConfig,
     pub text: TextFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -566,45 +568,7 @@ impl OpenAIClient {
         // Create user prompt
         let user_prompt = create_user_prompt(diff, file_contents, additional_prompt);
 
-        // Create batch request using the responses API format
-        let batch_request = BatchRequest {
-            custom_id: "robocop-review-1".to_string(),
-            method: "POST".to_string(),
-            url: "/v1/responses".to_string(),
-            body: BatchRequestBody {
-                model: model.unwrap_or(DEFAULT_MODEL).to_string(),
-                instructions: get_system_prompt(),
-                input: vec![ResponsesInputMessage {
-                    role: "user".to_string(),
-                    content: user_prompt,
-                }],
-                reasoning: ReasoningConfig {
-                    effort: reasoning_effort.to_string(),
-                },
-                text: Self::create_text_format(),
-            },
-        };
-
-        // Convert to JSONL format (with trailing newline)
-        let jsonl_content = format!("{}\n", serde_json::to_string(&batch_request)?);
-        let jsonl_bytes = jsonl_content.as_bytes();
-
-        info!("Created batch request ({} bytes JSONL)", jsonl_bytes.len());
-
-        // Upload batch file
-        let file_response = self
-            .upload_file(
-                correlation_id,
-                jsonl_bytes,
-                "batch_request.jsonl",
-                "batch",
-                None, // No expiration for batch files
-            )
-            .await?;
-
-        info!("Uploaded batch file: {}", file_response.id);
-
-        // Create batch metadata
+        // Create metadata (used for both the response request and the batch)
         let mut batch_metadata = HashMap::new();
         batch_metadata.insert(
             "description".to_string(),
@@ -638,6 +602,45 @@ impl OpenAIClient {
         if let Some(url) = &metadata.pull_request_url {
             batch_metadata.insert("pull_request_url".to_string(), url.clone());
         }
+
+        // Create batch request using the responses API format
+        let batch_request = BatchRequest {
+            custom_id: "robocop-review-1".to_string(),
+            method: "POST".to_string(),
+            url: "/v1/responses".to_string(),
+            body: BatchRequestBody {
+                model: model.unwrap_or(DEFAULT_MODEL).to_string(),
+                instructions: get_system_prompt(),
+                input: vec![ResponsesInputMessage {
+                    role: "user".to_string(),
+                    content: user_prompt,
+                }],
+                reasoning: ReasoningConfig {
+                    effort: reasoning_effort.to_string(),
+                },
+                text: Self::create_text_format(),
+                metadata: Some(batch_metadata.clone()),
+            },
+        };
+
+        // Convert to JSONL format (with trailing newline)
+        let jsonl_content = format!("{}\n", serde_json::to_string(&batch_request)?);
+        let jsonl_bytes = jsonl_content.as_bytes();
+
+        info!("Created batch request ({} bytes JSONL)", jsonl_bytes.len());
+
+        // Upload batch file
+        let file_response = self
+            .upload_file(
+                correlation_id,
+                jsonl_bytes,
+                "batch_request.jsonl",
+                "batch",
+                None, // No expiration for batch files
+            )
+            .await?;
+
+        info!("Uploaded batch file: {}", file_response.id);
 
         // Create batch using responses API endpoint
         let batch_response = self
