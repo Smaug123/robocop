@@ -30,6 +30,38 @@ fn truncate_sha(sha: &str) -> &str {
     &sha[..7.min(sha.len())]
 }
 
+/// Build a check run request for when reviews are disabled/suppressed.
+/// This creates a completed check with "skipped" conclusion.
+fn build_skipped_check_run_request<'a>(
+    installation_id: u64,
+    repo_owner: &'a str,
+    repo_name: &'a str,
+    head_sha: &'a str,
+    completed_at: &'a str,
+) -> CreateCheckRunRequest<'a> {
+    CreateCheckRunRequest {
+        installation_id,
+        repo_owner,
+        repo_name,
+        name: CHECK_RUN_NAME,
+        head_sha,
+        details_url: None,
+        external_id: None,
+        status: Some(CheckRunStatus::Completed),
+        started_at: None,
+        conclusion: Some(CheckRunConclusion::Skipped),
+        completed_at: Some(completed_at),
+        output: Some(CheckRunOutput {
+            title: "Reviews disabled for this PR".to_string(),
+            summary: format!(
+                "Code review for commit {} was skipped because reviews are disabled for this PR.",
+                truncate_sha(head_sha)
+            ),
+            text: None,
+        }),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GitHubWebhookPayload {
     pub action: Option<String>,
@@ -1247,6 +1279,27 @@ async fn process_code_review(
             .manage_robocop_comment(correlation_id, &pr_info, &suppression_content, &version)
             .await?;
 
+        // Create a skipped check run so the PR shows the review was intentionally skipped
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        let check_run_request = build_skipped_check_run_request(
+            installation_id,
+            repo_owner,
+            repo_name,
+            head_sha,
+            &completed_at,
+        );
+
+        if let Err(e) = github_client
+            .create_check_run(correlation_id, &check_run_request)
+            .await
+        {
+            // Log but don't fail - check run creation is best-effort
+            error!(
+                "Failed to create skipped check run for PR #{}: {}",
+                pr.number, e
+            );
+        }
+
         return Ok(());
     }
 
@@ -1941,5 +1994,50 @@ mod tests {
 
         let sender = payload.sender.unwrap();
         assert_eq!(sender.id, 456);
+    }
+
+    #[test]
+    fn test_build_skipped_check_run_request() {
+        // This test verifies that when reviews are disabled for a PR,
+        // we create a check run with the correct "skipped" status.
+        //
+        // This is important because GitHub's Checks API allows PRs to show
+        // a clear "skipped" status rather than having no check at all,
+        // which provides better visibility into why no review was performed.
+
+        let completed_at = "2024-01-15T10:30:00Z";
+        let request = build_skipped_check_run_request(
+            12345,          // installation_id
+            "test-owner",   // repo_owner
+            "test-repo",    // repo_name
+            "abc123def456", // head_sha
+            completed_at,
+        );
+
+        // Verify the check run is marked as completed with skipped conclusion
+        assert_eq!(request.status, Some(CheckRunStatus::Completed));
+        assert_eq!(request.conclusion, Some(CheckRunConclusion::Skipped));
+        assert_eq!(request.completed_at, Some(completed_at));
+
+        // Verify the check run name matches the constant
+        assert_eq!(request.name, CHECK_RUN_NAME);
+
+        // Verify the output contains the expected title and summary
+        let output = request.output.expect("output should be present");
+        assert_eq!(output.title, "Reviews disabled for this PR");
+        assert!(
+            output.summary.contains("abc123d"),
+            "summary should contain truncated SHA"
+        );
+        assert!(
+            output.summary.contains("skipped"),
+            "summary should mention 'skipped'"
+        );
+
+        // Verify identifiers are passed through correctly
+        assert_eq!(request.installation_id, 12345);
+        assert_eq!(request.repo_owner, "test-owner");
+        assert_eq!(request.repo_name, "test-repo");
+        assert_eq!(request.head_sha, "abc123def456");
     }
 }
