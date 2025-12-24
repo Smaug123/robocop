@@ -5,6 +5,7 @@ pub mod git;
 pub mod github;
 pub mod openai;
 pub mod review_state;
+pub mod state_machine;
 pub mod webhook;
 
 use std::collections::HashMap;
