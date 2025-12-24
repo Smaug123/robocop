@@ -1085,3 +1085,417 @@ mod tests {
         assert!(!result.state.reviews_enabled());
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use super::super::state::{BatchId, CheckRunId, CommentId, CommitSha};
+    use super::*;
+    use proptest::prelude::*;
+
+    // =========================================================================
+    // Arbitrary generators
+    // =========================================================================
+
+    fn arb_commit_sha() -> impl Strategy<Value = CommitSha> {
+        "[a-f0-9]{40}".prop_map(CommitSha::from)
+    }
+
+    fn arb_batch_id() -> impl Strategy<Value = BatchId> {
+        "batch_[a-zA-Z0-9]{24}".prop_map(BatchId::from)
+    }
+
+    fn arb_comment_id() -> impl Strategy<Value = CommentId> {
+        (1u64..1000000).prop_map(CommentId::from)
+    }
+
+    fn arb_check_run_id() -> impl Strategy<Value = CheckRunId> {
+        (1u64..1000000).prop_map(CheckRunId::from)
+    }
+
+    fn arb_model() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("o1".to_string()),
+            Just("o3".to_string()),
+            Just("gpt-4".to_string()),
+            Just("gpt-4o".to_string()),
+        ]
+    }
+
+    fn arb_reasoning_effort() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("low".to_string()),
+            Just("medium".to_string()),
+            Just("high".to_string()),
+        ]
+    }
+
+    fn arb_review_options() -> impl Strategy<Value = ReviewOptions> {
+        (
+            proptest::option::of(arb_model()),
+            proptest::option::of(arb_reasoning_effort()),
+        )
+            .prop_map(|(model, reasoning_effort)| ReviewOptions {
+                model,
+                reasoning_effort,
+            })
+    }
+
+    fn arb_review_result() -> impl Strategy<Value = ReviewResult> {
+        prop_oneof![
+            (".*", ".*")
+                .prop_map(|(summary, reasoning)| ReviewResult::NoIssues { summary, reasoning }),
+            (".*", ".*").prop_map(|(summary, reasoning)| ReviewResult::HasIssues {
+                summary,
+                reasoning,
+                comments: vec![], // Simplified for now
+            }),
+        ]
+    }
+
+    fn arb_failure_reason() -> impl Strategy<Value = FailureReason> {
+        prop_oneof![
+            Just(FailureReason::BatchExpired),
+            Just(FailureReason::NoOutputFile),
+            ".*".prop_map(|e| FailureReason::BatchFailed { error: Some(e) }),
+            ".*".prop_map(|e| FailureReason::DownloadFailed { error: e }),
+            ".*".prop_map(|e| FailureReason::ParseFailed { error: e }),
+            ".*".prop_map(|e| FailureReason::SubmissionFailed { error: e }),
+        ]
+    }
+
+    fn arb_cancellation_reason() -> impl Strategy<Value = CancellationReason> {
+        prop_oneof![
+            Just(CancellationReason::UserRequested),
+            Just(CancellationReason::ReviewsDisabled),
+            arb_commit_sha().prop_map(|sha| CancellationReason::Superseded { new_sha: sha }),
+        ]
+    }
+
+    fn arb_idle_state() -> impl Strategy<Value = ReviewMachineState> {
+        any::<bool>().prop_map(|reviews_enabled| ReviewMachineState::Idle { reviews_enabled })
+    }
+
+    fn arb_preparing_state() -> impl Strategy<Value = ReviewMachineState> {
+        (
+            any::<bool>(),
+            arb_commit_sha(),
+            arb_commit_sha(),
+            arb_review_options(),
+        )
+            .prop_map(|(reviews_enabled, head_sha, base_sha, options)| {
+                ReviewMachineState::Preparing {
+                    reviews_enabled,
+                    head_sha,
+                    base_sha,
+                    options,
+                }
+            })
+    }
+
+    fn arb_batch_pending_state() -> impl Strategy<Value = ReviewMachineState> {
+        (
+            any::<bool>(),
+            arb_batch_id(),
+            arb_commit_sha(),
+            arb_commit_sha(),
+            arb_comment_id(),
+            arb_check_run_id(),
+            arb_model(),
+            arb_reasoning_effort(),
+        )
+            .prop_map(
+                |(
+                    reviews_enabled,
+                    batch_id,
+                    head_sha,
+                    base_sha,
+                    comment_id,
+                    check_run_id,
+                    model,
+                    reasoning_effort,
+                )| {
+                    ReviewMachineState::BatchPending {
+                        reviews_enabled,
+                        batch_id,
+                        head_sha,
+                        base_sha,
+                        comment_id,
+                        check_run_id,
+                        model,
+                        reasoning_effort,
+                    }
+                },
+            )
+    }
+
+    fn arb_completed_state() -> impl Strategy<Value = ReviewMachineState> {
+        (any::<bool>(), arb_commit_sha(), arb_review_result()).prop_map(
+            |(reviews_enabled, head_sha, result)| ReviewMachineState::Completed {
+                reviews_enabled,
+                head_sha,
+                result,
+            },
+        )
+    }
+
+    fn arb_failed_state() -> impl Strategy<Value = ReviewMachineState> {
+        (any::<bool>(), arb_commit_sha(), arb_failure_reason()).prop_map(
+            |(reviews_enabled, head_sha, reason)| ReviewMachineState::Failed {
+                reviews_enabled,
+                head_sha,
+                reason,
+            },
+        )
+    }
+
+    fn arb_cancelled_state() -> impl Strategy<Value = ReviewMachineState> {
+        (any::<bool>(), arb_commit_sha(), arb_cancellation_reason()).prop_map(
+            |(reviews_enabled, head_sha, reason)| ReviewMachineState::Cancelled {
+                reviews_enabled,
+                head_sha,
+                reason,
+            },
+        )
+    }
+
+    fn arb_terminal_state() -> impl Strategy<Value = ReviewMachineState> {
+        prop_oneof![
+            arb_completed_state(),
+            arb_failed_state(),
+            arb_cancelled_state(),
+        ]
+    }
+
+    fn arb_state() -> impl Strategy<Value = ReviewMachineState> {
+        prop_oneof![
+            arb_idle_state(),
+            arb_preparing_state(),
+            arb_batch_pending_state(),
+            arb_completed_state(),
+            arb_failed_state(),
+            arb_cancelled_state(),
+        ]
+    }
+
+    fn arb_pr_updated_event() -> impl Strategy<Value = Event> {
+        (
+            arb_commit_sha(),
+            arb_commit_sha(),
+            any::<bool>(),
+            arb_review_options(),
+        )
+            .prop_map(
+                |(head_sha, base_sha, force_review, options)| Event::PrUpdated {
+                    head_sha,
+                    base_sha,
+                    force_review,
+                    options,
+                },
+            )
+    }
+
+    fn arb_event() -> impl Strategy<Value = Event> {
+        prop_oneof![
+            arb_pr_updated_event(),
+            (arb_commit_sha(), arb_commit_sha(), arb_review_options()).prop_map(
+                |(head_sha, base_sha, options)| Event::ReviewRequested {
+                    head_sha,
+                    base_sha,
+                    options
+                }
+            ),
+            Just(Event::CancelRequested),
+            (arb_commit_sha(), arb_commit_sha()).prop_map(|(head_sha, base_sha)| {
+                Event::EnableReviewsRequested { head_sha, base_sha }
+            }),
+            Just(Event::DisableReviewsRequested),
+            (arb_batch_id(), arb_review_result())
+                .prop_map(|(batch_id, result)| Event::BatchCompleted { batch_id, result }),
+            (arb_batch_id(), arb_failure_reason())
+                .prop_map(|(batch_id, reason)| Event::BatchTerminated { batch_id, reason }),
+        ]
+    }
+
+    // =========================================================================
+    // Property Tests
+    // =========================================================================
+
+    proptest! {
+        /// Property: reviews_enabled only changes on explicit enable/disable commands
+        #[test]
+        fn reviews_enabled_only_changes_on_explicit_commands(
+            state in arb_state(),
+            event in arb_event()
+        ) {
+            let original_enabled = state.reviews_enabled();
+            let result = transition(state, event.clone());
+            let new_enabled = result.state.reviews_enabled();
+
+            // reviews_enabled should only change if the event was Enable/Disable
+            let is_enable_disable = matches!(
+                event,
+                Event::EnableReviewsRequested { .. } | Event::DisableReviewsRequested
+            );
+
+            if !is_enable_disable {
+                prop_assert_eq!(
+                    original_enabled, new_enabled,
+                    "reviews_enabled changed without enable/disable command"
+                );
+            }
+        }
+
+        /// Property: CancelBatch effect only emitted when in BatchPending or AwaitingAncestryCheck
+        #[test]
+        fn cancel_batch_only_when_pending(
+            state in arb_state(),
+            event in arb_event()
+        ) {
+            let has_pending_batch = state.has_pending_batch();
+            let result = transition(state, event);
+
+            let emits_cancel = result.effects.iter().any(|e| matches!(e, Effect::CancelBatch { .. }));
+
+            if emits_cancel {
+                prop_assert!(
+                    has_pending_batch,
+                    "CancelBatch emitted but state had no pending batch"
+                );
+            }
+        }
+
+        /// Property: Terminal states remain terminal on cancel requests
+        #[test]
+        fn terminal_states_stable_on_cancel(
+            state in arb_terminal_state()
+        ) {
+            let result = transition(state.clone(), Event::CancelRequested);
+
+            // Should stay in same terminal state type
+            prop_assert!(result.state.is_terminal(), "Terminal state became non-terminal on cancel");
+
+            // Should have no pending batch effects
+            let has_cancel_batch = result.effects.iter().any(|e| matches!(e, Effect::CancelBatch { .. }));
+            prop_assert!(!has_cancel_batch, "Cancel emitted for terminal state");
+        }
+
+        /// Property: Transition function always produces valid state
+        #[test]
+        fn transition_produces_valid_state(
+            state in arb_state(),
+            event in arb_event()
+        ) {
+            let result = transition(state, event);
+
+            // State should be constructible (type system ensures this, but let's verify no panics)
+            let _ = result.state.reviews_enabled();
+            let _ = result.state.is_terminal();
+            let _ = result.state.has_pending_batch();
+
+            // Effects should be non-panicking to inspect
+            for effect in &result.effects {
+                let _ = format!("{:?}", effect);
+            }
+        }
+
+        /// Property: When a new commit arrives while BatchPending, either:
+        /// 1. State stays BatchPending (same commit - duplicate webhook)
+        /// 2. State becomes AwaitingAncestryCheck (different commit)
+        #[test]
+        fn new_commit_during_batch_pending_triggers_ancestry_check(
+            state in arb_batch_pending_state(),
+            new_head_sha in arb_commit_sha(),
+            new_base_sha in arb_commit_sha(),
+        ) {
+            let current_head = if let ReviewMachineState::BatchPending { head_sha, .. } = &state {
+                head_sha.clone()
+            } else {
+                unreachable!()
+            };
+
+            let event = Event::PrUpdated {
+                head_sha: new_head_sha.clone(),
+                base_sha: new_base_sha,
+                force_review: false,
+                options: ReviewOptions::default(),
+            };
+
+            let result = transition(state, event);
+
+            if current_head == new_head_sha {
+                // Same commit - should stay BatchPending
+                prop_assert!(
+                    matches!(result.state, ReviewMachineState::BatchPending { .. }),
+                    "Same commit should stay BatchPending"
+                );
+            } else {
+                // Different commit - should go to AwaitingAncestryCheck
+                prop_assert!(
+                    matches!(result.state, ReviewMachineState::AwaitingAncestryCheck { .. }),
+                    "Different commit should trigger ancestry check"
+                );
+                // Should emit CheckAncestry effect
+                prop_assert!(
+                    result.effects.iter().any(|e| matches!(e, Effect::CheckAncestry { .. })),
+                    "Should emit CheckAncestry effect"
+                );
+            }
+        }
+
+        /// Property: ReviewRequested always starts a review, even when disabled
+        #[test]
+        fn review_requested_always_starts_review(
+            reviews_enabled in any::<bool>(),
+            head_sha in arb_commit_sha(),
+            base_sha in arb_commit_sha(),
+            options in arb_review_options(),
+        ) {
+            let state = ReviewMachineState::Idle { reviews_enabled };
+            let event = Event::ReviewRequested {
+                head_sha,
+                base_sha,
+                options,
+            };
+
+            let result = transition(state, event);
+
+            prop_assert!(
+                matches!(result.state, ReviewMachineState::Preparing { .. }),
+                "ReviewRequested should always start preparing"
+            );
+            prop_assert!(
+                result.effects.iter().any(|e| matches!(e, Effect::FetchData { .. })),
+                "Should emit FetchData effect"
+            );
+        }
+
+        /// Property: Idle with reviews_enabled=false suppresses PrUpdated (unless force_review)
+        #[test]
+        fn disabled_idle_suppresses_pr_updated(
+            head_sha in arb_commit_sha(),
+            base_sha in arb_commit_sha(),
+            options in arb_review_options(),
+        ) {
+            let state = ReviewMachineState::Idle { reviews_enabled: false };
+            let event = Event::PrUpdated {
+                head_sha,
+                base_sha,
+                force_review: false,
+                options,
+            };
+
+            let result = transition(state, event);
+
+            // Should stay Idle
+            prop_assert!(
+                matches!(result.state, ReviewMachineState::Idle { reviews_enabled: false }),
+                "Should stay Idle when disabled"
+            );
+            // Should emit suppression notice
+            prop_assert!(
+                result.effects.iter().any(|e| matches!(e, Effect::UpdateComment { content: CommentContent::ReviewSuppressed { .. } })),
+                "Should emit suppression notice"
+            );
+        }
+    }
+}

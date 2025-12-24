@@ -11,10 +11,12 @@
 
 pub mod effect;
 pub mod event;
+pub mod interpreter;
 pub mod state;
 pub mod transition;
 
 pub use effect::*;
 pub use event::*;
+pub use interpreter::*;
 pub use state::*;
 pub use transition::*;
