@@ -1,4 +1,4 @@
-use crate::github::GitHubClient;
+use crate::github::{CompareCommitsRequest, GitHubClient};
 use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
@@ -36,17 +36,15 @@ impl GitOps {
 
         // Use GitHub Compare API to check if existing_sha is in new_sha's history
         // Compare existing_sha...new_sha - if ahead_by > 0 and behind_by == 0, then existing_sha is an ancestor
-        match github_client
-            .compare_commits(
-                None, // No correlation ID available in this context
-                installation_id,
-                repo_owner,
-                repo_name,
-                existing_sha,
-                new_sha,
-            )
-            .await
-        {
+        let compare_request = CompareCommitsRequest {
+            installation_id,
+            repo_owner,
+            repo_name,
+            base_sha: existing_sha,
+            head_sha: new_sha,
+        };
+
+        match github_client.compare_commits(None, &compare_request).await {
             Ok(compare_result) => {
                 // If ahead_by > 0 and behind_by == 0, it means existing_sha is an ancestor of new_sha
                 let is_ancestor = compare_result.ahead_by > 0 && compare_result.behind_by == 0;

@@ -33,6 +33,8 @@ pub enum Effect {
     CreateCheckRun {
         head_sha: CommitSha,
         status: EffectCheckRunStatus,
+        /// Required when status is Completed.
+        conclusion: Option<EffectCheckRunConclusion>,
         title: String,
         summary: String,
     },

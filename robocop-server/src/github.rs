@@ -109,6 +109,16 @@ pub struct CommitStatusRequest<'a> {
     pub context: &'a str,
 }
 
+/// Request to compare two commits
+#[derive(Debug, Clone)]
+pub struct CompareCommitsRequest<'a> {
+    pub installation_id: u64,
+    pub repo_owner: &'a str,
+    pub repo_name: &'a str,
+    pub base_sha: &'a str,
+    pub head_sha: &'a str,
+}
+
 /// GitHub Check Run status
 ///
 /// See: https://docs.github.com/en/rest/checks/runs
@@ -1246,23 +1256,19 @@ impl GitHubClient {
     pub async fn compare_commits(
         &self,
         correlation_id: Option<&str>,
-        installation_id: u64,
-        repo_owner: &str,
-        repo_name: &str,
-        base_sha: &str,
-        head_sha: &str,
+        request: &CompareCommitsRequest<'_>,
     ) -> Result<CompareResult> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/compare/{}...{}",
-            repo_owner, repo_name, base_sha, head_sha
+            request.repo_owner, request.repo_name, request.base_sha, request.head_sha
         );
 
         info!(
             "Comparing commits {} to {} in {}/{}",
-            base_sha, head_sha, repo_owner, repo_name
+            request.base_sha, request.head_sha, request.repo_owner, request.repo_name
         );
 
-        let token = self.get_installation_token(installation_id).await?;
+        let token = self.get_installation_token(request.installation_id).await?;
         let mut request_builder = self
             .client
             .get(&url)

@@ -99,9 +99,10 @@ async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResul
         Effect::CreateCheckRun {
             head_sha,
             status,
+            conclusion,
             title,
             summary,
-        } => execute_create_check_run(ctx, &head_sha, status, &title, &summary, None).await,
+        } => execute_create_check_run(ctx, &head_sha, status, &title, &summary, conclusion).await,
 
         Effect::UpdateCheckRun {
             check_run_id,
@@ -276,16 +277,17 @@ async fn execute_check_ancestry(
 
     let correlation_id = ctx.correlation_id.as_deref();
 
+    let compare_request = crate::github::CompareCommitsRequest {
+        installation_id: ctx.installation_id,
+        repo_owner: &ctx.repo_owner,
+        repo_name: &ctx.repo_name,
+        base_sha: &old_sha.0,
+        head_sha: &new_sha.0,
+    };
+
     match ctx
         .github_client
-        .compare_commits(
-            correlation_id,
-            ctx.installation_id,
-            &ctx.repo_name,
-            &old_sha.0,
-            &new_sha.0,
-            &ctx.repo_owner,
-        )
+        .compare_commits(correlation_id, &compare_request)
         .await
     {
         Ok(comparison) => {
@@ -668,7 +670,7 @@ async fn execute_submit_batch(
     let reasoning_effort = options
         .reasoning_effort
         .clone()
-        .unwrap_or_else(|| "medium".to_string());
+        .unwrap_or_else(|| "xhigh".to_string());
 
     let metadata = ReviewMetadata {
         head_hash: head_sha.0.clone(),
@@ -706,6 +708,8 @@ async fn execute_submit_batch(
         Err(e) => {
             return EffectResult::single(Event::BatchSubmissionFailed {
                 error: format!("Failed to create comment: {}", e),
+                comment_id: None,
+                check_run_id: None,
             });
         }
     };
@@ -740,6 +744,8 @@ async fn execute_submit_batch(
         Err(e) => {
             return EffectResult::single(Event::BatchSubmissionFailed {
                 error: format!("Failed to create check run: {}", e),
+                comment_id: Some(comment_id),
+                check_run_id: None,
             });
         }
     };
@@ -771,6 +777,8 @@ async fn execute_submit_batch(
         }
         Err(e) => EffectResult::single(Event::BatchSubmissionFailed {
             error: e.to_string(),
+            comment_id: Some(comment_id),
+            check_run_id: Some(check_run_id),
         }),
     }
 }

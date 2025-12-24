@@ -68,7 +68,13 @@ pub enum Event {
     },
 
     /// Batch submission failed.
-    BatchSubmissionFailed { error: String },
+    BatchSubmissionFailed {
+        error: String,
+        /// Comment ID if a comment was created before failure.
+        comment_id: Option<CommentId>,
+        /// Check run ID if a check run was created before failure.
+        check_run_id: Option<CheckRunId>,
+    },
 
     // =========================================================================
     // Polling Results

@@ -35,8 +35,8 @@ async fn poll_pending_batches(state: &Arc<AppState>) -> Result<()> {
 
     info!("Polling {} pending batches", pending_batches.len());
 
-    for (pr_id, batch_id) in pending_batches {
-        if let Err(e) = process_single_batch(state, &pr_id, &batch_id).await {
+    for (pr_id, batch_id, installation_id) in pending_batches {
+        if let Err(e) = process_single_batch(state, &pr_id, &batch_id, installation_id).await {
             error!(
                 "Error processing batch {} for PR #{}: {}",
                 &batch_id.0, pr_id.pr_number, e
@@ -52,6 +52,7 @@ async fn create_and_process_event(
     state: &Arc<AppState>,
     pr_id: &crate::state_machine::StateMachinePrId,
     event: crate::state_machine::Event,
+    installation_id: u64,
 ) -> Result<()> {
     let pr_url = format!(
         "https://github.com/{}/{}/pull/{}",
@@ -64,7 +65,7 @@ async fn create_and_process_event(
     let ctx = InterpreterContext {
         github_client: state.github_client.clone(),
         openai_client: state.openai_client.clone(),
-        installation_id: 0,
+        installation_id,
         repo_owner: pr_id.repo_owner.clone(),
         repo_name: pr_id.repo_name.clone(),
         pr_number: pr_id.pr_number,
@@ -86,6 +87,7 @@ async fn process_single_batch(
     state: &Arc<AppState>,
     pr_id: &crate::state_machine::StateMachinePrId,
     batch_id: &crate::state_machine::BatchId,
+    installation_id: u64,
 ) -> Result<()> {
     let batch_response = state.openai_client.get_batch(None, &batch_id.0).await?;
 
@@ -106,6 +108,7 @@ async fn process_single_batch(
                         state,
                         pr_id,
                         batch_terminated_event(&batch_id.0, FailureReason::NoOutputFile),
+                        installation_id,
                     )
                     .await;
                 }
@@ -175,7 +178,7 @@ async fn process_single_batch(
     };
 
     // Process the event through the state machine
-    create_and_process_event(state, pr_id, event).await
+    create_and_process_event(state, pr_id, event, installation_id).await
 }
 
 /// Batch output line from OpenAI responses API

@@ -86,6 +86,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 Effect::CreateCheckRun {
                     head_sha,
                     status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Reviews disabled for this PR".to_string(),
                     summary: "Code review was skipped because reviews are disabled.".to_string(),
                 },
@@ -279,15 +280,46 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 reviews_enabled,
                 ..
             },
-            Event::BatchSubmissionFailed { error },
-        ) => TransitionResult::new(
-            ReviewMachineState::Failed {
-                reviews_enabled: *reviews_enabled,
-                head_sha: head_sha.clone(),
-                reason: FailureReason::SubmissionFailed { error },
+            Event::BatchSubmissionFailed {
+                error,
+                comment_id: _,
+                check_run_id,
             },
-            vec![],
-        ),
+        ) => {
+            // Build cleanup effects for any UI elements that were created
+            let mut effects = vec![
+                // Update comment to show failure (manage_robocop_comment will find existing)
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewFailed {
+                        head_sha: head_sha.clone(),
+                        batch_id: super::state::BatchId::from("(submission failed)".to_string()),
+                        reason: FailureReason::SubmissionFailed {
+                            error: error.clone(),
+                        },
+                    },
+                },
+            ];
+
+            // Update check run if it was created
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Failure),
+                    title: "Code review failed".to_string(),
+                    summary: format!("Batch submission failed: {}", error),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Failed {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha: head_sha.clone(),
+                    reason: FailureReason::SubmissionFailed { error },
+                },
+                effects,
+            )
+        }
 
         // Cancel while preparing -> go back to idle
         (
@@ -688,6 +720,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 Effect::CreateCheckRun {
                     head_sha,
                     status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Reviews disabled".to_string(),
                     summary: "Reviews are disabled for this PR.".to_string(),
                 },

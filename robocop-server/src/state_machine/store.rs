@@ -42,6 +42,8 @@ impl StateMachinePrId {
 /// Thread-safe store for per-PR state machines.
 pub struct StateStore {
     states: RwLock<HashMap<StateMachinePrId, ReviewMachineState>>,
+    /// Installation IDs for each PR (needed for batch polling to auth with GitHub).
+    installation_ids: RwLock<HashMap<StateMachinePrId, u64>>,
 }
 
 impl Default for StateStore {
@@ -54,6 +56,7 @@ impl StateStore {
     pub fn new() -> Self {
         Self {
             states: RwLock::new(HashMap::new()),
+            installation_ids: RwLock::new(HashMap::new()),
         }
     }
 
@@ -99,7 +102,21 @@ impl StateStore {
     /// Remove the state for a PR (e.g., when PR is closed).
     pub async fn remove(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
         let mut states = self.states.write().await;
+        let mut installation_ids = self.installation_ids.write().await;
+        installation_ids.remove(pr_id);
         states.remove(pr_id)
+    }
+
+    /// Set the installation ID for a PR.
+    pub async fn set_installation_id(&self, pr_id: &StateMachinePrId, installation_id: u64) {
+        let mut installation_ids = self.installation_ids.write().await;
+        installation_ids.insert(pr_id.clone(), installation_id);
+    }
+
+    /// Get the installation ID for a PR.
+    pub async fn get_installation_id(&self, pr_id: &StateMachinePrId) -> Option<u64> {
+        let installation_ids = self.installation_ids.read().await;
+        installation_ids.get(pr_id).copied()
     }
 
     /// Get all PR IDs with pending batches.
@@ -114,15 +131,16 @@ impl StateStore {
 
     /// Get all pending batches with their PR information.
     ///
-    /// Returns a list of (pr_id, batch_id) tuples for all PRs with pending batches.
-    pub async fn get_pending_batches(&self) -> Vec<(StateMachinePrId, super::state::BatchId)> {
+    /// Returns a list of (pr_id, batch_id, installation_id) tuples for all PRs with pending batches.
+    pub async fn get_pending_batches(&self) -> Vec<(StateMachinePrId, super::state::BatchId, u64)> {
         let states = self.states.read().await;
+        let installation_ids = self.installation_ids.read().await;
         states
             .iter()
             .filter_map(|(id, state)| {
-                state
-                    .pending_batch_id()
-                    .map(|batch_id| (id.clone(), batch_id.clone()))
+                let batch_id = state.pending_batch_id()?;
+                let installation_id = installation_ids.get(id).copied()?;
+                Some((id.clone(), batch_id.clone(), installation_id))
             })
             .collect()
     }
@@ -143,6 +161,9 @@ impl StateStore {
         event: Event,
         ctx: &InterpreterContext,
     ) -> ReviewMachineState {
+        // Store the installation_id for later use by batch polling
+        self.set_installation_id(pr_id, ctx.installation_id).await;
+
         let mut current_state = self.get_or_default(pr_id).await;
 
         // Event loop: process initial event and any result events from effects
