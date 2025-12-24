@@ -20,7 +20,7 @@ use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
 use robocop_server::webhook::webhook_router;
-use robocop_server::{AppState, RecordingLogger};
+use robocop_server::{AppState, RecordingLogger, StateStore};
 
 async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(json!({
@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
         target_user_id: config.target_user_id,
         pending_batches: Arc::new(RwLock::new(HashMap::new())),
         review_states: Arc::new(RwLock::new(HashMap::new())),
+        state_store: Arc::new(StateStore::new()),
         recording_logger,
     });
 

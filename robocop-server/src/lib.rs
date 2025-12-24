@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 pub use github::*;
 pub use openai::*;
 pub use review_state::{PullRequestId, ReviewState};
+pub use state_machine::{StateMachinePrId, StateStore};
 
 // Re-export recording types from robocop_core
 pub use robocop_core::{
@@ -54,5 +55,6 @@ pub struct AppState {
     pub target_user_id: u64,
     pub pending_batches: Arc<RwLock<HashMap<String, PendingBatch>>>,
     pub review_states: Arc<RwLock<HashMap<PullRequestId, ReviewState>>>,
+    pub state_store: Arc<StateStore>,
     pub recording_logger: Option<RecordingLogger>,
 }
