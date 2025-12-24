@@ -63,6 +63,27 @@ impl StateStore {
         states.get(pr_id).cloned().unwrap_or_default()
     }
 
+    /// Get or initialize the state for a PR with the given reviews_enabled setting.
+    ///
+    /// If the PR doesn't have a state, creates an Idle state with the given reviews_enabled.
+    /// If the PR already has a state, returns it unchanged.
+    pub async fn get_or_init(
+        &self,
+        pr_id: &StateMachinePrId,
+        reviews_enabled: bool,
+    ) -> ReviewMachineState {
+        let states = self.states.read().await;
+        if let Some(state) = states.get(pr_id) {
+            return state.clone();
+        }
+        drop(states);
+
+        // Initialize with the given reviews_enabled
+        let state = ReviewMachineState::Idle { reviews_enabled };
+        self.set(pr_id.clone(), state.clone()).await;
+        state
+    }
+
     /// Get the current state for a PR.
     pub async fn get(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
         let states = self.states.read().await;

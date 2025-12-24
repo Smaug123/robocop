@@ -32,28 +32,11 @@ pub fn get_bot_version() -> String {
     robocop_core::get_library_version()
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingBatch {
-    pub batch_id: String,
-    pub installation_id: u64,
-    pub repo_owner: String,
-    pub repo_name: String,
-    pub pr_number: u64,
-    pub comment_id: u64,
-    /// The GitHub check run ID for this batch, used to update check status
-    pub check_run_id: u64,
-    pub version: String,
-    pub created_at: u64,
-    pub head_sha: String,
-    pub base_sha: String,
-}
-
 pub struct AppState {
-    pub github_client: GitHubClient,
-    pub openai_client: OpenAIClient,
+    pub github_client: Arc<GitHubClient>,
+    pub openai_client: Arc<OpenAIClient>,
     pub webhook_secret: String,
     pub target_user_id: u64,
-    pub pending_batches: Arc<RwLock<HashMap<String, PendingBatch>>>,
     pub review_states: Arc<RwLock<HashMap<PullRequestId, ReviewState>>>,
     pub state_store: Arc<StateStore>,
     pub recording_logger: Option<RecordingLogger>,

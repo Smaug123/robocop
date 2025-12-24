@@ -151,11 +151,10 @@ async fn main() -> Result<()> {
     );
 
     let app_state = Arc::new(AppState {
-        github_client,
-        openai_client,
+        github_client: Arc::new(github_client),
+        openai_client: Arc::new(openai_client),
         webhook_secret: config.github_webhook_secret,
         target_user_id: config.target_user_id,
-        pending_batches: Arc::new(RwLock::new(HashMap::new())),
         review_states: Arc::new(RwLock::new(HashMap::new())),
         state_store: Arc::new(StateStore::new()),
         recording_logger,
