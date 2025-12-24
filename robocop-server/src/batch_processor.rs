@@ -3,9 +3,11 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-use crate::github::{CommitStatusRequest, CommitStatusState, PullRequestInfo};
+use crate::github::{
+    CheckRunConclusion, CheckRunOutput, CheckRunStatus, PullRequestInfo, UpdateCheckRunRequest,
+};
 use crate::openai::BatchResponse;
-use crate::{AppState, PendingBatch, COMMIT_STATUS_CONTEXT};
+use crate::{AppState, PendingBatch, CHECK_RUN_NAME};
 
 pub async fn batch_polling_loop(state: Arc<AppState>) {
     let mut interval = interval(Duration::from_secs(60)); // Poll every minute
@@ -146,53 +148,68 @@ async fn handle_completed_batch(
         repo_name: pending.repo_name.clone(),
         pr_number: pending.pr_number,
     };
-    match github_client
+
+    // Try to update/create the comment, but proceed with check run update regardless
+    let comment_result = github_client
         .manage_robocop_comment(None, &pr_info, &final_content, &pending.version)
-        .await
-    {
-        Ok(comment_id) => {
+        .await;
+
+    let comment_id = match &comment_result {
+        Ok(id) => {
             info!(
                 "Successfully updated comment {} with review results for batch {}",
-                comment_id, batch_response.id
+                id, batch_response.id
             );
-
-            // Post commit status based on review result
-            let status_state = determine_review_status(review_result.substantive_comments);
-            let status_description = if review_result.substantive_comments {
-                "Code review found issues"
-            } else {
-                "Code review passed"
-            };
-
-            let status_target_url = format!(
-                "https://github.com/{}/{}/pull/{}#issuecomment-{}",
-                pending.repo_owner, pending.repo_name, pending.pr_number, comment_id
-            );
-
-            let status_request = CommitStatusRequest {
-                installation_id: pending.installation_id,
-                repo_owner: &pending.repo_owner,
-                repo_name: &pending.repo_name,
-                sha: &pending.head_sha,
-                state: status_state,
-                target_url: Some(&status_target_url),
-                description: Some(status_description),
-                context: COMMIT_STATUS_CONTEXT,
-            };
-
-            if let Err(e) = github_client
-                .post_commit_status(None, &status_request)
-                .await
-            {
-                error!(
-                    "Failed to post commit status for completed batch {}: {}",
-                    batch_response.id, e
-                );
-            }
+            Some(*id)
         }
         Err(e) => {
             error!(
                 "Failed to update comment for completed batch {}: {}",
+                batch_response.id, e
+            );
+            None
+        }
+    };
+
+    // Always update check run if we have a valid check_run_id, regardless of comment outcome
+    if pending.check_run_id != 0 {
+        let (conclusion, title) = if review_result.substantive_comments {
+            (CheckRunConclusion::Failure, "Code review found issues")
+        } else {
+            (CheckRunConclusion::Success, "Code review passed")
+        };
+
+        // Build details URL if we have a comment ID
+        let check_run_url = comment_id.map(|id| {
+            format!(
+                "https://github.com/{}/{}/pull/{}#issuecomment-{}",
+                pending.repo_owner, pending.repo_name, pending.pr_number, id
+            )
+        });
+
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        let update_request = UpdateCheckRunRequest {
+            installation_id: pending.installation_id,
+            repo_owner: &pending.repo_owner,
+            repo_name: &pending.repo_name,
+            check_run_id: pending.check_run_id,
+            name: Some(CHECK_RUN_NAME),
+            details_url: check_run_url.as_deref(),
+            external_id: None,
+            status: Some(CheckRunStatus::Completed),
+            started_at: None,
+            conclusion: Some(conclusion),
+            completed_at: Some(&completed_at),
+            output: Some(CheckRunOutput {
+                title: title.to_string(),
+                summary: review_result.summary.clone(),
+                text: None,
+            }),
+        };
+
+        if let Err(e) = github_client.update_check_run(None, &update_request).await {
+            error!(
+                "Failed to update check run for completed batch {}: {}",
                 batch_response.id, e
             );
         }
@@ -252,33 +269,45 @@ async fn handle_failed_batch(
         );
     }
 
-    // Post error commit status
-    let status_desc = match status {
-        "failed" => "Review failed during processing",
-        "expired" => "Review timed out",
-        "cancelled" => "Review was cancelled",
-        _ => "Review encountered an error",
-    };
+    // Update check run with error status
+    // Only update if we have a valid check_run_id
+    if pending.check_run_id != 0 {
+        let (conclusion, title) = match status {
+            "failed" => (
+                CheckRunConclusion::Failure,
+                "Review failed during processing",
+            ),
+            "expired" => (CheckRunConclusion::TimedOut, "Review timed out"),
+            "cancelled" => (CheckRunConclusion::Cancelled, "Review was cancelled"),
+            _ => (CheckRunConclusion::Failure, "Review encountered an error"),
+        };
 
-    let status_request = CommitStatusRequest {
-        installation_id: pending.installation_id,
-        repo_owner: &pending.repo_owner,
-        repo_name: &pending.repo_name,
-        sha: &pending.head_sha,
-        state: CommitStatusState::Error,
-        target_url: None,
-        description: Some(status_desc),
-        context: COMMIT_STATUS_CONTEXT,
-    };
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        let update_request = UpdateCheckRunRequest {
+            installation_id: pending.installation_id,
+            repo_owner: &pending.repo_owner,
+            repo_name: &pending.repo_name,
+            check_run_id: pending.check_run_id,
+            name: Some(CHECK_RUN_NAME),
+            details_url: None,
+            external_id: None,
+            status: Some(CheckRunStatus::Completed),
+            started_at: None,
+            conclusion: Some(conclusion),
+            completed_at: Some(&completed_at),
+            output: Some(CheckRunOutput {
+                title: title.to_string(),
+                summary: format!("Batch {} encountered status: {}", pending.batch_id, status),
+                text: None,
+            }),
+        };
 
-    if let Err(e) = github_client
-        .post_commit_status(None, &status_request)
-        .await
-    {
-        error!(
-            "Failed to post error commit status for batch {}: {}",
-            pending.batch_id, e
-        );
+        if let Err(e) = github_client.update_check_run(None, &update_request).await {
+            error!(
+                "Failed to update check run for failed batch {}: {}",
+                pending.batch_id, e
+            );
+        }
     }
 
     Ok(())
@@ -373,18 +402,6 @@ fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
     Ok(review_result)
 }
 
-/// Determine the commit status state based on the review result.
-///
-/// - Returns `Success` if no substantive comments were found
-/// - Returns `Failure` if substantive comments were found
-fn determine_review_status(substantive_comments: bool) -> CommitStatusState {
-    if substantive_comments {
-        CommitStatusState::Failure
-    } else {
-        CommitStatusState::Success
-    }
-}
-
 fn format_review_comment(review: &ReviewResult, batch_id: &str, commit_sha: &str) -> String {
     if review.substantive_comments {
         format!(
@@ -410,20 +427,6 @@ fn format_review_comment(review: &ReviewResult, batch_id: &str, commit_sha: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_determine_review_status_with_issues() {
-        // When there are substantive comments, the status should be Failure
-        let status = determine_review_status(true);
-        assert_eq!(status, CommitStatusState::Failure);
-    }
-
-    #[test]
-    fn test_determine_review_status_without_issues() {
-        // When there are no substantive comments, the status should be Success
-        let status = determine_review_status(false);
-        assert_eq!(status, CommitStatusState::Success);
-    }
 
     #[test]
     fn test_format_review_comment_with_issues() {

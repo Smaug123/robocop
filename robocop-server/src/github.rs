@@ -109,6 +109,167 @@ pub struct CommitStatusRequest<'a> {
     pub context: &'a str,
 }
 
+/// GitHub Check Run status
+///
+/// See: https://docs.github.com/en/rest/checks/runs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRunStatus {
+    /// The check run is waiting to be processed
+    Queued,
+    /// The check run is currently running
+    InProgress,
+    /// The check run has finished
+    Completed,
+}
+
+impl CheckRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CheckRunStatus::Queued => "queued",
+            CheckRunStatus::InProgress => "in_progress",
+            CheckRunStatus::Completed => "completed",
+        }
+    }
+}
+
+/// GitHub Check Run conclusion (required when status is completed)
+///
+/// See: https://docs.github.com/en/rest/checks/runs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckRunConclusion {
+    /// The check run requires action from the user
+    ActionRequired,
+    /// The check run was cancelled
+    Cancelled,
+    /// The check run failed
+    Failure,
+    /// The check run completed with neutral status
+    Neutral,
+    /// The check run succeeded
+    Success,
+    /// The check run was skipped
+    Skipped,
+    /// The check run is stale (superseded)
+    Stale,
+    /// The check run timed out
+    TimedOut,
+}
+
+impl CheckRunConclusion {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CheckRunConclusion::ActionRequired => "action_required",
+            CheckRunConclusion::Cancelled => "cancelled",
+            CheckRunConclusion::Failure => "failure",
+            CheckRunConclusion::Neutral => "neutral",
+            CheckRunConclusion::Success => "success",
+            CheckRunConclusion::Skipped => "skipped",
+            CheckRunConclusion::Stale => "stale",
+            CheckRunConclusion::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Request body for creating a check run
+#[derive(Debug, Serialize)]
+struct CreateCheckRunApiRequest {
+    name: String,
+    head_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conclusion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<CheckRunOutput>,
+}
+
+/// Request body for updating a check run
+#[derive(Debug, Serialize)]
+struct UpdateCheckRunApiRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conclusion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<CheckRunOutput>,
+}
+
+/// Output for a check run (title, summary, text, annotations)
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckRunOutput {
+    pub title: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Response from creating/updating a check run
+#[derive(Debug, Deserialize)]
+pub struct CheckRunResponse {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    pub html_url: String,
+}
+
+/// Request to create a check run
+#[derive(Debug, Clone)]
+pub struct CreateCheckRunRequest<'a> {
+    pub installation_id: u64,
+    pub repo_owner: &'a str,
+    pub repo_name: &'a str,
+    pub name: &'a str,
+    pub head_sha: &'a str,
+    pub details_url: Option<&'a str>,
+    pub external_id: Option<&'a str>,
+    pub status: Option<CheckRunStatus>,
+    /// ISO 8601 timestamp for when the check run started (required when status is in_progress)
+    pub started_at: Option<&'a str>,
+    pub conclusion: Option<CheckRunConclusion>,
+    /// ISO 8601 timestamp for when the check run completed (required when status is completed)
+    pub completed_at: Option<&'a str>,
+    pub output: Option<CheckRunOutput>,
+}
+
+/// Request to update a check run
+#[derive(Debug, Clone)]
+pub struct UpdateCheckRunRequest<'a> {
+    pub installation_id: u64,
+    pub repo_owner: &'a str,
+    pub repo_name: &'a str,
+    pub check_run_id: u64,
+    pub name: Option<&'a str>,
+    pub details_url: Option<&'a str>,
+    pub external_id: Option<&'a str>,
+    pub status: Option<CheckRunStatus>,
+    /// ISO 8601 timestamp for when the check run started
+    pub started_at: Option<&'a str>,
+    pub conclusion: Option<CheckRunConclusion>,
+    /// ISO 8601 timestamp for when the check run completed (required when status is completed)
+    pub completed_at: Option<&'a str>,
+    pub output: Option<CheckRunOutput>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequestInfo {
     pub installation_id: u64,
@@ -1230,6 +1391,169 @@ impl GitHubClient {
         );
 
         Ok(status_response)
+    }
+
+    /// Create a check run for a specific commit SHA
+    ///
+    /// This is used to report the status of the code review as a GitHub check run,
+    /// which provides richer status information than commit statuses, including
+    /// the ability to show "skipped" status when a review is cancelled.
+    ///
+    /// See: https://docs.github.com/en/rest/checks/runs#create-a-check-run
+    pub async fn create_check_run(
+        &self,
+        correlation_id: Option<&str>,
+        request: &CreateCheckRunRequest<'_>,
+    ) -> Result<CheckRunResponse> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/check-runs",
+            request.repo_owner, request.repo_name
+        );
+
+        info!(
+            "Creating check run '{}' for {} in {}/{}",
+            request.name, request.head_sha, request.repo_owner, request.repo_name
+        );
+
+        let token = self.get_installation_token(request.installation_id).await?;
+        let request_body = CreateCheckRunApiRequest {
+            name: request.name.to_string(),
+            head_sha: request.head_sha.to_string(),
+            details_url: request.details_url.map(|s| s.to_string()),
+            external_id: request.external_id.map(|s| s.to_string()),
+            status: request.status.map(|s| s.as_str().to_string()),
+            started_at: request.started_at.map(|s| s.to_string()),
+            conclusion: request.conclusion.map(|c| c.as_str().to_string()),
+            completed_at: request.completed_at.map(|s| s.to_string()),
+            output: request.output.clone(),
+        };
+
+        let mut request_builder = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .body(serde_json::to_string(&request_body)?)
+            .header("Content-Type", "application/json");
+
+        if let Some(cid) = correlation_id {
+            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .context("Failed to send create check run request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .context("Failed to read error response body")?;
+            error!(
+                "GitHub API error creating check run: {} - {}",
+                status, error_text
+            );
+            return Err(anyhow!(
+                "GitHub API error creating check run: {} - {}",
+                status,
+                error_text
+            ));
+        }
+
+        let check_run_response: CheckRunResponse = response
+            .json()
+            .await
+            .context("Failed to parse check run response")?;
+        info!(
+            "Successfully created check run {} (id: {}, status: {})",
+            check_run_response.name, check_run_response.id, check_run_response.status
+        );
+
+        Ok(check_run_response)
+    }
+
+    /// Update a check run
+    ///
+    /// This is used to update the status and conclusion of a check run,
+    /// for example when a review completes or is cancelled.
+    ///
+    /// See: https://docs.github.com/en/rest/checks/runs#update-a-check-run
+    pub async fn update_check_run(
+        &self,
+        correlation_id: Option<&str>,
+        request: &UpdateCheckRunRequest<'_>,
+    ) -> Result<CheckRunResponse> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/check-runs/{}",
+            request.repo_owner, request.repo_name, request.check_run_id
+        );
+
+        info!(
+            "Updating check run {} in {}/{}",
+            request.check_run_id, request.repo_owner, request.repo_name
+        );
+
+        let token = self.get_installation_token(request.installation_id).await?;
+        let request_body = UpdateCheckRunApiRequest {
+            name: request.name.map(|s| s.to_string()),
+            details_url: request.details_url.map(|s| s.to_string()),
+            external_id: request.external_id.map(|s| s.to_string()),
+            status: request.status.map(|s| s.as_str().to_string()),
+            started_at: request.started_at.map(|s| s.to_string()),
+            conclusion: request.conclusion.map(|c| c.as_str().to_string()),
+            completed_at: request.completed_at.map(|s| s.to_string()),
+            output: request.output.clone(),
+        };
+
+        let mut request_builder = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .body(serde_json::to_string(&request_body)?)
+            .header("Content-Type", "application/json");
+
+        if let Some(cid) = correlation_id {
+            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .context("Failed to send update check run request")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .context("Failed to read error response body")?;
+            error!(
+                "GitHub API error updating check run: {} - {}",
+                status, error_text
+            );
+            return Err(anyhow!(
+                "GitHub API error updating check run: {} - {}",
+                status,
+                error_text
+            ));
+        }
+
+        let check_run_response: CheckRunResponse = response
+            .json()
+            .await
+            .context("Failed to parse check run response")?;
+        info!(
+            "Successfully updated check run {} (id: {}, status: {}, conclusion: {:?})",
+            check_run_response.name,
+            check_run_response.id,
+            check_run_response.status,
+            check_run_response.conclusion
+        );
+
+        Ok(check_run_response)
     }
 }
 

@@ -17,11 +17,18 @@ use uuid::Uuid;
 use crate::command;
 use crate::git::GitOps;
 use crate::github::{
-    CommitStatusRequest, CommitStatusState, FileContentRequest, FileSizeLimits, PullRequestInfo,
+    CheckRunConclusion, CheckRunOutput, CheckRunStatus, CreateCheckRunRequest, FileContentRequest,
+    FileSizeLimits, PullRequestInfo, UpdateCheckRunRequest,
 };
 use crate::openai::{ReviewMetadata, DEFAULT_MODEL};
-use crate::{AppState, COMMIT_STATUS_CONTEXT};
+use crate::{AppState, CHECK_RUN_NAME};
 use crate::{CorrelationId, Direction, EventType, RecordedEvent, Sanitizer};
+
+/// Safely truncate a SHA to at most 7 characters for display.
+/// Returns the full string if shorter than 7 characters.
+fn truncate_sha(sha: &str) -> &str {
+    &sha[..7.min(sha.len())]
+}
 
 #[derive(Debug, Deserialize)]
 pub struct GitHubWebhookPayload {
@@ -623,26 +630,40 @@ async fn process_cancel_reviews(
                 cancelled_count += 1;
                 batches_to_remove.push(batch_id.clone());
 
-                // Post error status for the cancelled batch
-                let status_request = CommitStatusRequest {
-                    installation_id,
-                    repo_owner,
-                    repo_name,
-                    sha: &batch.head_sha,
-                    state: CommitStatusState::Error,
-                    target_url: None,
-                    description: Some("Review cancelled by user"),
-                    context: COMMIT_STATUS_CONTEXT,
-                };
-                if let Err(e) = state
-                    .github_client
-                    .post_commit_status(correlation_id, &status_request)
-                    .await
-                {
-                    error!(
-                        "Failed to post cancelled commit status for batch {}: {}",
-                        batch_id, e
-                    );
+                // Update check run with skipped status for user-cancelled batch
+                if batch.check_run_id != 0 {
+                    let completed_at = chrono::Utc::now().to_rfc3339();
+                    let update_request = UpdateCheckRunRequest {
+                        installation_id,
+                        repo_owner,
+                        repo_name,
+                        check_run_id: batch.check_run_id,
+                        name: Some(CHECK_RUN_NAME),
+                        details_url: None,
+                        external_id: None,
+                        status: Some(CheckRunStatus::Completed),
+                        started_at: None,
+                        conclusion: Some(CheckRunConclusion::Skipped),
+                        completed_at: Some(&completed_at),
+                        output: Some(CheckRunOutput {
+                            title: "Review cancelled by user".to_string(),
+                            summary: format!(
+                                "Code review for commit {} was cancelled by user request.",
+                                truncate_sha(&batch.head_sha)
+                            ),
+                            text: None,
+                        }),
+                    };
+                    if let Err(e) = state
+                        .github_client
+                        .update_check_run(correlation_id, &update_request)
+                        .await
+                    {
+                        error!(
+                            "Failed to update check run for cancelled batch {}: {}",
+                            batch_id, e
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -666,6 +687,43 @@ async fn process_cancel_reviews(
                             );
                             cancelled_count += 1; // Count as cancelled since it won't be processed
                             batches_to_remove.push(batch_id.clone());
+
+                            // Update check run even though cancel failed - batch is terminal
+                            if batch.check_run_id != 0 {
+                                let completed_at = chrono::Utc::now().to_rfc3339();
+                                let update_request = UpdateCheckRunRequest {
+                                    installation_id,
+                                    repo_owner,
+                                    repo_name,
+                                    check_run_id: batch.check_run_id,
+                                    name: Some(CHECK_RUN_NAME),
+                                    details_url: None,
+                                    external_id: None,
+                                    status: Some(CheckRunStatus::Completed),
+                                    started_at: None,
+                                    conclusion: Some(CheckRunConclusion::Skipped),
+                                    completed_at: Some(&completed_at),
+                                    output: Some(CheckRunOutput {
+                                        title: "Review cancelled by user".to_string(),
+                                        summary: format!(
+                                            "Code review for commit {} was cancelled by user request (batch was already {}).",
+                                            truncate_sha(&batch.head_sha),
+                                            status_response.status
+                                        ),
+                                        text: None,
+                                    }),
+                                };
+                                if let Err(e) = state
+                                    .github_client
+                                    .update_check_run(correlation_id, &update_request)
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to update check run for terminal batch {}: {}",
+                                        batch_id, e
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -862,45 +920,111 @@ async fn process_disable_reviews(
             .collect()
     };
 
-    let cancelled_count = batches_to_cancel.len();
+    let mut batches_to_remove = Vec::new();
 
     for (batch_id, batch) in &batches_to_cancel {
         info!("Cancelling batch {} due to disable-reviews", batch_id);
-        if let Err(e) = state
+
+        let should_update_check_run;
+        let should_remove_from_tracking;
+
+        match state
             .openai_client
             .cancel_batch(correlation_id, batch_id)
             .await
         {
-            warn!("Failed to cancel batch {}: {}", batch_id, e);
-        } else {
-            // Post error status for the disabled review
-            let status_request = CommitStatusRequest {
+            Ok(_) => {
+                should_update_check_run = true;
+                should_remove_from_tracking = true;
+            }
+            Err(e) => {
+                warn!("Failed to cancel batch {}: {}", batch_id, e);
+
+                // Check if batch is already in a terminal state
+                match state
+                    .openai_client
+                    .get_batch(correlation_id, batch_id)
+                    .await
+                {
+                    Ok(status_response) => {
+                        if matches!(
+                            status_response.status.as_str(),
+                            "completed" | "failed" | "cancelled" | "expired"
+                        ) {
+                            info!(
+                                "Batch {} is already in terminal state: {}",
+                                batch_id, status_response.status
+                            );
+                            // Terminal state: update check run and remove from tracking
+                            should_update_check_run = true;
+                            should_remove_from_tracking = true;
+                        } else {
+                            // Not terminal: don't remove, let polling handle it
+                            info!(
+                                "Batch {} is still in state {}, leaving in tracking for polling",
+                                batch_id, status_response.status
+                            );
+                            should_update_check_run = false;
+                            should_remove_from_tracking = false;
+                        }
+                    }
+                    Err(status_e) => {
+                        error!("Failed to check status of batch {}: {}", batch_id, status_e);
+                        // Can't determine state: don't remove, let polling handle it
+                        should_update_check_run = false;
+                        should_remove_from_tracking = false;
+                    }
+                }
+            }
+        }
+
+        // Update check run with skipped status for disabled review
+        if should_update_check_run && batch.check_run_id != 0 {
+            let completed_at = chrono::Utc::now().to_rfc3339();
+            let update_request = UpdateCheckRunRequest {
                 installation_id,
                 repo_owner,
                 repo_name,
-                sha: &batch.head_sha,
-                state: CommitStatusState::Error,
-                target_url: None,
-                description: Some("Reviews disabled for this PR"),
-                context: COMMIT_STATUS_CONTEXT,
+                check_run_id: batch.check_run_id,
+                name: Some(CHECK_RUN_NAME),
+                details_url: None,
+                external_id: None,
+                status: Some(CheckRunStatus::Completed),
+                started_at: None,
+                conclusion: Some(CheckRunConclusion::Skipped),
+                completed_at: Some(&completed_at),
+                output: Some(CheckRunOutput {
+                    title: "Reviews disabled for this PR".to_string(),
+                    summary: format!(
+                        "Code review for commit {} was skipped because reviews are disabled for this PR.",
+                        truncate_sha(&batch.head_sha)
+                    ),
+                    text: None,
+                }),
             };
             if let Err(e) = state
                 .github_client
-                .post_commit_status(correlation_id, &status_request)
+                .update_check_run(correlation_id, &update_request)
                 .await
             {
                 error!(
-                    "Failed to post disabled commit status for batch {}: {}",
+                    "Failed to update check run for disabled batch {}: {}",
                     batch_id, e
                 );
             }
         }
+
+        if should_remove_from_tracking {
+            batches_to_remove.push(batch_id.clone());
+        }
     }
 
-    // Remove from tracking
+    let cancelled_count = batches_to_remove.len();
+
+    // Remove only successfully cancelled or terminal batches from tracking
     {
         let mut pending = state.pending_batches.write().await;
-        for (batch_id, _) in &batches_to_cancel {
+        for batch_id in &batches_to_remove {
             pending.remove(batch_id);
         }
     }
@@ -1319,31 +1443,42 @@ async fn process_code_review(
         comment_id, batch_id, pr.number, repo.full_name
     );
 
-    // Post pending commit status
-    let status_target_url = format!(
+    // Create check run with in_progress status
+    let check_run_url = format!(
         "https://github.com/{}/pull/{}#issuecomment-{}",
         repo.full_name, pr.number, comment_id
     );
-    let status_request = CommitStatusRequest {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let check_run_request = CreateCheckRunRequest {
         installation_id,
         repo_owner,
         repo_name,
-        sha: head_sha,
-        state: CommitStatusState::Pending,
-        target_url: Some(&status_target_url),
-        description: Some("Code review in progress"),
-        context: COMMIT_STATUS_CONTEXT,
+        name: CHECK_RUN_NAME,
+        head_sha,
+        details_url: Some(&check_run_url),
+        external_id: Some(&batch_id),
+        status: Some(CheckRunStatus::InProgress),
+        started_at: Some(&started_at),
+        conclusion: None,
+        completed_at: None,
+        output: Some(CheckRunOutput {
+            title: "Code review in progress".to_string(),
+            summary: format!("Reviewing commit {}", truncate_sha(head_sha)),
+            text: None,
+        }),
     };
-    if let Err(e) = github_client
-        .post_commit_status(correlation_id, &status_request)
+    let check_run_id = match github_client
+        .create_check_run(correlation_id, &check_run_request)
         .await
     {
-        // Log but don't fail the review - status posting is best-effort
-        error!(
-            "Failed to post pending commit status for PR #{}: {}",
-            pr.number, e
-        );
-    }
+        Ok(response) => response.id,
+        Err(e) => {
+            // Log but don't fail the review - check run creation is best-effort
+            error!("Failed to create check run for PR #{}: {}", pr.number, e);
+            // Use 0 as a sentinel value indicating no check run was created
+            0
+        }
+    };
 
     // Store batch for polling
     let pending_batch = crate::PendingBatch {
@@ -1353,6 +1488,7 @@ async fn process_code_review(
         repo_name: repo_name.to_string(),
         pr_number: pr.number,
         comment_id,
+        check_run_id,
         version: version.clone(),
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1491,29 +1627,43 @@ async fn cancel_superseded_batches(
                             );
                         }
 
-                        // Post error status for the superseded commit
-                        let status_description = format!(
-                            "Review superseded by commit {}",
-                            &new_head_sha[..7.min(new_head_sha.len())]
-                        );
-                        let status_request = CommitStatusRequest {
-                            installation_id: batch.installation_id,
-                            repo_owner: &batch.repo_owner,
-                            repo_name: &batch.repo_name,
-                            sha: &batch.head_sha,
-                            state: CommitStatusState::Error,
-                            target_url: None,
-                            description: Some(&status_description),
-                            context: COMMIT_STATUS_CONTEXT,
-                        };
-                        if let Err(e) = github_client
-                            .post_commit_status(correlation_id, &status_request)
-                            .await
-                        {
-                            error!(
-                                "Failed to post superseded commit status for batch {}: {}",
-                                batch_id, e
-                            );
+                        // Update check run with stale status for superseded commit
+                        if batch.check_run_id != 0 {
+                            let completed_at = chrono::Utc::now().to_rfc3339();
+                            let update_request = UpdateCheckRunRequest {
+                                installation_id: batch.installation_id,
+                                repo_owner: &batch.repo_owner,
+                                repo_name: &batch.repo_name,
+                                check_run_id: batch.check_run_id,
+                                name: Some(CHECK_RUN_NAME),
+                                details_url: None,
+                                external_id: None,
+                                status: Some(CheckRunStatus::Completed),
+                                started_at: None,
+                                conclusion: Some(CheckRunConclusion::Stale),
+                                completed_at: Some(&completed_at),
+                                output: Some(CheckRunOutput {
+                                    title: format!(
+                                        "Review superseded by commit {}",
+                                        truncate_sha(new_head_sha)
+                                    ),
+                                    summary: format!(
+                                        "This review was cancelled because commit {} superseded commit {}.",
+                                        truncate_sha(new_head_sha),
+                                        truncate_sha(&batch.head_sha)
+                                    ),
+                                    text: None,
+                                }),
+                            };
+                            if let Err(e) = github_client
+                                .update_check_run(correlation_id, &update_request)
+                                .await
+                            {
+                                error!(
+                                    "Failed to update check run for superseded batch {}: {}",
+                                    batch_id, e
+                                );
+                            }
                         }
 
                         cancelled_batches.push(batch_id.clone());
@@ -1541,6 +1691,47 @@ async fn cancel_superseded_batches(
                                     status_response.status.as_str(),
                                     "completed" | "failed" | "cancelled" | "expired"
                                 ) {
+                                    // Update check run even though cancel failed - batch is terminal
+                                    if batch.check_run_id != 0 {
+                                        let github_client = &state.github_client;
+                                        let completed_at = chrono::Utc::now().to_rfc3339();
+                                        let update_request = UpdateCheckRunRequest {
+                                            installation_id: batch.installation_id,
+                                            repo_owner: &batch.repo_owner,
+                                            repo_name: &batch.repo_name,
+                                            check_run_id: batch.check_run_id,
+                                            name: Some(CHECK_RUN_NAME),
+                                            details_url: None,
+                                            external_id: None,
+                                            status: Some(CheckRunStatus::Completed),
+                                            started_at: None,
+                                            conclusion: Some(CheckRunConclusion::Stale),
+                                            completed_at: Some(&completed_at),
+                                            output: Some(CheckRunOutput {
+                                                title: format!(
+                                                    "Review superseded by commit {}",
+                                                    truncate_sha(new_head_sha)
+                                                ),
+                                                summary: format!(
+                                                    "This review was cancelled because commit {} superseded commit {} (batch was already {}).",
+                                                    truncate_sha(new_head_sha),
+                                                    truncate_sha(&batch.head_sha),
+                                                    status_response.status
+                                                ),
+                                                text: None,
+                                            }),
+                                        };
+                                        if let Err(e) = github_client
+                                            .update_check_run(correlation_id, &update_request)
+                                            .await
+                                        {
+                                            error!(
+                                                "Failed to update check run for terminal superseded batch {}: {}",
+                                                batch_id, e
+                                            );
+                                        }
+                                    }
+
                                     cancelled_batches.push(batch_id.clone());
                                 }
                             }

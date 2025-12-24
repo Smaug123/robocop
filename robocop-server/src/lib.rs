@@ -21,9 +21,9 @@ pub use robocop_core::{
     Sanitizer, ServiceType, CORRELATION_ID_HEADER,
 };
 
-/// The context string used for GitHub commit statuses posted by robocop.
-/// This is used with GitHub branch protection rules to require reviews.
-pub const COMMIT_STATUS_CONTEXT: &str = "robocop/code-review";
+/// The name used for GitHub check runs created by robocop.
+/// This appears in the Checks tab of pull requests.
+pub const CHECK_RUN_NAME: &str = "Robocop Code Review";
 
 /// Returns the bot version (delegates to robocop_core::get_library_version).
 pub fn get_bot_version() -> String {
@@ -38,6 +38,8 @@ pub struct PendingBatch {
     pub repo_name: String,
     pub pr_number: u64,
     pub comment_id: u64,
+    /// The GitHub check run ID for this batch, used to update check status
+    pub check_run_id: u64,
     pub version: String,
     pub created_at: u64,
     pub head_sha: String,
