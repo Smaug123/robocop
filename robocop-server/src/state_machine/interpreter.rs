@@ -110,8 +110,18 @@ async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResul
             conclusion,
             title,
             summary,
+            external_id,
         } => {
-            execute_update_check_run(ctx, check_run_id, status, conclusion, &title, &summary).await
+            execute_update_check_run(
+                ctx,
+                check_run_id,
+                status,
+                conclusion,
+                &title,
+                &summary,
+                external_id.as_ref(),
+            )
+            .await
         }
 
         Effect::SubmitBatch {
@@ -447,6 +457,7 @@ fn format_comment_content(content: &CommentContent) -> String {
                     format!("Superseded by commit `{}`.", new_sha.short())
                 }
                 CancellationReason::ReviewsDisabled => "Reviews were disabled.".to_string(),
+                CancellationReason::External => "Batch was cancelled externally.".to_string(),
             };
 
             format!(
@@ -623,6 +634,7 @@ async fn execute_update_check_run(
     conclusion: Option<EffectCheckRunConclusion>,
     title: &str,
     summary: &str,
+    external_id: Option<&BatchId>,
 ) -> EffectResult {
     let github_status = status.to_github();
     let github_conclusion = conclusion.map(|c| c.to_github());
@@ -640,6 +652,7 @@ async fn execute_update_check_run(
         None
     };
 
+    let external_id_str = external_id.map(|id| id.0.clone());
     let request = UpdateCheckRunRequest {
         installation_id: ctx.installation_id,
         repo_owner: &ctx.repo_owner,
@@ -647,7 +660,7 @@ async fn execute_update_check_run(
         check_run_id: check_run_id.0,
         name: Some(CHECK_RUN_NAME),
         details_url: None,
-        external_id: None,
+        external_id: external_id_str.as_deref(),
         status: Some(github_status),
         started_at,
         conclusion: github_conclusion,
@@ -929,8 +942,18 @@ fn parse_review_text(text: &str) -> Result<ReviewResult, String> {
         .unwrap_or("Review complete")
         .to_string();
 
-    let comments: Vec<ReviewComment> = parsed
-        .get("substantiveComments")
+    // Handle substantiveComments which can be:
+    // - An array of comment objects -> parse as HasIssues with comments
+    // - Boolean true -> HasIssues with no specific comments (issues are in summary)
+    // - Boolean false, null, or empty array -> NoIssues
+    let substantive_comments_value = parsed.get("substantiveComments");
+
+    // Check if it's a boolean true (indicates issues exist but no specific line comments)
+    let has_issues_flag = substantive_comments_value
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let comments: Vec<ReviewComment> = substantive_comments_value
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -951,14 +974,15 @@ fn parse_review_text(text: &str) -> Result<ReviewResult, String> {
         })
         .unwrap_or_default();
 
-    if comments.is_empty() {
-        Ok(ReviewResult::NoIssues { summary, reasoning })
-    } else {
+    // If substantiveComments was true (boolean) or has actual comments, it's HasIssues
+    if has_issues_flag || !comments.is_empty() {
         Ok(ReviewResult::HasIssues {
             summary,
             reasoning,
             comments,
         })
+    } else {
+        Ok(ReviewResult::NoIssues { summary, reasoning })
     }
 }
 
@@ -1096,5 +1120,39 @@ mod tests {
         } else {
             panic!("Expected HasIssues");
         }
+    }
+
+    /// Regression test: substantiveComments: true (boolean) should be treated as HasIssues.
+    ///
+    /// Bug: When OpenAI returns substantiveComments: true instead of an array,
+    /// the old code would fall through to unwrap_or_default() and return NoIssues,
+    /// incorrectly indicating no problems when issues exist.
+    #[test]
+    fn test_parse_review_text_with_boolean_true_substantive_comments() {
+        let text = r#"{
+            "reasoning": "Found potential security issues",
+            "summary": "Security concerns need review",
+            "substantiveComments": true
+        }"#;
+        let result = parse_review_text(text).unwrap();
+        assert!(
+            matches!(result, ReviewResult::HasIssues { comments, .. } if comments.is_empty()),
+            "substantiveComments: true should result in HasIssues (with empty comments)"
+        );
+    }
+
+    /// Test that substantiveComments: false still returns NoIssues.
+    #[test]
+    fn test_parse_review_text_with_boolean_false_substantive_comments() {
+        let text = r#"{
+            "reasoning": "Code looks good",
+            "summary": "LGTM",
+            "substantiveComments": false
+        }"#;
+        let result = parse_review_text(text).unwrap();
+        assert!(
+            matches!(result, ReviewResult::NoIssues { .. }),
+            "substantiveComments: false should result in NoIssues"
+        );
     }
 }

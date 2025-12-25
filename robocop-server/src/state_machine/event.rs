@@ -121,6 +121,133 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Returns a summary of the event suitable for logging.
+    ///
+    /// This avoids logging potentially large/sensitive data like diffs and file contents.
+    pub fn log_summary(&self) -> String {
+        match self {
+            Event::PrUpdated {
+                head_sha,
+                base_sha,
+                force_review,
+                ..
+            } => {
+                format!(
+                    "PrUpdated {{ head: {}, base: {}, force: {} }}",
+                    head_sha.short(),
+                    base_sha.short(),
+                    force_review
+                )
+            }
+            Event::ReviewRequested {
+                head_sha, base_sha, ..
+            } => {
+                format!(
+                    "ReviewRequested {{ head: {}, base: {} }}",
+                    head_sha.short(),
+                    base_sha.short()
+                )
+            }
+            Event::CancelRequested => "CancelRequested".to_string(),
+            Event::EnableReviewsRequested {
+                head_sha, base_sha, ..
+            } => {
+                format!(
+                    "EnableReviewsRequested {{ head: {}, base: {} }}",
+                    head_sha.short(),
+                    base_sha.short()
+                )
+            }
+            Event::DisableReviewsRequested => "DisableReviewsRequested".to_string(),
+            Event::DataFetched {
+                diff,
+                file_contents,
+            } => {
+                format!(
+                    "DataFetched {{ diff_len: {}, file_count: {} }}",
+                    diff.len(),
+                    file_contents.len()
+                )
+            }
+            Event::DataFetchFailed { reason } => {
+                format!("DataFetchFailed {{ reason: {:?} }}", reason)
+            }
+            Event::BatchSubmitted {
+                batch_id,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+            } => {
+                format!(
+                    "BatchSubmitted {{ batch: {}, comment: {}, check_run: {:?}, model: {}, reasoning: {} }}",
+                    batch_id, comment_id.0, check_run_id.map(|c| c.0), model, reasoning_effort
+                )
+            }
+            Event::BatchSubmissionFailed { error, .. } => {
+                format!("BatchSubmissionFailed {{ error: {} }}", error)
+            }
+            Event::BatchStatusUpdate { batch_id, status } => {
+                format!(
+                    "BatchStatusUpdate {{ batch: {}, status: {:?} }}",
+                    batch_id, status
+                )
+            }
+            Event::BatchCompleted { batch_id, result } => {
+                let result_summary = match result {
+                    ReviewResult::NoIssues { .. } => "NoIssues",
+                    ReviewResult::HasIssues { comments, .. } => {
+                        if comments.is_empty() {
+                            "HasIssues(0 comments)"
+                        } else {
+                            return format!(
+                                "BatchCompleted {{ batch: {}, result: HasIssues({} comments) }}",
+                                batch_id,
+                                comments.len()
+                            );
+                        }
+                    }
+                };
+                format!(
+                    "BatchCompleted {{ batch: {}, result: {} }}",
+                    batch_id, result_summary
+                )
+            }
+            Event::BatchTerminated { batch_id, reason } => {
+                format!(
+                    "BatchTerminated {{ batch: {}, reason: {:?} }}",
+                    batch_id, reason
+                )
+            }
+            Event::AncestryResult {
+                old_sha,
+                new_sha,
+                is_superseded,
+            } => {
+                format!(
+                    "AncestryResult {{ old: {}, new: {}, superseded: {} }}",
+                    old_sha.short(),
+                    new_sha.short(),
+                    is_superseded
+                )
+            }
+            Event::AncestryCheckFailed {
+                old_sha,
+                new_sha,
+                error,
+            } => {
+                format!(
+                    "AncestryCheckFailed {{ old: {}, new: {}, error: {} }}",
+                    old_sha.short(),
+                    new_sha.short(),
+                    error
+                )
+            }
+        }
+    }
+}
+
 /// File content fetched from the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileContent {

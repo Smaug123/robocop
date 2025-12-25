@@ -181,8 +181,10 @@ impl StateStore {
 
         while let Some(event) = events_to_process.pop() {
             info!(
-                "Processing event {:?} for PR #{} in state {:?}",
-                event, pr_id.pr_number, current_state
+                "Processing event {} for PR #{} in state {:?}",
+                event.log_summary(),
+                pr_id.pr_number,
+                current_state
             );
 
             let TransitionResult { state, effects } = transition(current_state, event);

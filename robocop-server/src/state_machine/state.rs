@@ -140,6 +140,8 @@ pub enum CancellationReason {
     Superseded { new_sha: CommitSha },
     /// Reviews were disabled for this PR.
     ReviewsDisabled,
+    /// Batch was cancelled externally (e.g., via OpenAI dashboard or API).
+    External,
 }
 
 impl fmt::Display for CancellationReason {
@@ -148,6 +150,7 @@ impl fmt::Display for CancellationReason {
             Self::UserRequested => write!(f, "cancelled by user"),
             Self::Superseded { new_sha } => write!(f, "superseded by {}", new_sha.short()),
             Self::ReviewsDisabled => write!(f, "reviews disabled"),
+            Self::External => write!(f, "cancelled externally"),
         }
     }
 }

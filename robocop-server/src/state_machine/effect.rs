@@ -46,6 +46,8 @@ pub enum Effect {
         conclusion: Option<EffectCheckRunConclusion>,
         title: String,
         summary: String,
+        /// Optional external ID to associate with the check run (e.g., batch ID).
+        external_id: Option<BatchId>,
     },
 
     // =========================================================================

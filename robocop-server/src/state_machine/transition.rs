@@ -322,6 +322,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Failure),
                     title: "Code review failed".to_string(),
                     summary: format!("Batch submission failed: {}", error),
+                    external_id: None,
                 });
             }
 
@@ -493,11 +494,14 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewResult::NoIssues { .. } => EffectCheckRunConclusion::Success,
                 ReviewResult::HasIssues { .. } => EffectCheckRunConclusion::Failure,
             };
-            let title = match &result {
-                ReviewResult::NoIssues { .. } => "Code review passed".to_string(),
-                ReviewResult::HasIssues { summary, .. } => {
-                    format!("Code review found issues: {}", summary)
+            let (title, result_summary) = match &result {
+                ReviewResult::NoIssues { summary, .. } => {
+                    ("Code review passed".to_string(), summary.clone())
                 }
+                ReviewResult::HasIssues { summary, .. } => (
+                    format!("Code review found issues: {}", summary),
+                    summary.clone(),
+                ),
             };
 
             let new_state = ReviewMachineState::Completed {
@@ -520,7 +524,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     status: EffectCheckRunStatus::Completed,
                     conclusion: Some(conclusion),
                     title,
-                    summary: "Review complete".to_string(),
+                    summary: result_summary,
+                    external_id: None,
                 });
             }
 
@@ -545,7 +550,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             let mut effects = vec![Effect::UpdateComment {
                 content: CommentContent::ReviewCancelled {
                     head_sha: head_sha.clone(),
-                    reason: CancellationReason::UserRequested, // External cancellation
+                    reason: CancellationReason::External, // Batch was cancelled externally
                 },
             }];
 
@@ -553,9 +558,10 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 effects.push(Effect::UpdateCheckRun {
                     check_run_id: *cr_id,
                     status: EffectCheckRunStatus::Completed,
-                    conclusion: Some(EffectCheckRunConclusion::Skipped),
+                    conclusion: Some(EffectCheckRunConclusion::Cancelled),
                     title: "Review cancelled".to_string(),
-                    summary: "The batch was cancelled.".to_string(),
+                    summary: "The batch was cancelled externally.".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -563,7 +569,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
-                    reason: CancellationReason::UserRequested,
+                    reason: CancellationReason::External,
                     pending_cancel_batch_id: None, // Already done
                 },
                 effects,
@@ -610,6 +616,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(conclusion),
                     title: "Code review failed".to_string(),
                     summary: "Review failed to complete".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -646,6 +653,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Review cancelled by user".to_string(),
                     summary: "The review was cancelled at the user's request.".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -687,6 +695,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Reviews disabled".to_string(),
                     summary: "Reviews were disabled for this PR.".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -727,6 +736,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Review restarted".to_string(),
                     summary: "A new review was manually requested.".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -806,7 +816,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
         // AwaitingAncestryCheck State Transitions
         // =====================================================================
 
-        // Old commit is superseded -> cancel old, start new review
+        // Old commit is superseded and reviews are enabled -> cancel old, start new review
         (
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
@@ -814,7 +824,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 check_run_id,
                 new_head_sha,
                 new_base_sha,
-                reviews_enabled,
+                reviews_enabled: true,
                 new_options,
                 ..
             },
@@ -847,6 +857,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         "This review was superseded by a newer commit: {}",
                         new_head_sha.short()
                     ),
+                    external_id: None,
                 });
             }
 
@@ -857,10 +868,68 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
 
             TransitionResult::new(
                 ReviewMachineState::Preparing {
-                    reviews_enabled: *reviews_enabled,
+                    reviews_enabled: true,
                     head_sha: new_head_sha.clone(),
                     base_sha: new_base_sha.clone(),
                     options: new_options.clone(),
+                },
+                effects,
+            )
+        }
+
+        // Old commit is superseded but reviews are disabled -> cancel old, don't start new
+        // This handles the case where a forced review was running and a new commit arrived,
+        // but reviews are disabled so we shouldn't start a new automatic review.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                batch_id,
+                head_sha: old_sha,
+                check_run_id,
+                new_head_sha,
+                reviews_enabled: false,
+                ..
+            },
+            Event::AncestryResult {
+                is_superseded: true,
+                ..
+            },
+        ) => {
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Commit {} superseded by {}, cancelling review (reviews disabled, not starting new)",
+                        old_sha.short(),
+                        new_head_sha.short()
+                    ),
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Superseded by {}", new_head_sha.short()),
+                    summary: format!(
+                        "This review was superseded by a newer commit: {} (reviews disabled)",
+                        new_head_sha.short()
+                    ),
+                    external_id: None,
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: false,
+                    head_sha: old_sha.clone(),
+                    reason: CancellationReason::Superseded {
+                        new_sha: new_head_sha.clone(),
+                    },
+                    pending_cancel_batch_id: Some(batch_id.clone()),
                 },
                 effects,
             )
@@ -907,6 +976,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         "This review was replaced by a newer commit: {} (reviews disabled)",
                         new_head_sha.short()
                     ),
+                    external_id: None,
                 });
             }
 
@@ -966,6 +1036,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         "This review was replaced by a newer commit (force-push/rebase): {}",
                         new_head_sha.short()
                     ),
+                    external_id: None,
                 });
             }
 
@@ -1048,6 +1119,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Review restarted".to_string(),
                     summary: "A new review was manually requested.".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -1134,6 +1206,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Reviews disabled".to_string(),
                     summary: "Reviews were disabled for this PR.".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -1179,6 +1252,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Review cancelled by user".to_string(),
                     summary: "The review was cancelled at the user's request.".to_string(),
+                    external_id: None,
                 });
             }
 
@@ -2068,14 +2142,14 @@ mod tests {
         }
     }
 
-    /// Regression test: Externally cancelled batch should set check-run conclusion to Skipped,
-    /// not Failure.
+    /// Regression test: Externally cancelled batch should set check-run conclusion to Cancelled,
+    /// not Failure or Skipped.
     ///
-    /// Bug: When a batch is cancelled (by us or externally), it was mapped to
+    /// Bug: When a batch is cancelled externally (via OpenAI dashboard/API), it was mapped to
     /// FailureReason::BatchFailed which resulted in a Failure conclusion. It should
-    /// use BatchCancelled and Skipped conclusion instead.
+    /// use BatchCancelled and Cancelled conclusion instead to accurately represent the outcome.
     #[test]
-    fn test_cancelled_batch_sets_skipped_conclusion() {
+    fn test_cancelled_batch_sets_cancelled_conclusion() {
         let state = ReviewMachineState::BatchPending {
             reviews_enabled: true,
             batch_id: BatchId::from("batch_123".to_string()),
@@ -2095,7 +2169,7 @@ mod tests {
             },
         );
 
-        // Find the UpdateCheckRun effect and verify conclusion is Skipped
+        // Find the UpdateCheckRun effect and verify conclusion is Cancelled
         let check_run_effect = result
             .effects
             .iter()
@@ -2109,8 +2183,8 @@ mod tests {
         if let Some(Effect::UpdateCheckRun { conclusion, .. }) = check_run_effect {
             assert_eq!(
                 *conclusion,
-                Some(EffectCheckRunConclusion::Skipped),
-                "Cancelled batch should set conclusion to Skipped, not Failure"
+                Some(EffectCheckRunConclusion::Cancelled),
+                "Externally cancelled batch should set conclusion to Cancelled"
             );
         }
     }
