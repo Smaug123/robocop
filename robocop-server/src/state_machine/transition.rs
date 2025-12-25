@@ -5086,5 +5086,198 @@ mod property_tests {
                 result.state
             );
         }
+
+        /// Property: Effects only reference data that exists in state or event.
+        ///
+        /// If we emit CancelBatch { batch_id }, that batch_id must be the pending batch.
+        /// If we emit UpdateCheckRun { check_run_id }, that check_run_id must exist in
+        /// either the state OR the event (e.g., BatchSubmitted carries a new check_run_id).
+        /// This catches bugs where we reference stale or incorrect IDs.
+        #[test]
+        fn effects_reference_valid_state_data(
+            (state, event) in arb_state_and_contextual_event()
+        ) {
+            let state_batch_id = state.pending_batch_id().cloned();
+            let state_check_run_id = state.check_run_id();
+
+            // Some events introduce new check_run_ids that can be validly referenced
+            let event_check_run_id = match &event {
+                Event::BatchSubmitted { check_run_id, .. } => *check_run_id,
+                Event::BatchSubmissionFailed { check_run_id, .. } => *check_run_id,
+                _ => None,
+            };
+
+            let result = transition(state, event);
+
+            for effect in &result.effects {
+                match effect {
+                    Effect::CancelBatch { batch_id } => {
+                        prop_assert_eq!(
+                            Some(batch_id.clone()), state_batch_id.clone(),
+                            "CancelBatch references batch_id {:?} but state had {:?}",
+                            batch_id, state_batch_id
+                        );
+                    }
+                    Effect::UpdateCheckRun { check_run_id, .. } => {
+                        let valid = state_check_run_id == Some(*check_run_id)
+                            || event_check_run_id == Some(*check_run_id);
+                        prop_assert!(
+                            valid,
+                            "UpdateCheckRun references check_run_id {:?} but state had {:?} \
+                             and event had {:?}",
+                            check_run_id, state_check_run_id, event_check_run_id
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// Property: Terminal states can only be escaped by "restart" events.
+        ///
+        /// From a terminal state (Completed, Failed, Cancelled), only these events
+        /// can transition to a non-terminal state:
+        /// - PrUpdated (new commit)
+        /// - ReviewRequested (manual review request)
+        /// - EnableReviewsRequested (re-enable reviews)
+        ///
+        /// All other events should leave the state terminal.
+        #[test]
+        fn terminal_states_only_escaped_by_restart_events(
+            (state, event) in arb_terminal_state()
+                .prop_flat_map(|s| {
+                    let s2 = s.clone();
+                    arb_event_for_state(&s).prop_map(move |e| (s2.clone(), e))
+                })
+        ) {
+            let result = transition(state, event.clone());
+
+            let is_restart_event = matches!(
+                event,
+                Event::PrUpdated { .. }
+                    | Event::ReviewRequested { .. }
+                    | Event::EnableReviewsRequested { .. }
+            );
+
+            if !is_restart_event {
+                prop_assert!(
+                    result.state.is_terminal(),
+                    "Terminal state escaped to {:?} via non-restart event {:?}",
+                    std::mem::discriminant(&result.state),
+                    event.log_summary()
+                );
+            }
+        }
+
+        /// Property: DisableReviewsRequested is idempotent.
+        ///
+        /// Applying DisableReviewsRequested twice should result in the same
+        /// reviews_enabled state as applying it once. The effects may differ
+        /// (first might emit a comment, second might not), but the final state
+        /// should have reviews_enabled = false in both cases.
+        #[test]
+        fn disable_reviews_is_idempotent(
+            state in arb_state()
+        ) {
+            let once = transition(state.clone(), Event::DisableReviewsRequested);
+            let twice = transition(once.state.clone(), Event::DisableReviewsRequested);
+
+            prop_assert_eq!(
+                once.state.reviews_enabled(),
+                twice.state.reviews_enabled(),
+                "DisableReviewsRequested not idempotent: first gave {:?}, second gave {:?}",
+                once.state.reviews_enabled(),
+                twice.state.reviews_enabled()
+            );
+
+            // Both should have reviews disabled
+            prop_assert!(
+                !twice.state.reviews_enabled(),
+                "After two DisableReviewsRequested, reviews should be disabled"
+            );
+        }
+
+        /// Property: CancelRequested is idempotent on terminal states.
+        ///
+        /// Applying CancelRequested twice to a terminal state should leave
+        /// it in a terminal state both times.
+        #[test]
+        fn cancel_is_idempotent_on_terminal(
+            state in arb_terminal_state()
+        ) {
+            let once = transition(state, Event::CancelRequested);
+            let twice = transition(once.state.clone(), Event::CancelRequested);
+
+            prop_assert!(
+                once.state.is_terminal(),
+                "First CancelRequested made terminal state non-terminal"
+            );
+            prop_assert!(
+                twice.state.is_terminal(),
+                "Second CancelRequested made terminal state non-terminal"
+            );
+        }
+
+        /// Property: No batch is orphaned (resource safety).
+        ///
+        /// If we transition away from a state with a pending batch, we must either:
+        /// 1. Still have that batch pending in the new state, OR
+        /// 2. Emit a CancelBatch effect for it, OR
+        /// 3. The batch completed/terminated (new state consumed the result), OR
+        /// 4. The batch was already in Cancelled state's pending_cancel_batch_id
+        ///    (already cancelled, can be abandoned when starting new review)
+        ///
+        /// This ensures we don't "forget" about batches, which would cause
+        /// resource leaks (polling continues forever) or lost results.
+        #[test]
+        fn no_batch_orphaned(
+            (state, event) in arb_state_and_contextual_event()
+        ) {
+            let old_batch = state.pending_batch_id().cloned();
+            let result = transition(state.clone(), event.clone());
+            let new_batch = result.state.pending_batch_id().cloned();
+
+            // If there was a batch and it changed, verify it wasn't orphaned
+            if let Some(ref old_id) = old_batch {
+                if new_batch.as_ref() != Some(old_id) {
+                    // Batch ID changed - check that we handled it properly
+                    let was_cancelled = result.effects.iter().any(|e| {
+                        matches!(e, Effect::CancelBatch { batch_id } if batch_id == old_id)
+                    });
+
+                    let result_was_consumed = matches!(
+                        event,
+                        Event::BatchCompleted { .. } | Event::BatchTerminated { .. }
+                    );
+
+                    // The batch might still be tracked in Cancelled state's pending_cancel_batch_id
+                    let tracked_in_cancelled = matches!(
+                        &result.state,
+                        ReviewMachineState::Cancelled { pending_cancel_batch_id: Some(id), .. }
+                            if id == old_id
+                    );
+
+                    // The batch was already in Cancelled state's pending_cancel_batch_id -
+                    // it was already cancelled, so it's safe to abandon it when starting
+                    // a new review. The batch will complete eventually with stale results
+                    // that will be ignored (wrong head_sha).
+                    let was_already_cancelled = matches!(
+                        &state,
+                        ReviewMachineState::Cancelled { pending_cancel_batch_id: Some(id), .. }
+                            if id == old_id
+                    );
+
+                    prop_assert!(
+                        was_cancelled || result_was_consumed || tracked_in_cancelled || was_already_cancelled,
+                        "Batch {:?} was orphaned! Old batch: {:?}, New batch: {:?}, \
+                         Event: {:?}, New state: {:?}, Effects: {:?}",
+                        old_id, old_batch, new_batch,
+                        event.log_summary(),
+                        std::mem::discriminant(&result.state),
+                        result.effects.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
     }
 }

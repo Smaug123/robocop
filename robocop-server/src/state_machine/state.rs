@@ -334,6 +334,15 @@ impl ReviewMachineState {
         }
     }
 
+    /// Returns the check run ID if the state has one.
+    pub fn check_run_id(&self) -> Option<CheckRunId> {
+        match self {
+            Self::BatchPending { check_run_id, .. } => *check_run_id,
+            Self::AwaitingAncestryCheck { check_run_id, .. } => *check_run_id,
+            _ => None,
+        }
+    }
+
     /// Returns true if this is a terminal state (Completed, Failed, or Cancelled).
     pub fn is_terminal(&self) -> bool {
         matches!(
