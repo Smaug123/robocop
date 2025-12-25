@@ -3110,6 +3110,182 @@ mod tests {
             "Should have reviews enabled after EnableReviewsRequested"
         );
     }
+
+    // =========================================================================
+    // Regression Tests - Bugs found in code review
+    // =========================================================================
+
+    /// Regression test: AncestryCheckFailed must not drop the new commit.
+    ///
+    /// Bug: When ancestry check fails (GitHub API error), the transition returned
+    /// to BatchPending for the OLD head_sha and dropped the new commit entirely.
+    /// This means the new commit would never be reviewed unless another PrUpdated
+    /// event arrived.
+    ///
+    /// The fix: When ancestry check fails, we should cancel the old batch and
+    /// start a review for the new commit. This ensures the latest commit is always
+    /// reviewed, even if we couldn't determine the ancestry relationship.
+    #[test]
+    fn test_ancestry_check_failed_reviews_new_commit() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base"),
+            new_options: ReviewOptions {
+                model: Some("o3".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+        };
+
+        let event = Event::AncestryCheckFailed {
+            old_sha: CommitSha::from("old_sha"),
+            new_sha: CommitSha::from("new_sha"),
+            error: "GitHub API error".to_string(),
+        };
+
+        let result = transition(state, event);
+
+        // The new commit should be reviewed, not dropped
+        // We should transition to Preparing for the NEW commit
+        if let ReviewMachineState::Preparing {
+            head_sha, options, ..
+        } = &result.state
+        {
+            assert_eq!(
+                head_sha.0, "new_sha",
+                "Should prepare review for new commit, not stay on old"
+            );
+            assert_eq!(
+                options.model,
+                Some("o3".to_string()),
+                "Should use options from new commit"
+            );
+        } else {
+            panic!(
+                "Expected Preparing state for new commit, got {:?}. \
+                 Bug: AncestryCheckFailed is dropping the new commit!",
+                result.state
+            );
+        }
+
+        // Should cancel the old batch (since we're starting a new review)
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should cancel the old batch"
+        );
+
+        // Should fetch data for the new commit
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::FetchData { head_sha, .. } if head_sha.0 == "new_sha"
+            )),
+            "Should fetch data for new commit"
+        );
+    }
+
+    /// Regression test: When reviews are disabled and commit is superseded,
+    /// the PR comment must be updated.
+    ///
+    /// Bug: When in AwaitingAncestryCheck with reviews_enabled=false and
+    /// AncestryResult indicates superseded, the batch was cancelled and
+    /// check run updated, but the PR comment was NOT updated. This leaves
+    /// the visible comment in "in progress" state forever.
+    #[test]
+    fn test_superseded_with_reviews_disabled_updates_comment() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: false,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base"),
+            new_options: ReviewOptions::default(),
+        };
+
+        let event = Event::AncestryResult {
+            old_sha: CommitSha::from("old_sha"),
+            new_sha: CommitSha::from("new_sha"),
+            is_superseded: true,
+        };
+
+        let result = transition(state, event);
+
+        // Should update the PR comment to indicate cancellation
+        let has_comment_update = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled { .. }
+                }
+            )
+        });
+
+        assert!(
+            has_comment_update,
+            "Should update PR comment when batch is cancelled due to supersession. \
+             Bug: Comment remains 'in progress' forever when reviews disabled + superseded!"
+        );
+    }
+
+    /// Regression test: When reviews are disabled and commits diverge (not superseded),
+    /// the PR comment must be updated.
+    ///
+    /// Same bug as above but for the diverged case (is_superseded=false).
+    #[test]
+    fn test_diverged_with_reviews_disabled_updates_comment() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: false,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base"),
+            new_options: ReviewOptions::default(),
+        };
+
+        let event = Event::AncestryResult {
+            old_sha: CommitSha::from("old_sha"),
+            new_sha: CommitSha::from("new_sha"),
+            is_superseded: false,
+        };
+
+        let result = transition(state, event);
+
+        // Should update the PR comment to indicate cancellation
+        let has_comment_update = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled { .. }
+                }
+            )
+        });
+
+        assert!(
+            has_comment_update,
+            "Should update PR comment when batch is cancelled due to divergence. \
+             Bug: Comment remains 'in progress' forever when reviews disabled + diverged!"
+        );
+    }
 }
 
 #[cfg(test)]
