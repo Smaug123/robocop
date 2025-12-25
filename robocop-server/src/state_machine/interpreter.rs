@@ -325,6 +325,20 @@ async fn execute_check_ancestry(
 }
 
 /// Update or create the robocop comment.
+///
+/// # Known limitation
+///
+/// If the original comment was deleted and a new one is created, the returned
+/// `comment_id` is not propagated back to update the check run's `details_url`.
+/// This means the check run may point to a stale URL.
+///
+/// To fix this properly, we would need to:
+/// 1. Return a `CommentUpdated { comment_id }` event from this function
+/// 2. Have the state machine track the comment_id and detect changes
+/// 3. Emit an UpdateCheckRun effect with the new details_url
+///
+/// This is a low-priority issue since it only affects the edge case where
+/// a user manually deletes the robocop comment.
 async fn execute_update_comment(
     ctx: &InterpreterContext,
     content: &CommentContent,
@@ -347,6 +361,8 @@ async fn execute_update_comment(
     {
         Ok(comment_id) => {
             info!("Updated comment {} on PR #{}", comment_id, ctx.pr_number);
+            // TODO: Return CommentUpdated event with comment_id to allow
+            // updating check run's details_url if the comment was recreated.
             EffectResult::none()
         }
         Err(e) => EffectResult::err(format!("Failed to update comment: {}", e)),

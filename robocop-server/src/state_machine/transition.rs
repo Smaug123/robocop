@@ -10,6 +10,30 @@ use super::effect::{
 use super::event::{DataFetchFailure, Event};
 use super::state::{CancellationReason, FailureReason, ReviewMachineState, ReviewResult};
 
+/// GitHub's maximum length for check run titles.
+const GITHUB_TITLE_MAX_LEN: usize = 255;
+
+/// Sanitize a check run title to meet GitHub constraints.
+///
+/// - Replaces newlines with spaces
+/// - Truncates to 255 characters (GitHub's limit)
+/// - Adds ellipsis if truncated
+fn sanitize_check_run_title(title: &str) -> String {
+    // Replace newlines with spaces for single-line display
+    let single_line = title.replace('\n', " ").replace('\r', "");
+
+    // Truncate if necessary
+    if single_line.len() <= GITHUB_TITLE_MAX_LEN {
+        single_line
+    } else {
+        // Leave room for "..."
+        let truncate_at = GITHUB_TITLE_MAX_LEN - 3;
+        // Find a good break point (don't cut in middle of word if possible)
+        let break_point = single_line[..truncate_at].rfind(' ').unwrap_or(truncate_at);
+        format!("{}...", &single_line[..break_point])
+    }
+}
+
 /// Result of a state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionResult {
@@ -519,7 +543,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ("Code review passed".to_string(), summary.clone())
                 }
                 ReviewResult::HasIssues { summary, .. } => (
-                    format!("Code review found issues: {}", summary),
+                    sanitize_check_run_title(&format!("Code review found issues: {}", summary)),
                     summary.clone(),
                 ),
             };
@@ -730,6 +754,59 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 effects,
             )
         }
+
+        // Enable reviews while batch pending -> flip flag and acknowledge
+        // The batch keeps running; user just enabled automatic reviews going forward.
+        (
+            ReviewMachineState::BatchPending {
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                ..
+            },
+            Event::EnableReviewsRequested { .. },
+        ) => TransitionResult::new(
+            ReviewMachineState::BatchPending {
+                reviews_enabled: true,
+                batch_id: batch_id.clone(),
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                comment_id: *comment_id,
+                check_run_id: *check_run_id,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+            },
+            vec![Effect::UpdateComment {
+                content: CommentContent::ReviewsEnabled {
+                    head_sha: head_sha.clone(),
+                },
+            }],
+        ),
+
+        // ReviewRequested for SAME commit while batch pending -> no-op (de-dup)
+        (
+            ReviewMachineState::BatchPending {
+                head_sha: pending_sha,
+                ..
+            },
+            Event::ReviewRequested {
+                head_sha: requested_sha,
+                ..
+            },
+        ) if pending_sha == &requested_sha => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Review already pending for commit {}, ignoring duplicate request",
+                    pending_sha.short()
+                ),
+            }],
+        ),
 
         // ReviewRequested while batch pending -> cancel current and start new
         (
@@ -1241,6 +1318,44 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 effects,
             )
         }
+
+        // Enable reviews while awaiting ancestry check -> flip flag and acknowledge
+        // The batch keeps running; user just enabled automatic reviews going forward.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                new_head_sha,
+                new_base_sha,
+                new_options,
+                ..
+            },
+            Event::EnableReviewsRequested { .. },
+        ) => TransitionResult::new(
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled: true,
+                batch_id: batch_id.clone(),
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                comment_id: *comment_id,
+                check_run_id: *check_run_id,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                new_head_sha: new_head_sha.clone(),
+                new_base_sha: new_base_sha.clone(),
+                new_options: new_options.clone(),
+            },
+            vec![Effect::UpdateComment {
+                content: CommentContent::ReviewsEnabled {
+                    head_sha: head_sha.clone(),
+                },
+            }],
+        ),
 
         // CancelRequested while awaiting ancestry check -> cancel batch
         (
@@ -2802,7 +2917,10 @@ mod tests {
             .iter()
             .find(|e| matches!(e, Effect::UpdateCheckRun { .. }));
 
-        assert!(check_run_effect.is_some(), "Should have UpdateCheckRun effect");
+        assert!(
+            check_run_effect.is_some(),
+            "Should have UpdateCheckRun effect"
+        );
 
         if let Some(Effect::UpdateCheckRun { title, .. }) = check_run_effect {
             assert!(
@@ -2890,7 +3008,10 @@ mod tests {
 
         // Should NOT cancel the batch
         assert!(
-            !result.effects.iter().any(|e| matches!(e, Effect::CancelBatch { .. })),
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
             "Should NOT cancel batch when ReviewRequested is for same commit"
         );
 
