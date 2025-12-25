@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3e924aba44839f369baaa5e2cbeb3bb7190f64adee53e865abccb0de06d1cff1 # shrinks to state = Idle { reviews_enabled: false }, event = DataFetched { diff: "", file_contents: [] }
+cc 1d945de22b1dec8ba6c4540f9eb0a52bb8043b277fd6ea7cece6e59aa910c4b4 # shrinks to state = BatchPending { reviews_enabled: false, batch_id: BatchId("batch_A0aA00aAA0aA0aAAAAaaAaa0"), head_sha: CommitSha("00a000a000a000a00aa0a000aa0a0a000a0a0a00"), base_sha: CommitSha("a000aaaa00a00aaa0aaa0aa0aaa000a000a00a00"), comment_id: None, check_run_id: None, model: "o1", reasoning_effort: "low" }, event = DataFetched { diff: "", file_contents: [] }
+cc c9acf95922d684deca16ba5d832c45a82a884efa7a0be541deacc1383f542caa # shrinks to state = BatchPending { reviews_enabled: false, batch_id: BatchId("batch_0000AA0AA00aAa0a0000Aa00"), head_sha: CommitSha("aa0a0aaaaa0a0a0a0aaa0aa00aaaa00aa0a00000"), base_sha: CommitSha("00aa0a00000aaa00a000aaa00000a00000a00a0a"), comment_id: None, check_run_id: None, model: "o1", reasoning_effort: "low" }, event = BatchStatusUpdate { batch_id: BatchId("batch_0a0aAaaAaA000AaaAaaAaA0A"), status: Validating }
+cc 5b9a83165b8ecd79b5f2295038acfb31bdacdd419ce88ba127b5aae0c2b02150 # shrinks to state = Cancelled { reviews_enabled: false, head_sha: CommitSha("a00a0a00aa0aa0aaaaaa000aaaa000a00aaa0a0a"), reason: UserRequested, pending_cancel_batch_id: None }, event = PrUpdated { head_sha: CommitSha("0a00a00aa00a000aaaa0aa000aaaaaaa0aa0a0aa"), base_sha: CommitSha("0aaaaa0a0000aa000aaaaaaa0aaa0a0a0aaaaaaa"), force_review: true, options: ReviewOptions { model: None, reasoning_effort: None } }
+cc 6fe7b1e47a22014ca46d24b058038ec23463c04d88d5b6c964f79f38be88ad30 # shrinks to state = Idle { reviews_enabled: false }, event = PrUpdated { head_sha: CommitSha("00a0a0a00000a000a0000a00aa0000a00a0000a0"), base_sha: CommitSha("00aaaaa00a0a0aa0a0a0aa000aaa00000a000aa0"), force_review: true, options: ReviewOptions { model: None, reasoning_effort: None } }

@@ -115,6 +115,28 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             ],
         ),
 
+        // Force review on Idle with reviews disabled -> start one-off review
+        // (force_review=true overrides reviews_enabled=false)
+        (
+            ReviewMachineState::Idle {
+                reviews_enabled: false,
+            },
+            Event::PrUpdated {
+                head_sha,
+                base_sha,
+                force_review: true,
+                options,
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: false, // Keep reviews disabled
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![Effect::FetchData { head_sha, base_sha }],
+        ),
+
         // Force review requested (even when disabled) -> start preparing
         (
             ReviewMachineState::Idle { reviews_enabled },
@@ -175,6 +197,89 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 content: CommentContent::NoReviewsToCancel,
             }],
         ),
+
+        // =====================================================================
+        // Stale Events in Idle State
+        // These events are results from effects triggered in a previous state.
+        // If we're now Idle, the previous state was cancelled, so ignore these.
+        // =====================================================================
+        (ReviewMachineState::Idle { .. }, Event::DataFetched { .. }) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale DataFetched event in Idle state".to_string(),
+            }],
+        ),
+
+        (ReviewMachineState::Idle { .. }, Event::DataFetchFailed { .. }) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale DataFetchFailed event in Idle state".to_string(),
+            }],
+        ),
+
+        (ReviewMachineState::Idle { .. }, Event::BatchSubmitted { .. }) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale BatchSubmitted event in Idle state".to_string(),
+            }],
+        ),
+
+        (ReviewMachineState::Idle { .. }, Event::BatchSubmissionFailed { .. }) => {
+            TransitionResult::new(
+                state.clone(),
+                vec![Effect::Log {
+                    level: LogLevel::Info,
+                    message: "Ignoring stale BatchSubmissionFailed event in Idle state".to_string(),
+                }],
+            )
+        }
+
+        (ReviewMachineState::Idle { .. }, Event::BatchStatusUpdate { .. }) => {
+            TransitionResult::new(
+                state.clone(),
+                vec![Effect::Log {
+                    level: LogLevel::Info,
+                    message: "Ignoring stale BatchStatusUpdate event in Idle state".to_string(),
+                }],
+            )
+        }
+
+        (ReviewMachineState::Idle { .. }, Event::BatchCompleted { .. }) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale BatchCompleted event in Idle state".to_string(),
+            }],
+        ),
+
+        (ReviewMachineState::Idle { .. }, Event::BatchTerminated { .. }) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale BatchTerminated event in Idle state".to_string(),
+            }],
+        ),
+
+        (ReviewMachineState::Idle { .. }, Event::AncestryResult { .. }) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale AncestryResult event in Idle state".to_string(),
+            }],
+        ),
+
+        (ReviewMachineState::Idle { .. }, Event::AncestryCheckFailed { .. }) => {
+            TransitionResult::new(
+                state.clone(),
+                vec![Effect::Log {
+                    level: LogLevel::Info,
+                    message: "Ignoring stale AncestryCheckFailed event in Idle state".to_string(),
+                }],
+            )
+        }
 
         // =====================================================================
         // Preparing State Transitions
@@ -504,6 +609,29 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             ],
         ),
 
+        // Force review via PrUpdated while preparing (reviews disabled) -> restart with new commit
+        // (force_review=true overrides reviews_enabled=false)
+        (
+            ReviewMachineState::Preparing {
+                reviews_enabled: false,
+                ..
+            },
+            Event::PrUpdated {
+                head_sha,
+                base_sha,
+                force_review: true,
+                options,
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: false, // Keep reviews disabled
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![Effect::FetchData { head_sha, base_sha }],
+        ),
+
         // Disable reviews while preparing -> go to Idle with reviews disabled
         (ReviewMachineState::Preparing { .. }, Event::DisableReviewsRequested) => {
             TransitionResult::new(
@@ -539,6 +667,26 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 },
                 Effect::FetchData { head_sha, base_sha },
             ],
+        ),
+
+        // =====================================================================
+        // Stale Events in Preparing State
+        // Polling events and ancestry events can arrive if a batch was cancelled
+        // before its results came back, or from a previous incarnation. Ignore them.
+        // =====================================================================
+        (
+            ReviewMachineState::Preparing { .. },
+            Event::BatchStatusUpdate { .. }
+            | Event::BatchCompleted { .. }
+            | Event::BatchTerminated { .. }
+            | Event::AncestryResult { .. }
+            | Event::AncestryCheckFailed { .. },
+        ) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale polling/ancestry event in Preparing state".to_string(),
+            }],
         ),
 
         // =====================================================================
@@ -941,6 +1089,54 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 message: format!(
                     "Ignoring duplicate PrUpdated for same commit {}",
                     head_sha.short()
+                ),
+            }],
+        ),
+
+        // =====================================================================
+        // Stale Events in BatchPending State
+        // Data fetch events are from a previous incarnation; ancestry events
+        // are only valid in AwaitingAncestryCheck. Ignore them.
+        // =====================================================================
+        (
+            ReviewMachineState::BatchPending { .. },
+            Event::DataFetched { .. }
+            | Event::DataFetchFailed { .. }
+            | Event::BatchSubmitted { .. }
+            | Event::BatchSubmissionFailed { .. }
+            | Event::AncestryResult { .. }
+            | Event::AncestryCheckFailed { .. },
+        ) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale event in BatchPending state".to_string(),
+            }],
+        ),
+
+        // Mismatched batch polling events (batch_id doesn't match current batch)
+        // This can happen if a previous batch's results arrive after we've started a new one.
+        (
+            ReviewMachineState::BatchPending { batch_id, .. },
+            Event::BatchStatusUpdate {
+                batch_id: event_batch_id,
+                ..
+            }
+            | Event::BatchCompleted {
+                batch_id: event_batch_id,
+                ..
+            }
+            | Event::BatchTerminated {
+                batch_id: event_batch_id,
+                ..
+            },
+        ) if batch_id != &event_batch_id => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Ignoring polling event for stale batch {} (current: {})",
+                    event_batch_id, batch_id
                 ),
             }],
         ),
@@ -1747,6 +1943,44 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
         }
 
         // =====================================================================
+        // Stale Events in AwaitingAncestryCheck State
+        // Data fetch and batch submission events are from a previous incarnation.
+        // Ignore them.
+        // =====================================================================
+        (
+            ReviewMachineState::AwaitingAncestryCheck { .. },
+            Event::DataFetched { .. }
+            | Event::DataFetchFailed { .. }
+            | Event::BatchSubmitted { .. }
+            | Event::BatchSubmissionFailed { .. },
+        ) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale event in AwaitingAncestryCheck state".to_string(),
+            }],
+        ),
+
+        // Mismatched batch polling events in AwaitingAncestryCheck
+        // (batch_id doesn't match current batch)
+        (
+            ReviewMachineState::AwaitingAncestryCheck { batch_id, .. },
+            Event::BatchStatusUpdate {
+                batch_id: event_batch_id,
+                ..
+            },
+        ) if batch_id != &event_batch_id => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Ignoring polling event for stale batch {} (current: {})",
+                    event_batch_id, batch_id
+                ),
+            }],
+        ),
+
+        // =====================================================================
         // Terminal State Transitions (Completed, Failed, Cancelled)
         // =====================================================================
 
@@ -1815,6 +2049,37 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     summary: "Reviews are disabled for this PR.".to_string(),
                 },
             ],
+        ),
+
+        // Force review on terminal state with reviews disabled -> start one-off review
+        // (force_review=true overrides reviews_enabled=false)
+        (
+            ReviewMachineState::Completed {
+                reviews_enabled: false,
+                ..
+            }
+            | ReviewMachineState::Failed {
+                reviews_enabled: false,
+                ..
+            }
+            | ReviewMachineState::Cancelled {
+                reviews_enabled: false,
+                ..
+            },
+            Event::PrUpdated {
+                head_sha,
+                base_sha,
+                force_review: true,
+                options,
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: false, // Keep reviews disabled
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![Effect::FetchData { head_sha, base_sha }],
         ),
 
         // Force review on terminal state -> start new review
@@ -1939,6 +2204,32 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     "Batch {} completed after cancel was requested, ignoring result",
                     batch_id
                 ),
+            }],
+        ),
+
+        // =====================================================================
+        // Stale Events in Terminal States (Completed, Failed, Cancelled)
+        // Effect results can arrive after we've reached a terminal state.
+        // These are all stale and should be ignored.
+        // =====================================================================
+        (
+            ReviewMachineState::Completed { .. }
+            | ReviewMachineState::Failed { .. }
+            | ReviewMachineState::Cancelled { .. },
+            Event::DataFetched { .. }
+            | Event::DataFetchFailed { .. }
+            | Event::BatchSubmitted { .. }
+            | Event::BatchSubmissionFailed { .. }
+            | Event::BatchStatusUpdate { .. }
+            | Event::BatchCompleted { .. }
+            | Event::BatchTerminated { .. }
+            | Event::AncestryResult { .. }
+            | Event::AncestryCheckFailed { .. },
+        ) => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Ignoring stale effect result in terminal state".to_string(),
             }],
         ),
 
@@ -2955,6 +3246,69 @@ mod tests {
         );
     }
 
+    /// Test: When ancestry result arrives after a newer commit, we still review the latest.
+    ///
+    /// Scenario:
+    /// 1. Batch pending for commit A
+    /// 2. Commit B arrives → triggers ancestry check A vs B
+    /// 3. Commit C arrives → updates new_head_sha to C
+    /// 4. Ancestry result arrives (about A vs B, but B is now stale)
+    ///
+    /// Expected: We should review commit C (the latest), not B.
+    /// The ancestry result's staleness doesn't matter because we use the stored new_head_sha.
+    #[test]
+    fn test_stale_ancestry_result_still_reviews_latest_commit() {
+        // State after step 3: awaiting ancestry check, new_head_sha is C
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_A".to_string()),
+            head_sha: CommitSha::from("commit_A"),
+            base_sha: CommitSha::from("base_sha"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+            // C arrived after B, so new_head_sha is C
+            new_head_sha: CommitSha::from("commit_C"),
+            new_base_sha: CommitSha::from("base_sha"),
+            new_options: ReviewOptions::default(),
+        };
+
+        // Ancestry result arrives, but it was comparing A vs B (not A vs C)
+        // This is technically stale, but the handler should use the stored new_head_sha
+        let event = Event::AncestryResult {
+            old_sha: CommitSha::from("commit_A"),
+            new_sha: CommitSha::from("commit_B"), // Stale! We now care about C
+            is_superseded: true,
+        };
+
+        let result = transition(state, event);
+
+        // Should start preparing a review for C (the latest), not B
+        match &result.state {
+            ReviewMachineState::Preparing { head_sha, .. } => {
+                assert_eq!(
+                    head_sha.0, "commit_C",
+                    "Should review the latest commit (C), not the commit from ancestry result (B)"
+                );
+            }
+            other => panic!(
+                "Expected Preparing state, got {:?}. \
+                 Stale ancestry result handling might be broken.",
+                other
+            ),
+        }
+
+        // Should fetch data for C
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::FetchData { head_sha, .. } if head_sha.0 == "commit_C"
+            )),
+            "Should fetch data for the latest commit (C)"
+        );
+    }
+
     /// Regression test: DisableReviewsRequested should not be dropped while AwaitingAncestryCheck.
     ///
     /// Bug: When reviews are disabled while waiting for ancestry check, the
@@ -3878,6 +4232,7 @@ mod tests {
 
 #[cfg(test)]
 mod property_tests {
+    use super::super::event::{BatchStatus, DataFetchFailure, FileContent};
     use super::super::state::{BatchId, CheckRunId, CommentId, CommitSha, ReviewOptions};
     use super::*;
     use proptest::prelude::*;
@@ -3960,6 +4315,37 @@ mod property_tests {
             Just(CancellationReason::ReviewsDisabled),
             arb_commit_sha().prop_map(|sha| CancellationReason::Superseded { new_sha: sha }),
         ]
+    }
+
+    fn arb_data_fetch_failure() -> impl Strategy<Value = DataFetchFailure> {
+        prop_oneof![
+            Just(DataFetchFailure::EmptyDiff),
+            Just(DataFetchFailure::NoFiles),
+            ".*".prop_map(|e| DataFetchFailure::FetchError { error: e }),
+            (proptest::collection::vec(".*", 0..5), 1usize..100).prop_map(
+                |(skipped_files, total_files)| DataFetchFailure::TooLarge {
+                    skipped_files,
+                    total_files,
+                }
+            ),
+        ]
+    }
+
+    fn arb_batch_status() -> impl Strategy<Value = BatchStatus> {
+        prop_oneof![
+            Just(BatchStatus::Validating),
+            Just(BatchStatus::InProgress),
+            Just(BatchStatus::Finalizing),
+            Just(BatchStatus::Completed),
+            Just(BatchStatus::Failed),
+            Just(BatchStatus::Expired),
+            Just(BatchStatus::Cancelling),
+            Just(BatchStatus::Cancelled),
+        ]
+    }
+
+    fn arb_file_content() -> impl Strategy<Value = FileContent> {
+        ("[a-z/]+\\.[a-z]+", ".*").prop_map(|(path, content)| FileContent { path, content })
     }
 
     fn arb_idle_state() -> impl Strategy<Value = ReviewMachineState> {
@@ -4140,8 +4526,13 @@ mod property_tests {
             )
     }
 
+    /// Generator for all Event variants.
+    ///
+    /// IMPORTANT: This must cover ALL event types to ensure property tests
+    /// can detect missing handlers. If you add a new Event variant, add it here.
     fn arb_event() -> impl Strategy<Value = Event> {
         prop_oneof![
+            // Webhook events
             arb_pr_updated_event(),
             (arb_commit_sha(), arb_commit_sha(), arb_review_options()).prop_map(
                 |(head_sha, base_sha, options)| Event::ReviewRequested {
@@ -4159,10 +4550,67 @@ mod property_tests {
                 },
             ),
             Just(Event::DisableReviewsRequested),
+            // Data fetch results
+            (".*", proptest::collection::vec(arb_file_content(), 0..5)).prop_map(
+                |(diff, file_contents)| Event::DataFetched {
+                    diff,
+                    file_contents
+                }
+            ),
+            arb_data_fetch_failure().prop_map(|reason| Event::DataFetchFailed { reason }),
+            // Batch submission results
+            (
+                arb_batch_id(),
+                proptest::option::of(arb_comment_id()),
+                arb_check_run_id(),
+                arb_model(),
+                arb_reasoning_effort(),
+            )
+                .prop_map(
+                    |(batch_id, comment_id, check_run_id, model, reasoning_effort)| {
+                        Event::BatchSubmitted {
+                            batch_id,
+                            comment_id,
+                            check_run_id,
+                            model,
+                            reasoning_effort,
+                        }
+                    },
+                ),
+            (
+                ".*",
+                proptest::option::of(arb_comment_id()),
+                arb_check_run_id(),
+            )
+                .prop_map(|(error, comment_id, check_run_id)| {
+                    Event::BatchSubmissionFailed {
+                        error,
+                        comment_id,
+                        check_run_id,
+                    }
+                }),
+            // Polling results
+            (arb_batch_id(), arb_batch_status())
+                .prop_map(|(batch_id, status)| Event::BatchStatusUpdate { batch_id, status }),
             (arb_batch_id(), arb_review_result())
                 .prop_map(|(batch_id, result)| Event::BatchCompleted { batch_id, result }),
             (arb_batch_id(), arb_failure_reason())
                 .prop_map(|(batch_id, reason)| Event::BatchTerminated { batch_id, reason }),
+            // Ancestry check results
+            (arb_commit_sha(), arb_commit_sha(), any::<bool>()).prop_map(
+                |(old_sha, new_sha, is_superseded)| Event::AncestryResult {
+                    old_sha,
+                    new_sha,
+                    is_superseded,
+                },
+            ),
+            (arb_commit_sha(), arb_commit_sha(), ".*").prop_map(|(old_sha, new_sha, error)| {
+                Event::AncestryCheckFailed {
+                    old_sha,
+                    new_sha,
+                    error,
+                }
+            }),
         ]
     }
 
@@ -4345,6 +4793,42 @@ mod property_tests {
             prop_assert!(
                 result.effects.iter().any(|e| matches!(e, Effect::UpdateComment { content: CommentContent::ReviewSuppressed { .. } })),
                 "Should emit suppression notice"
+            );
+        }
+
+        /// Property: NO event should fall through to the "Unhandled event" catch-all.
+        ///
+        /// This is the critical property that ensures state machine completeness.
+        /// If this test fails, it means there's a (state, event) pair that is not
+        /// explicitly handled in the transition function.
+        ///
+        /// The catch-all handler logs a Warn with "Unhandled event" - if we ever see
+        /// this in production, it indicates a bug where events are silently dropped.
+        #[test]
+        fn no_event_falls_through_to_unhandled(
+            state in arb_state(),
+            event in arb_event()
+        ) {
+            let result = transition(state.clone(), event.clone());
+
+            let has_unhandled_warning = result.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Log {
+                        level: LogLevel::Warn,
+                        message
+                    } if message.contains("Unhandled event")
+                )
+            });
+
+            prop_assert!(
+                !has_unhandled_warning,
+                "Event {:?} in state {:?} fell through to unhandled catch-all! \
+                 This is a bug - add an explicit handler for this (state, event) pair. \
+                 Result: {:?}",
+                event.log_summary(),
+                std::mem::discriminant(&state),
+                result.state
             );
         }
     }
