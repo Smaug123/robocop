@@ -69,7 +69,7 @@ impl StateStore {
     /// Get or initialize the state for a PR with the given reviews_enabled setting.
     ///
     /// If the PR doesn't have a state, creates an Idle state with the given reviews_enabled.
-    /// If the PR already has a state, returns it unchanged.
+    /// If the PR already has a state and its reviews_enabled differs, updates it to match.
     pub async fn get_or_init(
         &self,
         pr_id: &StateMachinePrId,
@@ -77,7 +77,17 @@ impl StateStore {
     ) -> ReviewMachineState {
         let states = self.states.read().await;
         if let Some(state) = states.get(pr_id) {
-            return state.clone();
+            let state = state.clone();
+            drop(states);
+
+            // If reviews_enabled changed (e.g., user edited PR description),
+            // update the state to reflect the new value
+            if state.reviews_enabled() != reviews_enabled {
+                let updated_state = state.with_reviews_enabled(reviews_enabled);
+                self.set(pr_id.clone(), updated_state.clone()).await;
+                return updated_state;
+            }
+            return state;
         }
         drop(states);
 
@@ -369,5 +379,59 @@ mod tests {
 
         let after_remove = store.get(&pr_id).await;
         assert_eq!(after_remove, None);
+    }
+
+    /// Regression test: get_or_init should update reviews_enabled when it differs
+    /// from the rehydrated value.
+    ///
+    /// Bug: When a PR description is edited to add/remove the "no review" marker,
+    /// the rehydrated reviews_enabled value should update the existing state.
+    /// Previously, get_or_init ignored the reviews_enabled parameter if a state
+    /// already existed.
+    #[tokio::test]
+    async fn test_get_or_init_updates_reviews_enabled_when_changed() {
+        use crate::state_machine::state::{BatchId, CheckRunId, CommentId, CommitSha};
+
+        let store = StateStore::new();
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Simulate: PR opened with reviews enabled, batch is pending
+        let initial_state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: CheckRunId(2),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        store.set(pr_id.clone(), initial_state).await;
+
+        // Now rehydrate with reviews_enabled: false (user added <!-- no review -->)
+        let state = store.get_or_init(&pr_id, false).await;
+
+        // The returned state should have reviews_enabled: false
+        // (Bug: previously it returned true because it didn't update existing state)
+        assert!(
+            !state.reviews_enabled(),
+            "get_or_init should update reviews_enabled to match rehydrated value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_init_creates_new_state_with_reviews_enabled() {
+        let store = StateStore::new();
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // No existing state - should create Idle with reviews_enabled: false
+        let state = store.get_or_init(&pr_id, false).await;
+
+        assert!(matches!(
+            state,
+            ReviewMachineState::Idle {
+                reviews_enabled: false
+            }
+        ));
     }
 }

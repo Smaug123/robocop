@@ -262,15 +262,23 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
         ) => TransitionResult::new(
             ReviewMachineState::BatchPending {
                 reviews_enabled: *reviews_enabled,
-                batch_id,
+                batch_id: batch_id.clone(),
                 head_sha: head_sha.clone(),
                 base_sha: base_sha.clone(),
                 comment_id,
                 check_run_id,
-                model,
-                reasoning_effort,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
             },
-            vec![], // Comment and check run already created by interpreter
+            // Update comment to include the batch ID (initially created without it)
+            vec![Effect::UpdateComment {
+                content: CommentContent::InProgress {
+                    head_sha: head_sha.clone(),
+                    batch_id,
+                    model,
+                    reasoning_effort,
+                },
+            }],
         ),
 
         // Batch submission failed -> transition to Failed
@@ -528,6 +536,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             Event::PrUpdated {
                 head_sha: new_head_sha,
                 base_sha: new_base_sha,
+                options,
                 ..
             },
         ) if head_sha != &new_head_sha => TransitionResult::new(
@@ -542,6 +551,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 reasoning_effort: reasoning_effort.clone(),
                 new_head_sha: new_head_sha.clone(),
                 new_base_sha,
+                new_options: options,
             },
             vec![Effect::CheckAncestry {
                 old_sha: head_sha.clone(),
@@ -580,6 +590,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 new_head_sha,
                 new_base_sha,
                 reviews_enabled,
+                new_options,
                 ..
             },
             Event::AncestryResult {
@@ -591,7 +602,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 reviews_enabled: *reviews_enabled,
                 head_sha: new_head_sha.clone(),
                 base_sha: new_base_sha.clone(),
-                options: ReviewOptions::default(),
+                options: new_options.clone(),
             },
             vec![
                 Effect::CancelBatch {
@@ -1016,6 +1027,7 @@ mod tests {
             reasoning_effort: "high".to_string(),
             new_head_sha: CommitSha::from("new_sha"),
             new_base_sha: CommitSha::from("base_sha"),
+            new_options: ReviewOptions::default(),
         };
         let event = Event::AncestryResult {
             old_sha: CommitSha::from("old_sha"),
@@ -1116,6 +1128,71 @@ mod tests {
 
         // Should preserve reviews_enabled = false even though we're reviewing
         assert!(!result.state.reviews_enabled());
+    }
+
+    /// Regression test: When a commit is superseded, the new review should use
+    /// the options from the PrUpdated event, not ReviewOptions::default().
+    ///
+    /// Bug: transition.rs:594 used ReviewOptions::default() instead of preserving
+    /// the options from the new PR update, so custom model/reasoning settings were lost.
+    #[test]
+    fn test_superseded_commit_preserves_new_options() {
+        // New commit pushed with custom options (model and reasoning_effort)
+        let custom_options = ReviewOptions {
+            model: Some("o3".to_string()),
+            reasoning_effort: Some("high".to_string()),
+        };
+
+        // Start in BatchPending state
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            comment_id: CommentId(1),
+            check_run_id: CheckRunId(2),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+
+        // New commit arrives with custom options
+        let event = Event::PrUpdated {
+            head_sha: CommitSha::from("new_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            force_review: false,
+            options: custom_options.clone(),
+        };
+
+        // Transition to AwaitingAncestryCheck
+        let result = transition(state, event);
+        assert!(matches!(
+            result.state,
+            ReviewMachineState::AwaitingAncestryCheck { .. }
+        ));
+
+        // Now simulate ancestry check confirming superseded
+        let ancestry_event = Event::AncestryResult {
+            old_sha: CommitSha::from("old_sha"),
+            new_sha: CommitSha::from("new_sha"),
+            is_superseded: true,
+        };
+        let result = transition(result.state, ancestry_event);
+
+        // Should transition to Preparing with the custom options preserved
+        if let ReviewMachineState::Preparing { options, .. } = &result.state {
+            assert_eq!(
+                options.model,
+                Some("o3".to_string()),
+                "Model option should be preserved from new PR update"
+            );
+            assert_eq!(
+                options.reasoning_effort,
+                Some("high".to_string()),
+                "Reasoning effort option should be preserved from new PR update"
+            );
+        } else {
+            panic!("Expected Preparing state, got {:?}", result.state);
+        }
     }
 }
 

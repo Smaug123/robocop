@@ -196,6 +196,8 @@ pub enum ReviewMachineState {
         /// The new commit that triggered the ancestry check.
         new_head_sha: CommitSha,
         new_base_sha: CommitSha,
+        /// Options from the new PR update event (to use if superseded).
+        new_options: ReviewOptions,
     },
 
     /// Batch submitted to OpenAI, awaiting completion.
@@ -299,6 +301,94 @@ impl ReviewMachineState {
     /// Creates a new Idle state with the specified reviews_enabled flag.
     pub fn idle(reviews_enabled: bool) -> Self {
         Self::Idle { reviews_enabled }
+    }
+
+    /// Returns a new state with the reviews_enabled flag updated.
+    ///
+    /// This is used when the PR description is edited to add/remove the
+    /// "no review" marker, and we need to update the existing state.
+    pub fn with_reviews_enabled(self, enabled: bool) -> Self {
+        match self {
+            Self::Idle { .. } => Self::Idle {
+                reviews_enabled: enabled,
+            },
+            Self::Preparing {
+                head_sha,
+                base_sha,
+                options,
+                ..
+            } => Self::Preparing {
+                reviews_enabled: enabled,
+                head_sha,
+                base_sha,
+                options,
+            },
+            Self::AwaitingAncestryCheck {
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                new_head_sha,
+                new_base_sha,
+                new_options,
+                ..
+            } => Self::AwaitingAncestryCheck {
+                reviews_enabled: enabled,
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                new_head_sha,
+                new_base_sha,
+                new_options,
+            },
+            Self::BatchPending {
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                ..
+            } => Self::BatchPending {
+                reviews_enabled: enabled,
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+            },
+            Self::Completed {
+                head_sha, result, ..
+            } => Self::Completed {
+                reviews_enabled: enabled,
+                head_sha,
+                result,
+            },
+            Self::Failed {
+                head_sha, reason, ..
+            } => Self::Failed {
+                reviews_enabled: enabled,
+                head_sha,
+                reason,
+            },
+            Self::Cancelled {
+                head_sha, reason, ..
+            } => Self::Cancelled {
+                reviews_enabled: enabled,
+                head_sha,
+                reason,
+            },
+        }
     }
 }
 

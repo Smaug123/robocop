@@ -622,7 +622,7 @@ async fn execute_update_check_run(
         repo_owner: &ctx.repo_owner,
         repo_name: &ctx.repo_name,
         check_run_id: check_run_id.0,
-        name: None,
+        name: Some(CHECK_RUN_NAME),
         details_url: None,
         external_id: None,
         status: Some(github_status),

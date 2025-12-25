@@ -122,7 +122,21 @@ async fn process_single_batch(
                 Ok(content) => content,
                 Err(e) => {
                     error!("Failed to download batch output: {}", e);
-                    return Ok(()); // Don't process further, batch will be retried
+                    // Emit a failure event so the check run gets updated and a failure
+                    // comment is posted. Previously this just returned Ok(()), leaving
+                    // the check run stuck in InProgress.
+                    return create_and_process_event(
+                        state,
+                        pr_id,
+                        batch_terminated_event(
+                            &batch_id.0,
+                            FailureReason::DownloadFailed {
+                                error: e.to_string(),
+                            },
+                        ),
+                        installation_id,
+                    )
+                    .await;
                 }
             };
 
