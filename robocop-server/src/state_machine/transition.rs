@@ -1003,6 +1003,14 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         new_head_sha.short()
                     ),
                 },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: old_sha.clone(),
+                        reason: CancellationReason::Superseded {
+                            new_sha: new_head_sha.clone(),
+                        },
+                    },
+                },
             ];
 
             if let Some(cr_id) = check_run_id {
@@ -1060,6 +1068,14 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         old_sha.short(),
                         new_head_sha.short()
                     ),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: old_sha.clone(),
+                        reason: CancellationReason::Superseded {
+                            new_sha: new_head_sha.clone(),
+                        },
+                    },
                 },
             ];
 
@@ -1153,43 +1169,75 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             )
         }
 
-        // Ancestry check failed (GitHub API error) -> keep batch running
-        // Don't cancel valid in-flight batches due to transient errors.
-        // A future PrUpdated event will trigger a new ancestry check if needed.
+        // Ancestry check failed (GitHub API error) -> cancel old, start new review
+        // We can't determine the ancestry relationship, but we should prioritize
+        // reviewing the latest commit. Cancel the old batch and start a new review.
         (
             ReviewMachineState::AwaitingAncestryCheck {
                 reviews_enabled,
                 batch_id,
-                head_sha,
-                base_sha,
-                comment_id,
+                head_sha: old_sha,
                 check_run_id,
-                model,
-                reasoning_effort,
+                new_head_sha,
+                new_base_sha,
+                new_options,
                 ..
             },
             Event::AncestryCheckFailed { error, .. },
-        ) => TransitionResult::new(
-            ReviewMachineState::BatchPending {
-                reviews_enabled: *reviews_enabled,
-                batch_id: batch_id.clone(),
-                head_sha: head_sha.clone(),
-                base_sha: base_sha.clone(),
-                comment_id: *comment_id,
-                check_run_id: *check_run_id,
-                model: model.clone(),
-                reasoning_effort: reasoning_effort.clone(),
-            },
-            vec![Effect::Log {
-                level: LogLevel::Warn,
-                message: format!(
-                    "Ancestry check failed ({}), keeping batch {} running for commit {}",
-                    error,
-                    batch_id,
-                    head_sha.short()
-                ),
-            }],
-        ),
+        ) => {
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "Ancestry check failed ({}), cancelling batch {} for {} and starting new review for {}",
+                        error,
+                        batch_id,
+                        old_sha.short(),
+                        new_head_sha.short()
+                    ),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: old_sha.clone(),
+                        reason: CancellationReason::Superseded {
+                            new_sha: new_head_sha.clone(),
+                        },
+                    },
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Replaced by {}", new_head_sha.short()),
+                    summary: format!(
+                        "This review was replaced by a newer commit: {} (ancestry check failed)",
+                        new_head_sha.short()
+                    ),
+                    external_id: None,
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: new_head_sha.clone(),
+                base_sha: new_base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha: new_head_sha.clone(),
+                    base_sha: new_base_sha.clone(),
+                    options: new_options.clone(),
+                },
+                effects,
+            )
+        }
 
         // ReviewRequested while awaiting ancestry check -> cancel current and start new
         (
@@ -1704,7 +1752,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -1737,7 +1785,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -1764,7 +1812,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -1793,7 +1841,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -1922,7 +1970,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -1985,7 +2033,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2143,7 +2191,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2192,7 +2240,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2249,7 +2297,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2290,7 +2338,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2449,7 +2497,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2511,7 +2559,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2561,7 +2609,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -2619,7 +2667,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -2653,7 +2701,7 @@ mod tests {
             batch_id: BatchId::from("batch_456".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -2686,7 +2734,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -2757,30 +2805,33 @@ mod tests {
     }
 
     // =========================================================================
-    // Bug #4: Compare-commits errors cancel valid batches
-    // Transient GitHub API errors should not cancel in-flight batches.
+    // Bug #4: Compare-commits errors - prioritize reviewing the latest commit
+    // When ancestry check fails (GitHub API error), we can't determine if the
+    // new commit supersedes the old one. Rather than risk missing the new commit,
+    // we cancel the old batch and start a new review for the latest commit.
     // =========================================================================
 
-    /// Regression test: When ancestry check fails (GitHub API error), the existing
-    /// batch should keep running instead of being cancelled.
+    /// Test that ancestry check failure cancels old batch and starts new review.
     ///
-    /// Bug: Ancestry check errors defaulted to is_superseded=false, which triggers
-    /// cancellation of the existing batch. Transient errors should not cancel
-    /// valid in-flight batches.
+    /// When ancestry check fails (GitHub API error), we prioritize reviewing
+    /// the latest commit. The old batch is cancelled and a new review starts.
     #[test]
-    fn test_ancestry_check_failure_keeps_batch_running() {
+    fn test_ancestry_check_failure_cancels_old_and_reviews_new() {
         let state = ReviewMachineState::AwaitingAncestryCheck {
             reviews_enabled: true,
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
             new_head_sha: CommitSha::from("new_sha"),
             new_base_sha: CommitSha::from("new_base_sha"),
-            new_options: ReviewOptions::default(),
+            new_options: ReviewOptions {
+                model: Some("o3".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+            },
         };
 
         let event = Event::AncestryCheckFailed {
@@ -2791,25 +2842,26 @@ mod tests {
 
         let result = transition(state, event);
 
-        // Should go back to BatchPending, not start a new review
+        // Should transition to Preparing for the new commit
         assert!(
-            matches!(result.state, ReviewMachineState::BatchPending { .. }),
-            "Ancestry check failure should revert to BatchPending, got: {:?}",
+            matches!(result.state, ReviewMachineState::Preparing { .. }),
+            "Ancestry check failure should start preparing new review, got: {:?}",
             result.state
         );
 
-        // Should NOT cancel the batch
+        // Should cancel the old batch
         assert!(
-            !result
+            result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::CancelBatch { .. })),
-            "Ancestry check failure should NOT cancel the existing batch"
+                .any(|e| matches!(e, Effect::CancelBatch { batch_id } if batch_id.0 == "batch_123")),
+            "Ancestry check failure should cancel the old batch"
         );
 
-        // Original batch_id should be preserved
-        if let ReviewMachineState::BatchPending { batch_id, .. } = &result.state {
-            assert_eq!(batch_id.0, "batch_123", "Batch ID should be preserved");
+        // New commit should be prepared for review
+        if let ReviewMachineState::Preparing { head_sha, options, .. } = &result.state {
+            assert_eq!(head_sha.0, "new_sha", "Should prepare new commit");
+            assert_eq!(options.model, Some("o3".to_string()), "Should use new options");
         }
     }
 
@@ -2831,7 +2883,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -2894,7 +2946,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -2942,7 +2994,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -2991,7 +3043,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -3040,7 +3092,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -3078,7 +3130,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
@@ -3132,7 +3184,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -3208,7 +3260,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -3253,7 +3305,7 @@ mod tests {
             batch_id: BatchId::from("batch_123".to_string()),
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
@@ -3401,7 +3453,7 @@ mod property_tests {
             arb_batch_id(),
             arb_commit_sha(),
             arb_commit_sha(),
-            arb_comment_id(),
+            proptest::option::of(arb_comment_id()),
             arb_check_run_id(),
             arb_model(),
             arb_reasoning_effort(),

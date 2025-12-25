@@ -745,27 +745,30 @@ async fn execute_submit_batch(
         pr_number: ctx.pr_number,
     };
 
+    // Create comment (best-effort: continue with OpenAI submission even if this fails)
     let comment_id = match ctx
         .github_client
         .manage_robocop_comment(correlation_id, &pr_info, &comment_body, &version)
         .await
     {
-        Ok(id) => CommentId(id),
+        Ok(id) => Some(CommentId(id)),
         Err(e) => {
-            return EffectResult::single(Event::BatchSubmissionFailed {
-                error: format!("Failed to create comment: {}", e),
-                comment_id: None,
-                check_run_id: None,
-            });
+            // Log warning but continue - don't fail the review just because GitHub comments failed
+            warn!(
+                "Failed to create comment for PR #{}: {} - continuing with review",
+                ctx.pr_number, e
+            );
+            None
         }
     };
 
     // Create check run (best-effort: continue with OpenAI submission even if this fails)
     // Link to the comment so users can click through from GitHub checks
-    let details_url = ctx
-        .pr_url
-        .as_ref()
-        .map(|pr_url| format!("{}#issuecomment-{}", pr_url, comment_id.0));
+    let details_url = comment_id.and_then(|cid| {
+        ctx.pr_url
+            .as_ref()
+            .map(|pr_url| format!("{}#issuecomment-{}", pr_url, cid.0))
+    });
     let now = chrono::Utc::now().to_rfc3339();
     let check_run_request = CreateCheckRunRequest {
         installation_id: ctx.installation_id,
@@ -829,7 +832,7 @@ async fn execute_submit_batch(
         }
         Err(e) => EffectResult::single(Event::BatchSubmissionFailed {
             error: e.to_string(),
-            comment_id: Some(comment_id),
+            comment_id,
             check_run_id,
         }),
     }

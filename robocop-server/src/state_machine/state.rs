@@ -195,7 +195,8 @@ pub enum ReviewMachineState {
         batch_id: BatchId,
         head_sha: CommitSha,
         base_sha: CommitSha,
-        comment_id: CommentId,
+        /// Comment ID if one was created (may be None if GitHub API failed).
+        comment_id: Option<CommentId>,
         /// Check run ID if one was created (may be None if GitHub API failed).
         check_run_id: Option<CheckRunId>,
         model: String,
@@ -213,7 +214,8 @@ pub enum ReviewMachineState {
         batch_id: BatchId,
         head_sha: CommitSha,
         base_sha: CommitSha,
-        comment_id: CommentId,
+        /// Comment ID if one was created (may be None if GitHub API failed).
+        comment_id: Option<CommentId>,
         /// Check run ID if one was created (may be None if GitHub API failed).
         check_run_id: Option<CheckRunId>,
         model: String,
@@ -495,7 +497,7 @@ mod tests {
             batch_id: BatchId("batch_123".into()),
             head_sha: CommitSha("abc123".into()),
             base_sha: CommitSha("def456".into()),
-            comment_id: CommentId(1),
+            comment_id: Some(CommentId(1)),
             check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".into(),
             reasoning_effort: "high".into(),

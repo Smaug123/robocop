@@ -63,7 +63,8 @@ pub enum Event {
     /// Batch was successfully submitted to OpenAI.
     BatchSubmitted {
         batch_id: BatchId,
-        comment_id: CommentId,
+        /// Comment ID if one was created (may be None if GitHub API failed).
+        comment_id: Option<CommentId>,
         /// Check run ID if one was created (may be None if GitHub API failed).
         check_run_id: Option<CheckRunId>,
         model: String,
@@ -181,8 +182,8 @@ impl Event {
                 reasoning_effort,
             } => {
                 format!(
-                    "BatchSubmitted {{ batch: {}, comment: {}, check_run: {:?}, model: {}, reasoning: {} }}",
-                    batch_id, comment_id.0, check_run_id.map(|c| c.0), model, reasoning_effort
+                    "BatchSubmitted {{ batch: {}, comment: {:?}, check_run: {:?}, model: {}, reasoning: {} }}",
+                    batch_id, comment_id.map(|c| c.0), check_run_id.map(|c| c.0), model, reasoning_effort
                 )
             }
             Event::BatchSubmissionFailed { error, .. } => {
