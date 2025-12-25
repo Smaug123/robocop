@@ -265,27 +265,47 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 model,
                 reasoning_effort,
             },
-        ) => TransitionResult::new(
-            ReviewMachineState::BatchPending {
-                reviews_enabled: *reviews_enabled,
-                batch_id: batch_id.clone(),
-                head_sha: head_sha.clone(),
-                base_sha: base_sha.clone(),
-                comment_id,
-                check_run_id,
-                model: model.clone(),
-                reasoning_effort: reasoning_effort.clone(),
-            },
-            // Update comment to include the batch ID (initially created without it)
-            vec![Effect::UpdateComment {
+        ) => {
+            let mut effects = vec![Effect::UpdateComment {
                 content: CommentContent::InProgress {
                     head_sha: head_sha.clone(),
-                    batch_id,
-                    model,
-                    reasoning_effort,
+                    batch_id: batch_id.clone(),
+                    model: model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
                 },
-            }],
-        ),
+            }];
+
+            // Update check run with batch ID as external_id for correlation
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: cr_id,
+                    status: EffectCheckRunStatus::InProgress,
+                    conclusion: None,
+                    title: "Code review in progress".to_string(),
+                    summary: format!(
+                        "Reviewing commit {} with {} (batch: {})",
+                        head_sha.short(),
+                        model,
+                        batch_id
+                    ),
+                    external_id: Some(batch_id.clone()),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::BatchPending {
+                    reviews_enabled: *reviews_enabled,
+                    batch_id: batch_id.clone(),
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                    comment_id,
+                    check_run_id,
+                    model: model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                },
+                effects,
+            )
+        }
 
         // Batch submission failed -> transition to Failed
         (

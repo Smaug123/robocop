@@ -13,8 +13,7 @@ use super::effect::{
 };
 use super::event::{DataFetchFailure, Event, FileContent};
 use super::state::{
-    BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, FailureReason, ReviewComment,
-    ReviewOptions, ReviewResult,
+    BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, ReviewOptions, ReviewResult,
 };
 use crate::github::{
     CheckRunOutput, CheckRunStatus, CreateCheckRunRequest, FileContentRequest, FileSizeLimits,
@@ -133,11 +132,6 @@ async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResul
         } => execute_submit_batch(ctx, &diff, file_contents, &head_sha, &base_sha, &options).await,
 
         Effect::CancelBatch { batch_id } => execute_cancel_batch(ctx, &batch_id).await,
-
-        Effect::DownloadBatchOutput {
-            batch_id,
-            output_file_id,
-        } => execute_download_batch_output(ctx, &batch_id, &output_file_id).await,
 
         Effect::Log { level, message } => {
             match level {
@@ -848,144 +842,6 @@ async fn execute_cancel_batch(ctx: &InterpreterContext, batch_id: &BatchId) -> E
     }
 }
 
-/// Download and parse batch output.
-async fn execute_download_batch_output(
-    ctx: &InterpreterContext,
-    batch_id: &BatchId,
-    output_file_id: &str,
-) -> EffectResult {
-    info!("Downloading output for batch {}", batch_id);
-
-    let correlation_id = ctx.correlation_id.as_deref();
-
-    match ctx
-        .openai_client
-        .download_batch_output(correlation_id, output_file_id)
-        .await
-    {
-        Ok(output) => {
-            // Parse the output
-            match parse_review_output(&output) {
-                Ok(result) => EffectResult::single(Event::BatchCompleted {
-                    batch_id: batch_id.clone(),
-                    result,
-                }),
-                Err(e) => EffectResult::single(Event::BatchTerminated {
-                    batch_id: batch_id.clone(),
-                    reason: FailureReason::ParseFailed { error: e },
-                }),
-            }
-        }
-        Err(e) => EffectResult::single(Event::BatchTerminated {
-            batch_id: batch_id.clone(),
-            reason: FailureReason::DownloadFailed {
-                error: e.to_string(),
-            },
-        }),
-    }
-}
-
-/// Parse review output from OpenAI batch response.
-fn parse_review_output(output: &str) -> Result<ReviewResult, String> {
-    // The output is JSONL format, parse each line
-    for line in output.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(line).map_err(|e| format!("Failed to parse JSONL: {}", e))?;
-
-        // Check for successful response
-        if let Some(response) = parsed.get("response") {
-            if let Some(body) = response.get("body") {
-                // Extract the review content
-                if let Some(output_arr) = body.get("output") {
-                    if let Some(output_item) = output_arr.as_array().and_then(|a| a.first()) {
-                        if let Some(content) = output_item.get("content") {
-                            if let Some(content_arr) = content.as_array() {
-                                for content_item in content_arr {
-                                    if content_item.get("type") == Some(&serde_json::json!("text"))
-                                    {
-                                        if let Some(text) = content_item.get("text") {
-                                            if let Some(text_str) = text.as_str() {
-                                                return parse_review_text(text_str);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Err("No valid review content found in output".to_string())
-}
-
-/// Parse the review text JSON.
-fn parse_review_text(text: &str) -> Result<ReviewResult, String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("Failed to parse review JSON: {}", e))?;
-
-    let reasoning = parsed
-        .get("reasoning")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let summary = parsed
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Review complete")
-        .to_string();
-
-    // Handle substantiveComments which can be:
-    // - An array of comment objects -> parse as HasIssues with comments
-    // - Boolean true -> HasIssues with no specific comments (issues are in summary)
-    // - Boolean false, null, or empty array -> NoIssues
-    let substantive_comments_value = parsed.get("substantiveComments");
-
-    // Check if it's a boolean true (indicates issues exist but no specific line comments)
-    let has_issues_flag = substantive_comments_value
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let comments: Vec<ReviewComment> = substantive_comments_value
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|c| {
-                    let file_path = c.get("filePath")?.as_str()?.to_string();
-                    let content = c.get("comment")?.as_str()?.to_string();
-                    let line_number = c
-                        .get("lineNumber")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as u32);
-                    Some(ReviewComment {
-                        file_path,
-                        line_number,
-                        content,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // If substantiveComments was true (boolean) or has actual comments, it's HasIssues
-    if has_issues_flag || !comments.is_empty() {
-        Ok(ReviewResult::HasIssues {
-            summary,
-            reasoning,
-            comments,
-        })
-    } else {
-        Ok(ReviewResult::NoIssues { summary, reasoning })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,67 +948,6 @@ mod tests {
         assert!(
             !formatted.contains("...and"),
             "Should not show overflow for small list"
-        );
-    }
-
-    #[test]
-    fn test_parse_review_text_no_issues() {
-        let text =
-            r#"{"reasoning": "Code looks good", "summary": "LGTM", "substantiveComments": []}"#;
-        let result = parse_review_text(text).unwrap();
-        assert!(matches!(result, ReviewResult::NoIssues { .. }));
-    }
-
-    #[test]
-    fn test_parse_review_text_with_issues() {
-        let text = r#"{
-            "reasoning": "Found some issues",
-            "summary": "Needs fixes",
-            "substantiveComments": [
-                {"filePath": "src/main.rs", "lineNumber": 10, "comment": "Fix this"}
-            ]
-        }"#;
-        let result = parse_review_text(text).unwrap();
-        if let ReviewResult::HasIssues { comments, .. } = result {
-            assert_eq!(comments.len(), 1);
-            assert_eq!(comments[0].file_path, "src/main.rs");
-            assert_eq!(comments[0].line_number, Some(10));
-        } else {
-            panic!("Expected HasIssues");
-        }
-    }
-
-    /// Regression test: substantiveComments: true (boolean) should be treated as HasIssues.
-    ///
-    /// Bug: When OpenAI returns substantiveComments: true instead of an array,
-    /// the old code would fall through to unwrap_or_default() and return NoIssues,
-    /// incorrectly indicating no problems when issues exist.
-    #[test]
-    fn test_parse_review_text_with_boolean_true_substantive_comments() {
-        let text = r#"{
-            "reasoning": "Found potential security issues",
-            "summary": "Security concerns need review",
-            "substantiveComments": true
-        }"#;
-        let result = parse_review_text(text).unwrap();
-        assert!(
-            matches!(result, ReviewResult::HasIssues { comments, .. } if comments.is_empty()),
-            "substantiveComments: true should result in HasIssues (with empty comments)"
-        );
-    }
-
-    /// Test that substantiveComments: false still returns NoIssues.
-    #[test]
-    fn test_parse_review_text_with_boolean_false_substantive_comments() {
-        let text = r#"{
-            "reasoning": "Code looks good",
-            "summary": "LGTM",
-            "substantiveComments": false
-        }"#;
-        let result = parse_review_text(text).unwrap();
-        assert!(
-            matches!(result, ReviewResult::NoIssues { .. }),
-            "substantiveComments: false should result in NoIssues"
         );
     }
 }

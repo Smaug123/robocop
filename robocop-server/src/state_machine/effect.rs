@@ -65,12 +65,6 @@ pub enum Effect {
     /// Cancel a pending batch.
     CancelBatch { batch_id: BatchId },
 
-    /// Download and parse batch output.
-    DownloadBatchOutput {
-        batch_id: BatchId,
-        output_file_id: String,
-    },
-
     // =========================================================================
     // Logging Effects
     // =========================================================================
