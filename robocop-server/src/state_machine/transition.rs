@@ -395,6 +395,24 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             }],
         ),
 
+        // Same commit while preparing -> no change (duplicate request)
+        (
+            ReviewMachineState::Preparing { head_sha, .. },
+            Event::ReviewRequested {
+                head_sha: new_head_sha,
+                ..
+            },
+        ) if head_sha == &new_head_sha => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Ignoring duplicate ReviewRequested for same commit {}",
+                    head_sha.short()
+                ),
+            }],
+        ),
+
         // ReviewRequested while preparing -> restart with new options
         (
             ReviewMachineState::Preparing {
@@ -413,6 +431,24 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 options,
             },
             vec![Effect::FetchData { head_sha, base_sha }],
+        ),
+
+        // Same commit while preparing -> no change (duplicate webhook)
+        (
+            ReviewMachineState::Preparing { head_sha, .. },
+            Event::PrUpdated {
+                head_sha: new_head_sha,
+                ..
+            },
+        ) if head_sha == &new_head_sha => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Ignoring duplicate PrUpdated for same commit {}",
+                    head_sha.short()
+                ),
+            }],
         ),
 
         // PrUpdated while preparing -> restart with new commit
@@ -2486,6 +2522,118 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Bug: Duplicate events while Preparing can cause double batch submission
+    // Same-SHA events during Preparing should be ignored (de-duped).
+    // =========================================================================
+
+    /// Regression test: PrUpdated for the SAME commit while Preparing
+    /// should NOT restart FetchData - it's a duplicate webhook.
+    ///
+    /// Bug: Without SHA comparison, concurrent webhooks for the same commit
+    /// can each trigger FetchData, leading to multiple batch submissions.
+    #[test]
+    fn test_pr_updated_same_commit_while_preparing_does_not_restart() {
+        let state = ReviewMachineState::Preparing {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        // PrUpdated for the SAME commit
+        let event = Event::PrUpdated {
+            head_sha: CommitSha::from("abc123"), // Same as preparing
+            base_sha: CommitSha::from("def456"),
+            force_review: false,
+            options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT emit FetchData (would cause duplicate batch)
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchData { .. })),
+            "Should NOT restart FetchData for same commit - got: {:?}",
+            result.effects
+        );
+
+        // Should stay in Preparing
+        assert!(
+            matches!(result.state, ReviewMachineState::Preparing { .. }),
+            "Should stay in Preparing, got: {:?}",
+            result.state
+        );
+
+        // Should log the duplicate (matching BatchPending pattern)
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Info,
+                    ..
+                }
+            )),
+            "Should log the duplicate event"
+        );
+    }
+
+    /// Regression test: ReviewRequested for the SAME commit while Preparing
+    /// should NOT restart FetchData - it's a duplicate request.
+    ///
+    /// Bug: Without SHA comparison, concurrent review requests for the same commit
+    /// can each trigger FetchData, leading to multiple batch submissions.
+    #[test]
+    fn test_review_requested_same_commit_while_preparing_does_not_restart() {
+        let state = ReviewMachineState::Preparing {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        // ReviewRequested for the SAME commit
+        let event = Event::ReviewRequested {
+            head_sha: CommitSha::from("abc123"), // Same as preparing
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT emit FetchData (would cause duplicate batch)
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchData { .. })),
+            "Should NOT restart FetchData for same commit - got: {:?}",
+            result.effects
+        );
+
+        // Should stay in Preparing
+        assert!(
+            matches!(result.state, ReviewMachineState::Preparing { .. }),
+            "Should stay in Preparing, got: {:?}",
+            result.state
+        );
+
+        // Should log the duplicate (matching BatchPending pattern)
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Info,
+                    ..
+                }
+            )),
+            "Should log the duplicate event"
+        );
+    }
+
     /// Regression test: PrUpdated should not be dropped while AwaitingAncestryCheck.
     ///
     /// Bug: When yet another new commit is pushed while waiting for ancestry
@@ -2851,17 +2999,23 @@ mod tests {
 
         // Should cancel the old batch
         assert!(
-            result
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::CancelBatch { batch_id } if batch_id.0 == "batch_123")),
+            result.effects.iter().any(
+                |e| matches!(e, Effect::CancelBatch { batch_id } if batch_id.0 == "batch_123")
+            ),
             "Ancestry check failure should cancel the old batch"
         );
 
         // New commit should be prepared for review
-        if let ReviewMachineState::Preparing { head_sha, options, .. } = &result.state {
+        if let ReviewMachineState::Preparing {
+            head_sha, options, ..
+        } = &result.state
+        {
             assert_eq!(head_sha.0, "new_sha", "Should prepare new commit");
-            assert_eq!(options.model, Some("o3".to_string()), "Should use new options");
+            assert_eq!(
+                options.model,
+                Some("o3".to_string()),
+                "Should use new options"
+            );
         }
     }
 
