@@ -2759,6 +2759,236 @@ mod tests {
             "Should NOT fetch data for new review when reviews are disabled"
         );
     }
+
+    // =========================================================================
+    // Bug: Title exceeds GitHub limits (max 255 chars)
+    // When BatchCompleted produces a summary, the title must be truncated.
+    // =========================================================================
+
+    /// Regression test: Check run title must not exceed GitHub's 255 char limit.
+    ///
+    /// Bug: The title was built with `format!("Code review found issues: {}", summary)`
+    /// which can produce arbitrarily long titles when the model summary is long or multiline.
+    /// GitHub rejects updates with titles > 255 chars, leaving check runs stuck in_progress.
+    #[test]
+    fn test_batch_completed_title_truncated_for_long_summary() {
+        let long_summary = "A".repeat(300); // Way over 255 chars
+
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let event = Event::BatchCompleted {
+            batch_id: BatchId::from("batch_123".to_string()),
+            result: ReviewResult::HasIssues {
+                summary: long_summary,
+                reasoning: "Detailed reasoning".to_string(),
+                comments: vec![],
+            },
+        };
+
+        let result = transition(state, event);
+
+        // Find the UpdateCheckRun effect
+        let check_run_effect = result
+            .effects
+            .iter()
+            .find(|e| matches!(e, Effect::UpdateCheckRun { .. }));
+
+        assert!(check_run_effect.is_some(), "Should have UpdateCheckRun effect");
+
+        if let Some(Effect::UpdateCheckRun { title, .. }) = check_run_effect {
+            assert!(
+                title.len() <= 255,
+                "Title must not exceed GitHub's 255 char limit, but got {} chars: '{}'",
+                title.len(),
+                title
+            );
+        }
+    }
+
+    /// Test that multiline summaries are handled correctly in titles.
+    #[test]
+    fn test_batch_completed_title_handles_multiline_summary() {
+        let multiline_summary = "Line 1: Some issue\nLine 2: Another issue\nLine 3: Yet another";
+
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let event = Event::BatchCompleted {
+            batch_id: BatchId::from("batch_123".to_string()),
+            result: ReviewResult::HasIssues {
+                summary: multiline_summary.to_string(),
+                reasoning: "Reasoning".to_string(),
+                comments: vec![],
+            },
+        };
+
+        let result = transition(state, event);
+
+        if let Some(Effect::UpdateCheckRun { title, .. }) = result
+            .effects
+            .iter()
+            .find(|e| matches!(e, Effect::UpdateCheckRun { .. }))
+        {
+            // Title should not contain newlines
+            assert!(
+                !title.contains('\n'),
+                "Title should not contain newlines, got: '{}'",
+                title
+            );
+        }
+    }
+
+    // =========================================================================
+    // Bug: @robocop review while batch pending for same commit restarts
+    // De-dup: If the requested commit matches the pending batch, no-op.
+    // =========================================================================
+
+    /// Regression test: ReviewRequested for the SAME commit as pending batch
+    /// should not cancel and restart - it's a duplicate request.
+    ///
+    /// Bug: ReviewRequested while BatchPending always cancels and restarts,
+    /// even if the requested commit is the same as the one being reviewed.
+    /// This doubles OpenAI spend for repeated manual requests.
+    #[test]
+    fn test_review_requested_same_commit_does_not_restart() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        // Request review for the SAME commit
+        let event = Event::ReviewRequested {
+            head_sha: CommitSha::from("abc123"), // Same as pending
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT cancel the batch
+        assert!(
+            !result.effects.iter().any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should NOT cancel batch when ReviewRequested is for same commit"
+        );
+
+        // Should stay in BatchPending
+        assert!(
+            matches!(result.state, ReviewMachineState::BatchPending { .. }),
+            "Should stay in BatchPending, got: {:?}",
+            result.state
+        );
+    }
+
+    // =========================================================================
+    // Bug: EnableReviewsRequested not handled in BatchPending/AwaitingAncestryCheck
+    // User enabling reviews during a forced review should acknowledge and flip flag.
+    // =========================================================================
+
+    /// Regression test: EnableReviewsRequested in BatchPending state should be handled,
+    /// not fall through to "Unhandled event".
+    ///
+    /// Bug: When a forced review is running (reviews_enabled=false) and user enables
+    /// reviews, the EnableReviewsRequested event falls through to default handler.
+    #[test]
+    fn test_enable_reviews_in_batch_pending_handled() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: false, // Forced review
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let event = Event::EnableReviewsRequested {
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT just log a warning (unhandled event)
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log { level: LogLevel::Warn, message } if message.contains("Unhandled")
+            )),
+            "EnableReviewsRequested in BatchPending should not fall through to unhandled"
+        );
+
+        // Should set reviews_enabled = true
+        assert!(
+            result.state.reviews_enabled(),
+            "Should have reviews enabled after EnableReviewsRequested"
+        );
+    }
+
+    /// Regression test: EnableReviewsRequested in AwaitingAncestryCheck state should be handled.
+    #[test]
+    fn test_enable_reviews_in_awaiting_ancestry_handled() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: false, // Forced review
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base"),
+            new_options: ReviewOptions::default(),
+        };
+
+        let event = Event::EnableReviewsRequested {
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT just log a warning (unhandled event)
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log { level: LogLevel::Warn, message } if message.contains("Unhandled")
+            )),
+            "EnableReviewsRequested in AwaitingAncestryCheck should not fall through to unhandled"
+        );
+
+        // Should set reviews_enabled = true
+        assert!(
+            result.state.reviews_enabled(),
+            "Should have reviews enabled after EnableReviewsRequested"
+        );
+    }
 }
 
 #[cfg(test)]
