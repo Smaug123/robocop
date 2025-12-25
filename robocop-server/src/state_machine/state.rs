@@ -99,6 +99,8 @@ pub enum FailureReason {
     BatchFailed { error: Option<String> },
     /// Batch expired before completion.
     BatchExpired,
+    /// Batch was cancelled (externally or by us).
+    BatchCancelled,
     /// Failed to download output file.
     DownloadFailed { error: String },
     /// Failed to parse review output.
@@ -119,6 +121,7 @@ impl fmt::Display for FailureReason {
                 None => write!(f, "batch processing failed"),
             },
             Self::BatchExpired => write!(f, "batch expired"),
+            Self::BatchCancelled => write!(f, "batch was cancelled"),
             Self::DownloadFailed { error } => write!(f, "download failed: {}", error),
             Self::ParseFailed { error } => write!(f, "parse failed: {}", error),
             Self::NoOutputFile => write!(f, "no output file"),
@@ -190,7 +193,8 @@ pub enum ReviewMachineState {
         head_sha: CommitSha,
         base_sha: CommitSha,
         comment_id: CommentId,
-        check_run_id: CheckRunId,
+        /// Check run ID if one was created (may be None if GitHub API failed).
+        check_run_id: Option<CheckRunId>,
         model: String,
         reasoning_effort: String,
         /// The new commit that triggered the ancestry check.
@@ -207,7 +211,8 @@ pub enum ReviewMachineState {
         head_sha: CommitSha,
         base_sha: CommitSha,
         comment_id: CommentId,
-        check_run_id: CheckRunId,
+        /// Check run ID if one was created (may be None if GitHub API failed).
+        check_run_id: Option<CheckRunId>,
         model: String,
         reasoning_effort: String,
     },
@@ -471,7 +476,7 @@ mod tests {
             head_sha: CommitSha("abc123".into()),
             base_sha: CommitSha("def456".into()),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".into(),
             reasoning_effort: "high".into(),
         };

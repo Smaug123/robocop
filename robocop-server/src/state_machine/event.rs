@@ -64,7 +64,8 @@ pub enum Event {
     BatchSubmitted {
         batch_id: BatchId,
         comment_id: CommentId,
-        check_run_id: CheckRunId,
+        /// Check run ID if one was created (may be None if GitHub API failed).
+        check_run_id: Option<CheckRunId>,
         model: String,
         reasoning_effort: String,
     },

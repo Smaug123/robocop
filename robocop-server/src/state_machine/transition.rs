@@ -349,7 +349,9 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
 
         // ReviewRequested while preparing -> restart with new options
         (
-            ReviewMachineState::Preparing { reviews_enabled, .. },
+            ReviewMachineState::Preparing {
+                reviews_enabled, ..
+            },
             Event::ReviewRequested {
                 head_sha,
                 base_sha,
@@ -363,6 +365,96 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 options,
             },
             vec![Effect::FetchData { head_sha, base_sha }],
+        ),
+
+        // PrUpdated while preparing -> restart with new commit
+        (
+            ReviewMachineState::Preparing {
+                reviews_enabled: true,
+                ..
+            },
+            Event::PrUpdated {
+                head_sha,
+                base_sha,
+                options,
+                ..
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: true,
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![Effect::FetchData { head_sha, base_sha }],
+        ),
+
+        // PrUpdated while preparing (reviews disabled) -> show suppression and stay idle
+        (
+            ReviewMachineState::Preparing {
+                reviews_enabled: false,
+                ..
+            },
+            Event::PrUpdated {
+                head_sha,
+                force_review: false,
+                ..
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Idle {
+                reviews_enabled: false,
+            },
+            vec![
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewSuppressed {
+                        head_sha: head_sha.clone(),
+                    },
+                },
+                Effect::CreateCheckRun {
+                    head_sha,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Skipped),
+                    title: "Reviews disabled for this PR".to_string(),
+                    summary: "Code review was skipped because reviews are disabled.".to_string(),
+                },
+            ],
+        ),
+
+        // Disable reviews while preparing -> go to Idle with reviews disabled
+        (ReviewMachineState::Preparing { .. }, Event::DisableReviewsRequested) => {
+            TransitionResult::new(
+                ReviewMachineState::Idle {
+                    reviews_enabled: false,
+                },
+                vec![Effect::UpdateComment {
+                    content: CommentContent::ReviewsDisabled { cancelled_count: 0 },
+                }],
+            )
+        }
+
+        // Enable reviews while preparing (already preparing, so update options)
+        (
+            ReviewMachineState::Preparing { .. },
+            Event::EnableReviewsRequested {
+                head_sha,
+                base_sha,
+                options,
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: true,
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewsEnabled {
+                        head_sha: head_sha.clone(),
+                    },
+                },
+                Effect::FetchData { head_sha, base_sha },
+            ],
         ),
 
         // =====================================================================
@@ -405,29 +497,31 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 }
             };
 
-            TransitionResult::new(
-                ReviewMachineState::Completed {
-                    reviews_enabled: *reviews_enabled,
+            let new_state = ReviewMachineState::Completed {
+                reviews_enabled: *reviews_enabled,
+                head_sha: head_sha.clone(),
+                result: result.clone(),
+            };
+
+            let mut effects = vec![Effect::UpdateComment {
+                content: CommentContent::ReviewComplete {
                     head_sha: head_sha.clone(),
-                    result: result.clone(),
+                    batch_id: batch_id.clone(),
+                    result,
                 },
-                vec![
-                    Effect::UpdateComment {
-                        content: CommentContent::ReviewComplete {
-                            head_sha: head_sha.clone(),
-                            batch_id: batch_id.clone(),
-                            result,
-                        },
-                    },
-                    Effect::UpdateCheckRun {
-                        check_run_id: *check_run_id,
-                        status: EffectCheckRunStatus::Completed,
-                        conclusion: Some(conclusion),
-                        title,
-                        summary: "Review complete".to_string(),
-                    },
-                ],
-            )
+            }];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(conclusion),
+                    title,
+                    summary: "Review complete".to_string(),
+                });
+            }
+
+            TransitionResult::new(new_state, effects)
         }
 
         // Batch terminated (failed/expired/cancelled) -> transition to Failed
@@ -446,32 +540,35 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
         ) if batch_id == &event_batch_id => {
             let conclusion = match &reason {
                 FailureReason::BatchExpired => EffectCheckRunConclusion::TimedOut,
+                FailureReason::BatchCancelled => EffectCheckRunConclusion::Skipped,
                 _ => EffectCheckRunConclusion::Failure,
             };
 
-            TransitionResult::new(
-                ReviewMachineState::Failed {
-                    reviews_enabled: *reviews_enabled,
+            let new_state = ReviewMachineState::Failed {
+                reviews_enabled: *reviews_enabled,
+                head_sha: head_sha.clone(),
+                reason: reason.clone(),
+            };
+
+            let mut effects = vec![Effect::UpdateComment {
+                content: CommentContent::ReviewFailed {
                     head_sha: head_sha.clone(),
-                    reason: reason.clone(),
+                    batch_id: batch_id.clone(),
+                    reason,
                 },
-                vec![
-                    Effect::UpdateComment {
-                        content: CommentContent::ReviewFailed {
-                            head_sha: head_sha.clone(),
-                            batch_id: batch_id.clone(),
-                            reason,
-                        },
-                    },
-                    Effect::UpdateCheckRun {
-                        check_run_id: *check_run_id,
-                        status: EffectCheckRunStatus::Completed,
-                        conclusion: Some(conclusion),
-                        title: "Code review failed".to_string(),
-                        summary: "Review failed to complete".to_string(),
-                    },
-                ],
-            )
+            }];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(conclusion),
+                    title: "Code review failed".to_string(),
+                    summary: "Review failed to complete".to_string(),
+                });
+            }
+
+            TransitionResult::new(new_state, effects)
         }
 
         // Cancel requested while batch pending -> cancel batch
@@ -484,13 +581,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ..
             },
             Event::CancelRequested,
-        ) => TransitionResult::new(
-            ReviewMachineState::Cancelled {
-                reviews_enabled: *reviews_enabled,
-                head_sha: head_sha.clone(),
-                reason: CancellationReason::UserRequested,
-            },
-            vec![
+        ) => {
+            let mut effects = vec![
                 Effect::CancelBatch {
                     batch_id: batch_id.clone(),
                 },
@@ -500,15 +592,27 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         reason: CancellationReason::UserRequested,
                     },
                 },
-                Effect::UpdateCheckRun {
-                    check_run_id: *check_run_id,
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
                     status: EffectCheckRunStatus::Completed,
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Review cancelled by user".to_string(),
                     summary: "The review was cancelled at the user's request.".to_string(),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha: head_sha.clone(),
+                    reason: CancellationReason::UserRequested,
                 },
-            ],
-        ),
+                effects,
+            )
+        }
 
         // Disable reviews while batch pending -> cancel and disable
         (
@@ -519,28 +623,35 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ..
             },
             Event::DisableReviewsRequested,
-        ) => TransitionResult::new(
-            ReviewMachineState::Cancelled {
-                reviews_enabled: false,
-                head_sha: head_sha.clone(),
-                reason: CancellationReason::ReviewsDisabled,
-            },
-            vec![
+        ) => {
+            let mut effects = vec![
                 Effect::CancelBatch {
                     batch_id: batch_id.clone(),
                 },
                 Effect::UpdateComment {
                     content: CommentContent::ReviewsDisabled { cancelled_count: 1 },
                 },
-                Effect::UpdateCheckRun {
-                    check_run_id: *check_run_id,
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
                     status: EffectCheckRunStatus::Completed,
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Reviews disabled".to_string(),
                     summary: "Reviews were disabled for this PR.".to_string(),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: false,
+                    head_sha: head_sha.clone(),
+                    reason: CancellationReason::ReviewsDisabled,
                 },
-            ],
-        ),
+                effects,
+            )
+        }
 
         // ReviewRequested while batch pending -> cancel current and start new
         (
@@ -555,27 +666,36 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 base_sha,
                 options,
             },
-        ) => TransitionResult::new(
-            ReviewMachineState::Preparing {
-                reviews_enabled: *reviews_enabled,
-                head_sha: head_sha.clone(),
-                base_sha: base_sha.clone(),
-                options,
-            },
-            vec![
-                Effect::CancelBatch {
-                    batch_id: batch_id.clone(),
-                },
-                Effect::UpdateCheckRun {
-                    check_run_id: *check_run_id,
+        ) => {
+            let mut effects = vec![Effect::CancelBatch {
+                batch_id: batch_id.clone(),
+            }];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
                     status: EffectCheckRunStatus::Completed,
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Review restarted".to_string(),
                     summary: "A new review was manually requested.".to_string(),
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha,
+                    base_sha,
+                    options,
                 },
-                Effect::FetchData { head_sha, base_sha },
-            ],
-        ),
+                effects,
+            )
+        }
 
         // New commit while batch pending -> check ancestry
         (
@@ -653,14 +773,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 is_superseded: true,
                 ..
             },
-        ) => TransitionResult::new(
-            ReviewMachineState::Preparing {
-                reviews_enabled: *reviews_enabled,
-                head_sha: new_head_sha.clone(),
-                base_sha: new_base_sha.clone(),
-                options: new_options.clone(),
-            },
-            vec![
+        ) => {
+            let mut effects = vec![
                 Effect::CancelBatch {
                     batch_id: batch_id.clone(),
                 },
@@ -672,8 +786,11 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         },
                     },
                 },
-                Effect::UpdateCheckRun {
-                    check_run_id: *check_run_id,
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
                     status: EffectCheckRunStatus::Completed,
                     conclusion: Some(EffectCheckRunConclusion::Stale),
                     title: format!("Superseded by {}", new_head_sha.short()),
@@ -681,13 +798,24 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         "This review was superseded by a newer commit: {}",
                         new_head_sha.short()
                     ),
-                },
-                Effect::FetchData {
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: new_head_sha.clone(),
+                base_sha: new_base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: *reviews_enabled,
                     head_sha: new_head_sha.clone(),
                     base_sha: new_base_sha.clone(),
+                    options: new_options.clone(),
                 },
-            ],
-        ),
+                effects,
+            )
+        }
 
         // Old commit is NOT superseded (e.g., force-push/rebase) -> cancel old, start new review
         // When commits diverge (no ancestor relationship), the old commit is no longer relevant
@@ -707,14 +835,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 is_superseded: false,
                 ..
             },
-        ) => TransitionResult::new(
-            ReviewMachineState::Preparing {
-                reviews_enabled: *reviews_enabled,
-                head_sha: new_head_sha.clone(),
-                base_sha: new_base_sha.clone(),
-                options: new_options.clone(),
-            },
-            vec![
+        ) => {
+            let mut effects = vec![
                 Effect::CancelBatch {
                     batch_id: batch_id.clone(),
                 },
@@ -726,8 +848,11 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         new_head_sha.short()
                     ),
                 },
-                Effect::UpdateCheckRun {
-                    check_run_id: *check_run_id,
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
                     status: EffectCheckRunStatus::Completed,
                     conclusion: Some(EffectCheckRunConclusion::Stale),
                     title: format!("Replaced by {}", new_head_sha.short()),
@@ -735,13 +860,24 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         "This review was replaced by a newer commit (force-push/rebase): {}",
                         new_head_sha.short()
                     ),
-                },
-                Effect::FetchData {
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: new_head_sha.clone(),
+                base_sha: new_base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: *reviews_enabled,
                     head_sha: new_head_sha.clone(),
                     base_sha: new_base_sha.clone(),
+                    options: new_options.clone(),
                 },
-            ],
-        ),
+                effects,
+            )
+        }
 
         // ReviewRequested while awaiting ancestry check -> cancel current and start new
         (
@@ -756,27 +892,159 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 base_sha,
                 options,
             },
-        ) => TransitionResult::new(
-            ReviewMachineState::Preparing {
-                reviews_enabled: *reviews_enabled,
-                head_sha: head_sha.clone(),
-                base_sha: base_sha.clone(),
-                options,
-            },
-            vec![
-                Effect::CancelBatch {
-                    batch_id: batch_id.clone(),
-                },
-                Effect::UpdateCheckRun {
-                    check_run_id: *check_run_id,
+        ) => {
+            let mut effects = vec![Effect::CancelBatch {
+                batch_id: batch_id.clone(),
+            }];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
                     status: EffectCheckRunStatus::Completed,
                     conclusion: Some(EffectCheckRunConclusion::Skipped),
                     title: "Review restarted".to_string(),
                     summary: "A new review was manually requested.".to_string(),
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha,
+                    base_sha,
+                    options,
                 },
-                Effect::FetchData { head_sha, base_sha },
-            ],
+                effects,
+            )
+        }
+
+        // PrUpdated while awaiting ancestry check -> update to track newest commit
+        // When yet another commit arrives while waiting for ancestry, just update
+        // the new_* fields to track the latest commit.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled,
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                ..
+            },
+            Event::PrUpdated {
+                head_sha: newest_head_sha,
+                base_sha: newest_base_sha,
+                options: newest_options,
+                ..
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled: *reviews_enabled,
+                batch_id: batch_id.clone(),
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                comment_id: *comment_id,
+                check_run_id: *check_run_id,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                new_head_sha: newest_head_sha,
+                new_base_sha: newest_base_sha,
+                new_options: newest_options,
+            },
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: "Updated pending commit while awaiting ancestry check".to_string(),
+            }],
         ),
+
+        // DisableReviewsRequested while awaiting ancestry check -> cancel and disable
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                batch_id,
+                head_sha,
+                check_run_id,
+                ..
+            },
+            Event::DisableReviewsRequested,
+        ) => {
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewsDisabled { cancelled_count: 1 },
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Skipped),
+                    title: "Reviews disabled".to_string(),
+                    summary: "Reviews were disabled for this PR.".to_string(),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: false,
+                    head_sha: head_sha.clone(),
+                    reason: CancellationReason::ReviewsDisabled,
+                },
+                effects,
+            )
+        }
+
+        // CancelRequested while awaiting ancestry check -> cancel batch
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                batch_id,
+                head_sha,
+                check_run_id,
+                reviews_enabled,
+                ..
+            },
+            Event::CancelRequested,
+        ) => {
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: head_sha.clone(),
+                        reason: CancellationReason::UserRequested,
+                    },
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Skipped),
+                    title: "Review cancelled by user".to_string(),
+                    summary: "The review was cancelled at the user's request.".to_string(),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha: head_sha.clone(),
+                    reason: CancellationReason::UserRequested,
+                },
+                effects,
+            )
+        }
 
         // =====================================================================
         // Terminal State Transitions (Completed, Failed, Cancelled)
@@ -1048,7 +1316,7 @@ mod tests {
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
         };
@@ -1081,7 +1349,7 @@ mod tests {
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
         };
@@ -1108,7 +1376,7 @@ mod tests {
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
         };
@@ -1137,7 +1405,7 @@ mod tests {
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
             new_head_sha: CommitSha::from("new_sha"),
@@ -1266,7 +1534,7 @@ mod tests {
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
         };
@@ -1329,7 +1597,7 @@ mod tests {
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("base_sha"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
             new_head_sha: CommitSha::from("new_sha"),
@@ -1487,7 +1755,7 @@ mod tests {
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
         };
@@ -1536,7 +1804,7 @@ mod tests {
             head_sha: CommitSha::from("old_sha"),
             base_sha: CommitSha::from("old_base"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
             new_head_sha: CommitSha::from("pending_sha"),
@@ -1593,7 +1861,7 @@ mod tests {
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "medium".to_string(),
         };
@@ -1619,6 +1887,329 @@ mod tests {
             );
         }
     }
+
+    /// Regression test: Externally cancelled batch should set check-run conclusion to Skipped,
+    /// not Failure.
+    ///
+    /// Bug: When a batch is cancelled (by us or externally), it was mapped to
+    /// FailureReason::BatchFailed which resulted in a Failure conclusion. It should
+    /// use BatchCancelled and Skipped conclusion instead.
+    #[test]
+    fn test_cancelled_batch_sets_skipped_conclusion() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+
+        let result = transition(
+            state,
+            Event::BatchTerminated {
+                batch_id: BatchId::from("batch_123".to_string()),
+                reason: FailureReason::BatchCancelled,
+            },
+        );
+
+        // Find the UpdateCheckRun effect and verify conclusion is Skipped
+        let check_run_effect = result
+            .effects
+            .iter()
+            .find(|e| matches!(e, Effect::UpdateCheckRun { .. }));
+
+        assert!(
+            check_run_effect.is_some(),
+            "Should have UpdateCheckRun effect"
+        );
+
+        if let Some(Effect::UpdateCheckRun { conclusion, .. }) = check_run_effect {
+            assert_eq!(
+                *conclusion,
+                Some(EffectCheckRunConclusion::Skipped),
+                "Cancelled batch should set conclusion to Skipped, not Failure"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Bug: Unhandled events in Preparing and AwaitingAncestryCheck states
+    // These tests verify that events are not dropped in these states.
+    // =========================================================================
+
+    /// Regression test: PrUpdated should not be dropped while Preparing.
+    ///
+    /// Bug: When a new commit is pushed while in Preparing state (fetching data),
+    /// the PrUpdated event was falling through to the default "unhandled" handler
+    /// and being logged but not processed, causing the new commit to be ignored.
+    #[test]
+    fn test_pr_updated_while_preparing_not_dropped() {
+        let state = ReviewMachineState::Preparing {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
+            options: ReviewOptions::default(),
+        };
+
+        let event = Event::PrUpdated {
+            head_sha: CommitSha::from("new_sha"),
+            base_sha: CommitSha::from("new_base"),
+            force_review: false,
+            options: ReviewOptions {
+                model: Some("o3".to_string()),
+                reasoning_effort: None,
+            },
+        };
+
+        let result = transition(state, event);
+
+        // Should restart with the new commit, NOT just log a warning
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "PrUpdated while Preparing should not just log a warning - it should be handled"
+        );
+
+        // Should transition to Preparing for the new commit
+        if let ReviewMachineState::Preparing { head_sha, .. } = &result.state {
+            assert_eq!(head_sha.0, "new_sha", "Should be preparing the new commit");
+        } else {
+            panic!(
+                "Expected Preparing state for new commit, got {:?}",
+                result.state
+            );
+        }
+
+        // Should emit FetchData for the new commit
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::FetchData { head_sha, .. } if head_sha.0 == "new_sha"
+            )),
+            "Should fetch data for new commit"
+        );
+    }
+
+    /// Regression test: DisableReviewsRequested should not be dropped while Preparing.
+    ///
+    /// Bug: When reviews are disabled while in Preparing state, the event was
+    /// falling through to the default "unhandled" handler and being logged
+    /// but not processed, leaving the state unchanged.
+    #[test]
+    fn test_disable_reviews_while_preparing_not_dropped() {
+        let state = ReviewMachineState::Preparing {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, Event::DisableReviewsRequested);
+
+        // Should NOT just log a warning
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "DisableReviewsRequested while Preparing should not just log a warning"
+        );
+
+        // Should transition to Idle with reviews disabled
+        assert!(
+            matches!(
+                result.state,
+                ReviewMachineState::Idle {
+                    reviews_enabled: false
+                }
+            ),
+            "Should transition to Idle with reviews disabled"
+        );
+
+        // Should emit ReviewsDisabled comment
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewsDisabled { .. }
+                }
+            )),
+            "Should emit ReviewsDisabled comment"
+        );
+    }
+
+    /// Regression test: PrUpdated should not be dropped while AwaitingAncestryCheck.
+    ///
+    /// Bug: When yet another new commit is pushed while waiting for ancestry
+    /// check, the PrUpdated event was falling through to the default handler.
+    #[test]
+    fn test_pr_updated_while_awaiting_ancestry_not_dropped() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+            new_head_sha: CommitSha::from("pending_sha"),
+            new_base_sha: CommitSha::from("pending_base"),
+            new_options: ReviewOptions::default(),
+        };
+
+        let event = Event::PrUpdated {
+            head_sha: CommitSha::from("even_newer_sha"),
+            base_sha: CommitSha::from("even_newer_base"),
+            force_review: false,
+            options: ReviewOptions {
+                model: Some("o3".to_string()),
+                reasoning_effort: None,
+            },
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT just log a warning
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "PrUpdated while AwaitingAncestryCheck should not just log a warning"
+        );
+
+        // Should update to track the newest commit (staying in AwaitingAncestryCheck
+        // with updated new_head_sha, or immediately cancel and start fresh)
+        // The important thing is the event is not dropped
+        let tracks_newest = match &result.state {
+            ReviewMachineState::AwaitingAncestryCheck { new_head_sha, .. } => {
+                new_head_sha.0 == "even_newer_sha"
+            }
+            ReviewMachineState::Preparing { head_sha, .. } => head_sha.0 == "even_newer_sha",
+            _ => false,
+        };
+
+        assert!(
+            tracks_newest,
+            "Should track the newest commit, got state: {:?}",
+            result.state
+        );
+    }
+
+    /// Regression test: DisableReviewsRequested should not be dropped while AwaitingAncestryCheck.
+    ///
+    /// Bug: When reviews are disabled while waiting for ancestry check, the
+    /// batch should be cancelled and state should become Cancelled with reviews disabled.
+    #[test]
+    fn test_disable_reviews_while_awaiting_ancestry_not_dropped() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base"),
+            new_options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, Event::DisableReviewsRequested);
+
+        // Should NOT just log a warning
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "DisableReviewsRequested while AwaitingAncestryCheck should not just log a warning"
+        );
+
+        // Should have reviews_enabled = false
+        assert!(
+            !result.state.reviews_enabled(),
+            "Should have reviews disabled"
+        );
+
+        // Should cancel the pending batch
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should cancel the pending batch"
+        );
+    }
+
+    /// Regression test: CancelRequested should not be dropped while AwaitingAncestryCheck.
+    ///
+    /// Bug: When user requests cancel while waiting for ancestry check, the
+    /// batch should be cancelled and state should become Cancelled.
+    #[test]
+    fn test_cancel_while_awaiting_ancestry_not_dropped() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base"),
+            new_options: ReviewOptions::default(),
+        };
+
+        let result = transition(state, Event::CancelRequested);
+
+        // Should NOT just log a warning
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "CancelRequested while AwaitingAncestryCheck should not just log a warning"
+        );
+
+        // Should be in Cancelled state
+        assert!(
+            matches!(result.state, ReviewMachineState::Cancelled { .. }),
+            "Should be in Cancelled state"
+        );
+
+        // Should cancel the pending batch
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should cancel the pending batch"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1643,8 +2234,8 @@ mod property_tests {
         (1u64..1000000).prop_map(CommentId::from)
     }
 
-    fn arb_check_run_id() -> impl Strategy<Value = CheckRunId> {
-        (1u64..1000000).prop_map(CheckRunId::from)
+    fn arb_check_run_id() -> impl Strategy<Value = Option<CheckRunId>> {
+        proptest::option::of((1u64..1000000).prop_map(CheckRunId::from))
     }
 
     fn arb_model() -> impl Strategy<Value = String> {
@@ -1690,6 +2281,7 @@ mod property_tests {
     fn arb_failure_reason() -> impl Strategy<Value = FailureReason> {
         prop_oneof![
             Just(FailureReason::BatchExpired),
+            Just(FailureReason::BatchCancelled),
             Just(FailureReason::NoOutputFile),
             ".*".prop_map(|e| FailureReason::BatchFailed { error: Some(e) }),
             ".*".prop_map(|e| FailureReason::DownloadFailed { error: e }),

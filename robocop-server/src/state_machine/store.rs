@@ -407,7 +407,7 @@ mod tests {
             head_sha: CommitSha::from("abc123"),
             base_sha: CommitSha::from("def456"),
             comment_id: CommentId(1),
-            check_run_id: CheckRunId(2),
+            check_run_id: Some(CheckRunId(2)),
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
         };

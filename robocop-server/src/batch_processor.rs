@@ -169,12 +169,7 @@ async fn process_single_batch(
                 "Batch {} was cancelled for PR #{}",
                 &batch_id.0, pr_id.pr_number
             );
-            batch_terminated_event(
-                &batch_id.0,
-                FailureReason::BatchFailed {
-                    error: Some("batch was cancelled".to_string()),
-                },
-            )
+            batch_terminated_event(&batch_id.0, FailureReason::BatchCancelled)
         }
         status => {
             // Still in progress - send status update

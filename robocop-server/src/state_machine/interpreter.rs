@@ -242,13 +242,21 @@ async fn execute_fetch_data(
         }
     };
 
-    // Check if too many files were skipped
+    // Check if all files were skipped due to size limits
     if !skipped.is_empty() && file_contents_map.is_empty() {
         return EffectResult::single(Event::DataFetchFailed {
             reason: DataFetchFailure::TooLarge {
                 skipped_files: skipped,
                 total_files: changed_files.len(),
             },
+        });
+    }
+
+    // Check if there are no files to review at all
+    // (e.g., empty diff or all files were binary/empty)
+    if file_contents_map.is_empty() && skipped.is_empty() {
+        return EffectResult::single(Event::DataFetchFailed {
+            reason: DataFetchFailure::NoFiles,
         });
     }
 
@@ -467,6 +475,24 @@ fn format_comment_content(content: &CommentContent) -> String {
             skipped_files,
             total_files,
         } => {
+            // Cap the number of files shown to avoid exceeding GitHub comment limits
+            const MAX_FILES_SHOWN: usize = 20;
+            let skipped_count = skipped_files.len();
+            let files_to_show: Vec<_> = skipped_files.iter().take(MAX_FILES_SHOWN).collect();
+            let remaining = skipped_count.saturating_sub(MAX_FILES_SHOWN);
+
+            let file_list = files_to_show
+                .iter()
+                .map(|f| format!("- `{}`", f))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let file_list_with_overflow = if remaining > 0 {
+                format!("{}\n- _...and {} more_", file_list, remaining)
+            } else {
+                file_list
+            };
+
             format!(
                 "⚠️ **Diff too large**\n\n\
                 Commit: `{}`\n\
@@ -474,13 +500,9 @@ fn format_comment_content(content: &CommentContent) -> String {
                 Skipped files:\n{}\n\n\
                 ---\n_Robocop v{}_",
                 head_sha.short(),
-                skipped_files.len(),
+                skipped_count,
                 total_files,
-                skipped_files
-                    .iter()
-                    .map(|f| format!("- `{}`", f))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                file_list_with_overflow,
                 version
             )
         }
@@ -714,7 +736,7 @@ async fn execute_submit_batch(
         }
     };
 
-    // Create check run
+    // Create check run (best-effort: continue with OpenAI submission even if this fails)
     let now = chrono::Utc::now().to_rfc3339();
     let check_run_request = CreateCheckRunRequest {
         installation_id: ctx.installation_id,
@@ -740,13 +762,14 @@ async fn execute_submit_batch(
         .create_check_run(correlation_id, &check_run_request)
         .await
     {
-        Ok(response) => CheckRunId(response.id),
+        Ok(response) => Some(CheckRunId(response.id)),
         Err(e) => {
-            return EffectResult::single(Event::BatchSubmissionFailed {
-                error: format!("Failed to create check run: {}", e),
-                comment_id: Some(comment_id),
-                check_run_id: None,
-            });
+            // Log warning but continue - don't fail the review just because GitHub checks failed
+            warn!(
+                "Failed to create check run for PR #{}: {} - continuing with review",
+                ctx.pr_number, e
+            );
+            None
         }
     };
 
@@ -778,7 +801,7 @@ async fn execute_submit_batch(
         Err(e) => EffectResult::single(Event::BatchSubmissionFailed {
             error: e.to_string(),
             comment_id: Some(comment_id),
-            check_run_id: Some(check_run_id),
+            check_run_id,
         }),
     }
 }
@@ -983,6 +1006,63 @@ mod tests {
         assert!(formatted.contains("cancelled"));
         assert!(formatted.contains("Superseded"));
         assert!(formatted.contains("def456"));
+    }
+
+    /// Regression test: Diff-too-large comment should cap the number of files shown
+    /// to avoid exceeding GitHub comment limits.
+    #[test]
+    fn test_format_comment_diff_too_large_caps_file_list() {
+        // Create more than 20 skipped files
+        let skipped_files: Vec<String> = (0..30).map(|i| format!("src/file{}.rs", i)).collect();
+
+        let content = CommentContent::DiffTooLarge {
+            head_sha: CommitSha::from("abc123"),
+            skipped_files,
+            total_files: 50,
+        };
+
+        let formatted = format_comment_content(&content);
+
+        // Should show first 20 files
+        assert!(formatted.contains("src/file0.rs"));
+        assert!(formatted.contains("src/file19.rs"));
+
+        // Should NOT show file 20 and beyond (they're in the overflow)
+        assert!(!formatted.contains("`src/file20.rs`"));
+        assert!(!formatted.contains("`src/file29.rs`"));
+
+        // Should indicate remaining files
+        assert!(
+            formatted.contains("...and 10 more"),
+            "Should show remaining count"
+        );
+
+        // Should show correct counts
+        assert!(formatted.contains("Skipped 30 of 50 files"));
+    }
+
+    /// Test that diff-too-large with few files doesn't show overflow message
+    #[test]
+    fn test_format_comment_diff_too_large_no_overflow() {
+        let skipped_files: Vec<String> = (0..5).map(|i| format!("src/file{}.rs", i)).collect();
+
+        let content = CommentContent::DiffTooLarge {
+            head_sha: CommitSha::from("abc123"),
+            skipped_files,
+            total_files: 10,
+        };
+
+        let formatted = format_comment_content(&content);
+
+        // Should show all 5 files
+        assert!(formatted.contains("src/file0.rs"));
+        assert!(formatted.contains("src/file4.rs"));
+
+        // Should NOT show overflow message
+        assert!(
+            !formatted.contains("...and"),
+            "Should not show overflow for small list"
+        );
     }
 
     #[test]
