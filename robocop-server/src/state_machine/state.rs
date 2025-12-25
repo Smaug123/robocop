@@ -236,6 +236,11 @@ pub enum ReviewMachineState {
         reviews_enabled: bool,
         head_sha: CommitSha,
         reason: CancellationReason,
+        /// Batch ID still being cancelled (for polling in case cancel fails).
+        /// When a batch is cancelled, the cancel API call might fail. If it does,
+        /// we keep tracking the batch here so polling can still pick up the result
+        /// if the batch completes before we successfully cancel it.
+        pending_cancel_batch_id: Option<BatchId>,
     },
 }
 
@@ -279,10 +284,17 @@ impl ReviewMachineState {
     }
 
     /// Returns the batch ID if there's a pending batch.
+    ///
+    /// This includes batches in active states (BatchPending, AwaitingAncestryCheck)
+    /// as well as batches in Cancelled state where cancel might have failed.
     pub fn pending_batch_id(&self) -> Option<&BatchId> {
         match self {
             Self::BatchPending { batch_id, .. } => Some(batch_id),
             Self::AwaitingAncestryCheck { batch_id, .. } => Some(batch_id),
+            Self::Cancelled {
+                pending_cancel_batch_id: Some(batch_id),
+                ..
+            } => Some(batch_id),
             _ => None,
         }
     }
@@ -387,11 +399,15 @@ impl ReviewMachineState {
                 reason,
             },
             Self::Cancelled {
-                head_sha, reason, ..
+                head_sha,
+                reason,
+                pending_cancel_batch_id,
+                ..
             } => Self::Cancelled {
                 reviews_enabled: enabled,
                 head_sha,
                 reason,
+                pending_cancel_batch_id,
             },
         }
     }
@@ -459,6 +475,7 @@ mod tests {
             reviews_enabled: true,
             head_sha: CommitSha("abc123".into()),
             reason: CancellationReason::UserRequested,
+            pending_cancel_batch_id: None,
         };
         assert!(cancelled.is_terminal());
     }

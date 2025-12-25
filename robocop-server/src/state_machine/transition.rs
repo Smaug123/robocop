@@ -201,6 +201,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
                         reason: CancellationReason::ReviewsDisabled, // No changes to review
+                        pending_cancel_batch_id: None,
                     },
                     vec![Effect::Log {
                         level: LogLevel::Info,
@@ -215,6 +216,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
                         reason: CancellationReason::ReviewsDisabled,
+                        pending_cancel_batch_id: None,
                     },
                     vec![Effect::UpdateComment {
                         content: CommentContent::DiffTooLarge {
@@ -237,6 +239,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
                         reason: CancellationReason::ReviewsDisabled,
+                        pending_cancel_batch_id: None,
                     },
                     vec![Effect::Log {
                         level: LogLevel::Info,
@@ -524,7 +527,50 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             TransitionResult::new(new_state, effects)
         }
 
-        // Batch terminated (failed/expired/cancelled) -> transition to Failed
+        // Batch cancelled externally (found via polling) -> transition to Cancelled
+        // This is different from CancelRequested which is user-initiated
+        (
+            ReviewMachineState::BatchPending {
+                batch_id,
+                head_sha,
+                check_run_id,
+                reviews_enabled,
+                ..
+            },
+            Event::BatchTerminated {
+                batch_id: event_batch_id,
+                reason: FailureReason::BatchCancelled,
+            },
+        ) if batch_id == &event_batch_id => {
+            let mut effects = vec![Effect::UpdateComment {
+                content: CommentContent::ReviewCancelled {
+                    head_sha: head_sha.clone(),
+                    reason: CancellationReason::UserRequested, // External cancellation
+                },
+            }];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Skipped),
+                    title: "Review cancelled".to_string(),
+                    summary: "The batch was cancelled.".to_string(),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha: head_sha.clone(),
+                    reason: CancellationReason::UserRequested,
+                    pending_cancel_batch_id: None, // Already done
+                },
+                effects,
+            )
+        }
+
+        // Batch terminated (failed/expired) -> transition to Failed
         (
             ReviewMachineState::BatchPending {
                 batch_id,
@@ -540,7 +586,6 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
         ) if batch_id == &event_batch_id => {
             let conclusion = match &reason {
                 FailureReason::BatchExpired => EffectCheckRunConclusion::TimedOut,
-                FailureReason::BatchCancelled => EffectCheckRunConclusion::Skipped,
                 _ => EffectCheckRunConclusion::Failure,
             };
 
@@ -609,6 +654,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
                     reason: CancellationReason::UserRequested,
+                    // Track batch for polling in case cancel fails
+                    pending_cancel_batch_id: Some(batch_id.clone()),
                 },
                 effects,
             )
@@ -648,6 +695,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
                     reason: CancellationReason::ReviewsDisabled,
+                    // Track batch for polling in case cancel fails
+                    pending_cancel_batch_id: Some(batch_id.clone()),
                 },
                 effects,
             )
@@ -817,6 +866,63 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             )
         }
 
+        // Old commit is NOT superseded, but reviews are disabled -> cancel old, don't start new
+        // This handles the case where a forced review was running and a force-push occurred,
+        // but reviews are disabled so we shouldn't start a new one.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                batch_id,
+                head_sha: old_sha,
+                check_run_id,
+                new_head_sha,
+                reviews_enabled: false,
+                ..
+            },
+            Event::AncestryResult {
+                is_superseded: false,
+                ..
+            },
+        ) => {
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Commits {} and {} diverged, cancelling old review (reviews disabled, not starting new)",
+                        old_sha.short(),
+                        new_head_sha.short()
+                    ),
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Replaced by {}", new_head_sha.short()),
+                    summary: format!(
+                        "This review was replaced by a newer commit: {} (reviews disabled)",
+                        new_head_sha.short()
+                    ),
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: false,
+                    head_sha: old_sha.clone(),
+                    reason: CancellationReason::Superseded {
+                        new_sha: new_head_sha.clone(),
+                    },
+                    pending_cancel_batch_id: Some(batch_id.clone()),
+                },
+                effects,
+            )
+        }
+
         // Old commit is NOT superseded (e.g., force-push/rebase) -> cancel old, start new review
         // When commits diverge (no ancestor relationship), the old commit is no longer relevant
         // since the branch has been rewritten. Cancel the old batch and review the new commit.
@@ -878,6 +984,44 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                 effects,
             )
         }
+
+        // Ancestry check failed (GitHub API error) -> keep batch running
+        // Don't cancel valid in-flight batches due to transient errors.
+        // A future PrUpdated event will trigger a new ancestry check if needed.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled,
+                batch_id,
+                head_sha,
+                base_sha,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                ..
+            },
+            Event::AncestryCheckFailed { error, .. },
+        ) => TransitionResult::new(
+            ReviewMachineState::BatchPending {
+                reviews_enabled: *reviews_enabled,
+                batch_id: batch_id.clone(),
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                comment_id: *comment_id,
+                check_run_id: *check_run_id,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+            },
+            vec![Effect::Log {
+                level: LogLevel::Warn,
+                message: format!(
+                    "Ancestry check failed ({}), keeping batch {} running for commit {}",
+                    error,
+                    batch_id,
+                    head_sha.short()
+                ),
+            }],
+        ),
 
         // ReviewRequested while awaiting ancestry check -> cancel current and start new
         (
@@ -998,6 +1142,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
                     reason: CancellationReason::ReviewsDisabled,
+                    // Track batch for polling in case cancel fails
+                    pending_cancel_batch_id: Some(batch_id.clone()),
                 },
                 effects,
             )
@@ -1041,6 +1187,8 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
                     reason: CancellationReason::UserRequested,
+                    // Track batch for polling in case cancel fails
+                    pending_cancel_batch_id: Some(batch_id.clone()),
                 },
                 effects,
             )
@@ -1182,10 +1330,15 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     head_sha: head_sha.clone(),
                     reason: reason.clone(),
                 },
-                ReviewMachineState::Cancelled { reason, .. } => ReviewMachineState::Cancelled {
+                ReviewMachineState::Cancelled {
+                    reason,
+                    pending_cancel_batch_id,
+                    ..
+                } => ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
                     reason: reason.clone(),
+                    pending_cancel_batch_id: pending_cancel_batch_id.clone(),
                 },
                 _ => unreachable!(),
             };
@@ -1207,6 +1360,33 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             state.clone(),
             vec![Effect::UpdateComment {
                 content: CommentContent::NoReviewsToCancel,
+            }],
+        ),
+
+        // Batch completed while in Cancelled state (cancel failed, batch completed anyway)
+        // Clear the tracking - user already saw "cancelled" so we don't change the outcome
+        (
+            ReviewMachineState::Cancelled {
+                reviews_enabled,
+                head_sha,
+                reason,
+                pending_cancel_batch_id: Some(_),
+            },
+            Event::BatchCompleted { batch_id, .. } | Event::BatchTerminated { batch_id, .. },
+        ) => TransitionResult::new(
+            ReviewMachineState::Cancelled {
+                reviews_enabled: *reviews_enabled,
+                head_sha: head_sha.clone(),
+                reason: reason.clone(),
+                // Clear the tracking - batch is done
+                pending_cancel_batch_id: None,
+            },
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Batch {} completed after cancel was requested, ignoring result",
+                    batch_id
+                ),
             }],
         ),
 
@@ -2210,6 +2390,281 @@ mod tests {
             "Should cancel the pending batch"
         );
     }
+
+    // =========================================================================
+    // Bug #1: CancelBatch failure drops batch from polling
+    // These tests verify that batches are tracked even after cancel is requested,
+    // so that if the cancel fails, we can still process the batch result.
+    // =========================================================================
+
+    /// Regression test: After CancelRequested, the batch should still be trackable
+    /// for polling in case the cancel fails.
+    ///
+    /// Bug: When CancelRequested is processed, the state immediately transitions
+    /// to Cancelled, which has has_pending_batch() = false. If the CancelBatch
+    /// effect fails, the batch is lost from polling and its result is never processed.
+    #[test]
+    fn test_cancelled_state_tracks_batch_for_failed_cancel() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let result = transition(state, Event::CancelRequested);
+
+        // State should be Cancelled
+        assert!(matches!(result.state, ReviewMachineState::Cancelled { .. }));
+
+        // But batch_id should still be trackable (for polling in case cancel fails)
+        // This is the key assertion - currently this FAILS because Cancelled
+        // doesn't track the batch_id
+        assert!(
+            result.state.pending_batch_id().is_some(),
+            "Cancelled state should track batch_id in case cancel fails"
+        );
+        assert_eq!(
+            result.state.pending_batch_id().map(|b| b.0.as_str()),
+            Some("batch_123"),
+            "Cancelled state should preserve the original batch_id"
+        );
+    }
+
+    /// Regression test: DisableReviewsRequested while BatchPending should also
+    /// track the batch for failed cancellation.
+    #[test]
+    fn test_disable_reviews_tracks_batch_for_failed_cancel() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_456".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let result = transition(state, Event::DisableReviewsRequested);
+
+        assert!(matches!(result.state, ReviewMachineState::Cancelled { .. }));
+        assert!(
+            result.state.pending_batch_id().is_some(),
+            "Cancelled state should track batch_id after disable-reviews"
+        );
+    }
+
+    // =========================================================================
+    // Bug #3: Polled cancelled batch shows as Failed/ReviewFailed
+    // A batch that is externally cancelled should show as Cancelled, not Failed.
+    // =========================================================================
+
+    /// Regression test: When polling finds a cancelled batch (external cancellation),
+    /// it should transition to Cancelled state, not Failed.
+    ///
+    /// Bug: BatchTerminated with BatchCancelled reason transitions to Failed state
+    /// and posts ReviewFailed comment. Should transition to Cancelled with
+    /// ReviewCancelled comment.
+    #[test]
+    fn test_externally_cancelled_batch_becomes_cancelled_not_failed() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let event = Event::BatchTerminated {
+            batch_id: BatchId::from("batch_123".to_string()),
+            reason: FailureReason::BatchCancelled,
+        };
+
+        let result = transition(state, event);
+
+        // Should be Cancelled, not Failed
+        assert!(
+            matches!(result.state, ReviewMachineState::Cancelled { .. }),
+            "Externally cancelled batch should transition to Cancelled state, got: {:?}",
+            result.state
+        );
+
+        // Should post ReviewCancelled, not ReviewFailed
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled { .. }
+                }
+            )),
+            "Should post ReviewCancelled comment for externally cancelled batch"
+        );
+    }
+
+    /// Regression test: When a batch completes but we're in Cancelled state
+    /// (because cancel failed), we should still be able to process the result.
+    #[test]
+    fn test_cancelled_state_handles_batch_completed() {
+        // Cancelled state with pending batch (cancel was requested but may have failed)
+        let state = ReviewMachineState::Cancelled {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            reason: CancellationReason::UserRequested,
+            pending_cancel_batch_id: Some(BatchId::from("batch_123".to_string())),
+        };
+
+        // If a BatchCompleted event arrives (because cancel_batch failed
+        // and the batch completed anyway), we should handle it gracefully
+        let event = Event::BatchCompleted {
+            batch_id: BatchId::from("batch_123".to_string()),
+            result: ReviewResult::NoIssues {
+                summary: "LGTM".to_string(),
+                reasoning: "All good".to_string(),
+            },
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT just log a warning and ignore - should process the result
+        // Currently this falls through to the default handler
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "BatchCompleted in Cancelled state should be handled, not logged as unhandled"
+        );
+    }
+
+    // =========================================================================
+    // Bug #4: Compare-commits errors cancel valid batches
+    // Transient GitHub API errors should not cancel in-flight batches.
+    // =========================================================================
+
+    /// Regression test: When ancestry check fails (GitHub API error), the existing
+    /// batch should keep running instead of being cancelled.
+    ///
+    /// Bug: Ancestry check errors defaulted to is_superseded=false, which triggers
+    /// cancellation of the existing batch. Transient errors should not cancel
+    /// valid in-flight batches.
+    #[test]
+    fn test_ancestry_check_failure_keeps_batch_running() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base_sha"),
+            new_options: ReviewOptions::default(),
+        };
+
+        let event = Event::AncestryCheckFailed {
+            old_sha: CommitSha::from("old_sha"),
+            new_sha: CommitSha::from("new_sha"),
+            error: "GitHub API rate limited".to_string(),
+        };
+
+        let result = transition(state, event);
+
+        // Should go back to BatchPending, not start a new review
+        assert!(
+            matches!(result.state, ReviewMachineState::BatchPending { .. }),
+            "Ancestry check failure should revert to BatchPending, got: {:?}",
+            result.state
+        );
+
+        // Should NOT cancel the batch
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Ancestry check failure should NOT cancel the existing batch"
+        );
+
+        // Original batch_id should be preserved
+        if let ReviewMachineState::BatchPending { batch_id, .. } = &result.state {
+            assert_eq!(batch_id.0, "batch_123", "Batch ID should be preserved");
+        }
+    }
+
+    // =========================================================================
+    // Bug #5: reviews_enabled not enforced for PrUpdated while BatchPending
+    // When reviews are disabled, new commits should not start new reviews.
+    // =========================================================================
+
+    /// Regression test: When reviews are disabled and commits diverge (force-push),
+    /// the old batch should be cancelled but NO new review should start.
+    ///
+    /// Bug: AncestryResult with is_superseded=false always starts a new review,
+    /// even when reviews_enabled=false.
+    #[test]
+    fn test_disabled_reviews_no_new_review_on_force_push() {
+        // Batch is pending with reviews_enabled=false (from a forced review)
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: false, // Reviews are disabled!
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            comment_id: CommentId(1),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base_sha"),
+            new_options: ReviewOptions::default(),
+        };
+
+        // Force-push detected: old commit is NOT superseded
+        let event = Event::AncestryResult {
+            old_sha: CommitSha::from("old_sha"),
+            new_sha: CommitSha::from("new_sha"),
+            is_superseded: false,
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT go to Preparing (which would start a new review)
+        assert!(
+            !matches!(result.state, ReviewMachineState::Preparing { .. }),
+            "Should NOT start new review when reviews are disabled, got: {:?}",
+            result.state
+        );
+
+        // Should cancel the old batch
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should cancel the old batch"
+        );
+
+        // Should NOT start fetching data for new review
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchData { .. })),
+            "Should NOT fetch data for new review when reviews are disabled"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2376,13 +2831,22 @@ mod property_tests {
     }
 
     fn arb_cancelled_state() -> impl Strategy<Value = ReviewMachineState> {
-        (any::<bool>(), arb_commit_sha(), arb_cancellation_reason()).prop_map(
-            |(reviews_enabled, head_sha, reason)| ReviewMachineState::Cancelled {
-                reviews_enabled,
-                head_sha,
-                reason,
-            },
+        (
+            any::<bool>(),
+            arb_commit_sha(),
+            arb_cancellation_reason(),
+            proptest::option::of(arb_batch_id()),
         )
+            .prop_map(
+                |(reviews_enabled, head_sha, reason, pending_cancel_batch_id)| {
+                    ReviewMachineState::Cancelled {
+                        reviews_enabled,
+                        head_sha,
+                        reason,
+                        pending_cancel_batch_id,
+                    }
+                },
+            )
     }
 
     fn arb_terminal_state() -> impl Strategy<Value = ReviewMachineState> {

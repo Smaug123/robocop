@@ -110,6 +110,15 @@ pub enum Event {
         /// True if old_sha is an ancestor of new_sha (old is superseded).
         is_superseded: bool,
     },
+
+    /// Ancestry check failed (e.g., GitHub API error).
+    /// This is separate from AncestryResult to allow explicit error handling -
+    /// we don't want transient errors to cancel valid in-flight batches.
+    AncestryCheckFailed {
+        old_sha: CommitSha,
+        new_sha: CommitSha,
+        error: String,
+    },
 }
 
 /// File content fetched from the repository.

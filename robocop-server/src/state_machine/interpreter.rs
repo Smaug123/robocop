@@ -309,11 +309,12 @@ async fn execute_check_ancestry(
         }
         Err(e) => {
             warn!("Failed to check ancestry: {}", e);
-            // If we can't determine ancestry, assume not superseded to be safe
-            EffectResult::single(Event::AncestryResult {
+            // Emit explicit error event so the state machine can decide what to do
+            // (rather than guessing is_superseded and potentially canceling valid batches)
+            EffectResult::single(Event::AncestryCheckFailed {
                 old_sha: old_sha.clone(),
                 new_sha: new_sha.clone(),
-                is_superseded: false,
+                error: e.to_string(),
             })
         }
     }
@@ -737,6 +738,11 @@ async fn execute_submit_batch(
     };
 
     // Create check run (best-effort: continue with OpenAI submission even if this fails)
+    // Link to the comment so users can click through from GitHub checks
+    let details_url = ctx
+        .pr_url
+        .as_ref()
+        .map(|pr_url| format!("{}#issuecomment-{}", pr_url, comment_id.0));
     let now = chrono::Utc::now().to_rfc3339();
     let check_run_request = CreateCheckRunRequest {
         installation_id: ctx.installation_id,
@@ -744,8 +750,8 @@ async fn execute_submit_batch(
         repo_name: &ctx.repo_name,
         name: CHECK_RUN_NAME,
         head_sha: &head_sha.0,
-        details_url: None,
-        external_id: None,
+        details_url: details_url.as_deref(),
+        external_id: None, // batch_id not known yet; set after submission if needed
         status: Some(CheckRunStatus::InProgress),
         started_at: Some(&now),
         conclusion: None,
