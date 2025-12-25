@@ -468,6 +468,9 @@ fn format_comment_content(content: &CommentContent) -> String {
                 }
                 CancellationReason::ReviewsDisabled => "Reviews were disabled.".to_string(),
                 CancellationReason::External => "Batch was cancelled externally.".to_string(),
+                CancellationReason::NoChanges => "No changes to review (empty diff).".to_string(),
+                CancellationReason::DiffTooLarge => "Diff was too large to review.".to_string(),
+                CancellationReason::NoFiles => "No files to review after filtering.".to_string(),
             };
 
             format!(

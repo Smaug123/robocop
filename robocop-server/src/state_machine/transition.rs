@@ -329,7 +329,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ReviewMachineState::Cancelled {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
-                        reason: CancellationReason::ReviewsDisabled, // No changes to review
+                        reason: CancellationReason::NoChanges,
                         pending_cancel_batch_id: None,
                     },
                     vec![Effect::Log {
@@ -344,7 +344,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ReviewMachineState::Cancelled {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
-                        reason: CancellationReason::ReviewsDisabled,
+                        reason: CancellationReason::DiffTooLarge,
                         pending_cancel_batch_id: None,
                     },
                     vec![Effect::UpdateComment {
@@ -367,7 +367,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ReviewMachineState::Cancelled {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
-                        reason: CancellationReason::ReviewsDisabled,
+                        reason: CancellationReason::NoFiles,
                         pending_cancel_batch_id: None,
                     },
                     vec![Effect::Log {
@@ -703,6 +703,26 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
         ) if batch_id == &event_batch_id && status.is_processing() => {
             TransitionResult::no_change(state.clone())
         }
+
+        // Batch status update (terminal status) -> no state change, wait for result event
+        // The polling loop noticed the batch finished, but we'll get the actual results
+        // via BatchCompleted or BatchTerminated events.
+        (
+            ReviewMachineState::BatchPending { batch_id, .. },
+            Event::BatchStatusUpdate {
+                batch_id: event_batch_id,
+                status,
+            },
+        ) if batch_id == &event_batch_id && status.is_terminal() => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Batch {} has terminal status {:?}, waiting for result event",
+                    batch_id, status
+                ),
+            }],
+        ),
 
         // Batch completed -> transition to Completed
         (
@@ -1958,6 +1978,39 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             vec![Effect::Log {
                 level: LogLevel::Info,
                 message: "Ignoring stale event in AwaitingAncestryCheck state".to_string(),
+            }],
+        ),
+
+        // Batch status update while awaiting ancestry check (still processing) -> no change
+        // The batch is still running, we're just waiting for either the ancestry
+        // result or the batch to complete.
+        (
+            ReviewMachineState::AwaitingAncestryCheck { batch_id, .. },
+            Event::BatchStatusUpdate {
+                batch_id: event_batch_id,
+                status,
+            },
+        ) if batch_id == &event_batch_id && status.is_processing() => {
+            TransitionResult::no_change(state.clone())
+        }
+
+        // Batch status update while awaiting ancestry check (terminal status) -> no change
+        // The polling loop noticed the batch finished, but we'll get the actual results
+        // via BatchCompleted or BatchTerminated events. Just acknowledge and wait.
+        (
+            ReviewMachineState::AwaitingAncestryCheck { batch_id, .. },
+            Event::BatchStatusUpdate {
+                batch_id: event_batch_id,
+                status,
+            },
+        ) if batch_id == &event_batch_id && status.is_terminal() => TransitionResult::new(
+            state.clone(),
+            vec![Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Batch {} has terminal status {:?}, waiting for result event",
+                    batch_id, status
+                ),
             }],
         ),
 
@@ -4313,6 +4366,10 @@ mod property_tests {
         prop_oneof![
             Just(CancellationReason::UserRequested),
             Just(CancellationReason::ReviewsDisabled),
+            Just(CancellationReason::External),
+            Just(CancellationReason::NoChanges),
+            Just(CancellationReason::DiffTooLarge),
+            Just(CancellationReason::NoFiles),
             arb_commit_sha().prop_map(|sha| CancellationReason::Superseded { new_sha: sha }),
         ]
     }
@@ -4614,6 +4671,200 @@ mod property_tests {
         ]
     }
 
+    /// Context extracted from a state for generating contextually-relevant events.
+    ///
+    /// Events often reference values that appear in the current state (e.g., batch_id,
+    /// commit SHAs). To properly test all (state, event) combinations, we need to
+    /// generate events that sometimes use the state's values and sometimes use fresh ones.
+    #[derive(Clone)]
+    struct StateContext {
+        /// Pending batch ID, if any.
+        batch_id: Option<BatchId>,
+        /// Current head SHA being reviewed.
+        head_sha: Option<CommitSha>,
+        /// Current base SHA.
+        base_sha: Option<CommitSha>,
+        /// New head SHA (for ancestry check states).
+        new_head_sha: Option<CommitSha>,
+    }
+
+    impl StateContext {
+        fn from_state(state: &ReviewMachineState) -> Self {
+            Self {
+                batch_id: state.pending_batch_id().cloned(),
+                head_sha: state.head_sha().cloned(),
+                base_sha: state.base_sha().cloned(),
+                new_head_sha: state.ancestry_new_head_sha().cloned(),
+            }
+        }
+    }
+
+    /// Generate a batch_id that sometimes matches the state's pending batch.
+    fn arb_batch_id_for_context(ctx: &StateContext) -> impl Strategy<Value = BatchId> {
+        let state_batch_id = ctx.batch_id.clone();
+        (arb_batch_id(), any::<bool>()).prop_map(move |(fresh, use_state)| {
+            if use_state {
+                state_batch_id.clone().unwrap_or(fresh)
+            } else {
+                fresh
+            }
+        })
+    }
+
+    /// Generate commit SHAs that sometimes match the state's values.
+    fn arb_commit_sha_for_context(
+        state_sha: Option<CommitSha>,
+    ) -> impl Strategy<Value = CommitSha> {
+        (arb_commit_sha(), any::<bool>()).prop_map(move |(fresh, use_state)| {
+            if use_state {
+                state_sha.clone().unwrap_or(fresh)
+            } else {
+                fresh
+            }
+        })
+    }
+
+    /// Generator for events that are contextually relevant to the given state.
+    ///
+    /// This generator creates events that sometimes use values from the state,
+    /// ensuring we test both matching and non-matching cases. For example:
+    /// - BatchStatusUpdate will sometimes have the same batch_id as the pending batch
+    /// - AncestryResult will sometimes have matching old_sha/new_sha values
+    ///
+    /// This is critical for testing state machine completeness, as handlers often
+    /// have guards like `if batch_id == &event_batch_id`.
+    fn arb_event_for_state(state: &ReviewMachineState) -> impl Strategy<Value = Event> {
+        let ctx = StateContext::from_state(state);
+        let ctx2 = ctx.clone();
+        let ctx3 = ctx.clone();
+        let ctx4 = ctx.clone();
+        let ctx5 = ctx.clone();
+        let ctx6 = ctx.clone();
+        let ctx7 = ctx.clone();
+        let ctx8 = ctx.clone();
+
+        prop_oneof![
+            // Webhook events - use state's SHAs sometimes
+            (
+                arb_commit_sha_for_context(ctx.head_sha.clone()),
+                arb_commit_sha_for_context(ctx.base_sha.clone()),
+                any::<bool>(),
+                arb_review_options()
+            )
+                .prop_map(|(head_sha, base_sha, force_review, options)| {
+                    Event::PrUpdated {
+                        head_sha,
+                        base_sha,
+                        force_review,
+                        options,
+                    }
+                }),
+            (
+                arb_commit_sha_for_context(ctx2.head_sha.clone()),
+                arb_commit_sha_for_context(ctx2.base_sha.clone()),
+                arb_review_options()
+            )
+                .prop_map(|(head_sha, base_sha, options)| Event::ReviewRequested {
+                    head_sha,
+                    base_sha,
+                    options,
+                }),
+            Just(Event::CancelRequested),
+            (
+                arb_commit_sha_for_context(ctx3.head_sha.clone()),
+                arb_commit_sha_for_context(ctx3.base_sha.clone()),
+                arb_review_options()
+            )
+                .prop_map(|(head_sha, base_sha, options)| {
+                    Event::EnableReviewsRequested {
+                        head_sha,
+                        base_sha,
+                        options,
+                    }
+                }),
+            Just(Event::DisableReviewsRequested),
+            // Data fetch results
+            (".*", proptest::collection::vec(arb_file_content(), 0..5)).prop_map(
+                |(diff, file_contents)| Event::DataFetched {
+                    diff,
+                    file_contents
+                }
+            ),
+            arb_data_fetch_failure().prop_map(|reason| Event::DataFetchFailed { reason }),
+            // Batch submission results
+            (
+                arb_batch_id_for_context(&ctx4),
+                proptest::option::of(arb_comment_id()),
+                arb_check_run_id(),
+                arb_model(),
+                arb_reasoning_effort(),
+            )
+                .prop_map(
+                    |(batch_id, comment_id, check_run_id, model, reasoning_effort)| {
+                        Event::BatchSubmitted {
+                            batch_id,
+                            comment_id,
+                            check_run_id,
+                            model,
+                            reasoning_effort,
+                        }
+                    },
+                ),
+            (
+                ".*",
+                proptest::option::of(arb_comment_id()),
+                arb_check_run_id(),
+            )
+                .prop_map(|(error, comment_id, check_run_id)| {
+                    Event::BatchSubmissionFailed {
+                        error,
+                        comment_id,
+                        check_run_id,
+                    }
+                }),
+            // Polling results - use state's batch_id sometimes
+            (arb_batch_id_for_context(&ctx5), arb_batch_status())
+                .prop_map(|(batch_id, status)| Event::BatchStatusUpdate { batch_id, status }),
+            (arb_batch_id_for_context(&ctx6), arb_review_result())
+                .prop_map(|(batch_id, result)| Event::BatchCompleted { batch_id, result }),
+            (arb_batch_id_for_context(&ctx7), arb_failure_reason())
+                .prop_map(|(batch_id, reason)| Event::BatchTerminated { batch_id, reason }),
+            // Ancestry check results - use state's ancestry SHAs sometimes
+            (
+                arb_commit_sha_for_context(ctx8.head_sha.clone()),
+                arb_commit_sha_for_context(ctx8.new_head_sha.clone()),
+                any::<bool>()
+            )
+                .prop_map(|(old_sha, new_sha, is_superseded)| Event::AncestryResult {
+                    old_sha,
+                    new_sha,
+                    is_superseded,
+                }),
+            (
+                arb_commit_sha_for_context(ctx.head_sha.clone()),
+                arb_commit_sha_for_context(ctx.new_head_sha.clone()),
+                ".*"
+            )
+                .prop_map(|(old_sha, new_sha, error)| Event::AncestryCheckFailed {
+                    old_sha,
+                    new_sha,
+                    error,
+                }),
+        ]
+    }
+
+    /// Generate a (state, event) pair where the event is contextually relevant to the state.
+    ///
+    /// This uses `prop_flat_map` to first generate a state, then generate an event
+    /// that sometimes uses values from that state. This ensures we test all combinations
+    /// of matching and non-matching values in (state, event) pairs.
+    fn arb_state_and_contextual_event() -> impl Strategy<Value = (ReviewMachineState, Event)> {
+        arb_state().prop_flat_map(|state| {
+            let state_clone = state.clone();
+            arb_event_for_state(&state).prop_map(move |event| (state_clone.clone(), event))
+        })
+    }
+
     // =========================================================================
     // Property Tests
     // =========================================================================
@@ -4804,10 +5055,14 @@ mod property_tests {
         ///
         /// The catch-all handler logs a Warn with "Unhandled event" - if we ever see
         /// this in production, it indicates a bug where events are silently dropped.
+        ///
+        /// NOTE: This test uses `arb_state_and_contextual_event()` which generates
+        /// events that sometimes use values from the state (e.g., matching batch_id).
+        /// This is critical because handlers often have guards like `if batch_id == &event_batch_id`,
+        /// and we need to test both matching and non-matching cases.
         #[test]
         fn no_event_falls_through_to_unhandled(
-            state in arb_state(),
-            event in arb_event()
+            (state, event) in arb_state_and_contextual_event()
         ) {
             let result = transition(state.clone(), event.clone());
 

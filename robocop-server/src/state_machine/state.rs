@@ -142,6 +142,12 @@ pub enum CancellationReason {
     ReviewsDisabled,
     /// Batch was cancelled externally (e.g., via OpenAI dashboard or API).
     External,
+    /// No changes to review (empty diff).
+    NoChanges,
+    /// Diff was too large to review.
+    DiffTooLarge,
+    /// No files to review after filtering.
+    NoFiles,
 }
 
 impl fmt::Display for CancellationReason {
@@ -151,6 +157,9 @@ impl fmt::Display for CancellationReason {
             Self::Superseded { new_sha } => write!(f, "superseded by {}", new_sha.short()),
             Self::ReviewsDisabled => write!(f, "reviews disabled"),
             Self::External => write!(f, "cancelled externally"),
+            Self::NoChanges => write!(f, "no changes to review"),
+            Self::DiffTooLarge => write!(f, "diff too large"),
+            Self::NoFiles => write!(f, "no files to review"),
         }
     }
 }
@@ -300,6 +309,27 @@ impl ReviewMachineState {
                 pending_cancel_batch_id: Some(batch_id),
                 ..
             } => Some(batch_id),
+            _ => None,
+        }
+    }
+
+    /// Returns the base SHA if the state has one.
+    pub fn base_sha(&self) -> Option<&CommitSha> {
+        match self {
+            Self::Idle { .. } => None,
+            Self::Preparing { base_sha, .. } => Some(base_sha),
+            Self::AwaitingAncestryCheck { base_sha, .. } => Some(base_sha),
+            Self::BatchPending { base_sha, .. } => Some(base_sha),
+            Self::Completed { .. } => None,
+            Self::Failed { .. } => None,
+            Self::Cancelled { .. } => None,
+        }
+    }
+
+    /// Returns the new head SHA for ancestry checking (only in AwaitingAncestryCheck state).
+    pub fn ancestry_new_head_sha(&self) -> Option<&CommitSha> {
+        match self {
+            Self::AwaitingAncestryCheck { new_head_sha, .. } => Some(new_head_sha),
             _ => None,
         }
     }
