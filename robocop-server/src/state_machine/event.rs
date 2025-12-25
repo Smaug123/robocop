@@ -38,6 +38,8 @@ pub enum Event {
     EnableReviewsRequested {
         head_sha: CommitSha,
         base_sha: CommitSha,
+        /// Review options extracted from PR description (model, reasoning_effort).
+        options: ReviewOptions,
     },
 
     /// User requested to disable automatic reviews via @robocop disable-reviews command.

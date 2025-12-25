@@ -287,10 +287,15 @@ pub fn cancel_requested_event() -> Event {
 }
 
 /// Create an enable reviews requested event.
-pub fn enable_reviews_event(head_sha: impl Into<String>, base_sha: impl Into<String>) -> Event {
+pub fn enable_reviews_event(
+    head_sha: impl Into<String>,
+    base_sha: impl Into<String>,
+    options: Option<crate::command::ReviewOptions>,
+) -> Event {
     Event::EnableReviewsRequested {
         head_sha: CommitSha::from(head_sha.into()),
         base_sha: CommitSha::from(base_sha.into()),
+        options: options.map(ReviewOptions::from).unwrap_or_default(),
     }
 }
 

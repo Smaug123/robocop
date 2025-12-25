@@ -622,11 +622,24 @@ async fn process_enable_reviews(
         )
         .await?;
 
+    // Extract review options from PR body if present
+    let review_options = pr_details
+        .body
+        .as_ref()
+        .and_then(|body| command::extract_review_options(body));
+
+    if review_options.is_some() {
+        info!(
+            "Found review options in PR description: {:?}",
+            review_options
+        );
+    }
+
     // Create state machine PR ID
     let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr_number);
 
-    // Create enable reviews event with current SHAs
-    let event = enable_reviews_event(&pr_details.head.sha, &pr_details.base.sha);
+    // Create enable reviews event with current SHAs and options from PR body
+    let event = enable_reviews_event(&pr_details.head.sha, &pr_details.base.sha, review_options);
 
     // Create interpreter context
     let pr_url = format!("https://github.com/{}/pull/{}", repo.full_name, pr_number);
@@ -647,6 +660,18 @@ async fn process_enable_reviews(
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
         .await;
+
+    // Update the cached review state to reflect the enable command
+    let pr_id = crate::PullRequestId {
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number,
+    };
+    state
+        .review_states
+        .write()
+        .await
+        .insert(pr_id, crate::ReviewState::Enabled);
 
     info!(
         "Enable reviews completed for PR #{}, final state: {:?}",
@@ -697,6 +722,18 @@ async fn process_disable_reviews(
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
         .await;
+
+    // Update the cached review state to reflect the disable command
+    let pr_id = crate::PullRequestId {
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number,
+    };
+    state
+        .review_states
+        .write()
+        .await
+        .insert(pr_id, crate::ReviewState::Disabled);
 
     info!(
         "Disable reviews completed for PR #{}, final state: {:?}",
