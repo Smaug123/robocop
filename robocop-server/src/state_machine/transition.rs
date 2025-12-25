@@ -1275,6 +1275,265 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
             )
         }
 
+        // BatchCompleted while awaiting ancestry check (reviews enabled) -> discard old results, start new review
+        // The batch completed for the old commit, but a new commit arrived. The old results
+        // are stale, so discard them and start reviewing the new commit.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled: true,
+                head_sha: old_sha,
+                check_run_id,
+                new_head_sha,
+                new_base_sha,
+                new_options,
+                ..
+            },
+            Event::BatchCompleted { result, .. },
+        ) => {
+            let mut effects = vec![
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Batch completed for {} but new commit {} arrived, discarding results and starting new review",
+                        old_sha.short(),
+                        new_head_sha.short()
+                    ),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: old_sha.clone(),
+                        reason: CancellationReason::Superseded {
+                            new_sha: new_head_sha.clone(),
+                        },
+                    },
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                // Mark as stale - the results are for an old commit
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Superseded by {}", new_head_sha.short()),
+                    summary: format!(
+                        "Review completed but superseded by newer commit: {}. Result was: {}",
+                        new_head_sha.short(),
+                        match &result {
+                            ReviewResult::NoIssues { summary, .. } =>
+                                format!("No issues - {}", summary),
+                            ReviewResult::HasIssues { summary, .. } =>
+                                format!("Issues found - {}", summary),
+                        }
+                    ),
+                    external_id: None,
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: new_head_sha.clone(),
+                base_sha: new_base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: true,
+                    head_sha: new_head_sha.clone(),
+                    base_sha: new_base_sha.clone(),
+                    options: new_options.clone(),
+                },
+                effects,
+            )
+        }
+
+        // BatchCompleted while awaiting ancestry check (reviews disabled) -> discard old results, don't start new
+        // The forced review completed but a new commit arrived. Since reviews are disabled,
+        // we don't start a new review automatically.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled: false,
+                head_sha: old_sha,
+                check_run_id,
+                new_head_sha,
+                ..
+            },
+            Event::BatchCompleted { result, .. },
+        ) => {
+            let mut effects = vec![
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Batch completed for {} but new commit {} arrived (reviews disabled), discarding results",
+                        old_sha.short(),
+                        new_head_sha.short()
+                    ),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: old_sha.clone(),
+                        reason: CancellationReason::Superseded {
+                            new_sha: new_head_sha.clone(),
+                        },
+                    },
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Superseded by {}", new_head_sha.short()),
+                    summary: format!(
+                        "Review completed but superseded by newer commit: {} (reviews disabled). Result was: {}",
+                        new_head_sha.short(),
+                        match &result {
+                            ReviewResult::NoIssues { summary, .. } => format!("No issues - {}", summary),
+                            ReviewResult::HasIssues { summary, .. } => format!("Issues found - {}", summary),
+                        }
+                    ),
+                    external_id: None,
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: false,
+                    head_sha: old_sha.clone(),
+                    reason: CancellationReason::Superseded {
+                        new_sha: new_head_sha.clone(),
+                    },
+                    pending_cancel_batch_id: None, // Batch already completed
+                },
+                effects,
+            )
+        }
+
+        // BatchTerminated while awaiting ancestry check (reviews enabled) -> start new review
+        // The batch failed/expired for the old commit, but a new commit arrived anyway.
+        // Start reviewing the new commit.
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled: true,
+                head_sha: old_sha,
+                check_run_id,
+                new_head_sha,
+                new_base_sha,
+                new_options,
+                ..
+            },
+            Event::BatchTerminated { reason, .. },
+        ) => {
+            let mut effects = vec![
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Batch for {} terminated ({}) but new commit {} arrived, starting new review",
+                        old_sha.short(),
+                        reason,
+                        new_head_sha.short()
+                    ),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: old_sha.clone(),
+                        reason: CancellationReason::Superseded {
+                            new_sha: new_head_sha.clone(),
+                        },
+                    },
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Superseded by {}", new_head_sha.short()),
+                    summary: format!(
+                        "Review failed ({}) and superseded by newer commit: {}",
+                        reason,
+                        new_head_sha.short()
+                    ),
+                    external_id: None,
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: new_head_sha.clone(),
+                base_sha: new_base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: true,
+                    head_sha: new_head_sha.clone(),
+                    base_sha: new_base_sha.clone(),
+                    options: new_options.clone(),
+                },
+                effects,
+            )
+        }
+
+        // BatchTerminated while awaiting ancestry check (reviews disabled) -> don't start new
+        (
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled: false,
+                head_sha: old_sha,
+                check_run_id,
+                new_head_sha,
+                ..
+            },
+            Event::BatchTerminated { reason, .. },
+        ) => {
+            let mut effects = vec![
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Batch for {} terminated ({}) and new commit {} arrived (reviews disabled)",
+                        old_sha.short(),
+                        reason,
+                        new_head_sha.short()
+                    ),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: old_sha.clone(),
+                        reason: CancellationReason::Superseded {
+                            new_sha: new_head_sha.clone(),
+                        },
+                    },
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Superseded by {}", new_head_sha.short()),
+                    summary: format!(
+                        "Review failed ({}) and superseded by newer commit: {} (reviews disabled)",
+                        reason,
+                        new_head_sha.short()
+                    ),
+                    external_id: None,
+                });
+            }
+
+            TransitionResult::new(
+                ReviewMachineState::Cancelled {
+                    reviews_enabled: false,
+                    head_sha: old_sha.clone(),
+                    reason: CancellationReason::Superseded {
+                        new_sha: new_head_sha.clone(),
+                    },
+                    pending_cancel_batch_id: None, // Batch already terminated
+                },
+                effects,
+            )
+        }
+
         // ReviewRequested while awaiting ancestry check -> cancel current and start new
         (
             ReviewMachineState::AwaitingAncestryCheck {
@@ -2915,7 +3174,7 @@ mod tests {
     }
 
     /// Regression test: When a batch completes but we're in Cancelled state
-    /// (because cancel failed), we should still be able to process the result.
+    /// (because cancel failed), we should still handle it gracefully.
     #[test]
     fn test_cancelled_state_handles_batch_completed() {
         // Cancelled state with pending batch (cancel was requested but may have failed)
@@ -2938,17 +3197,140 @@ mod tests {
 
         let result = transition(state, event);
 
-        // Should NOT just log a warning and ignore - should process the result
-        // Currently this falls through to the default handler
+        // Should NOT fall through to default handler (which logs a warning)
         assert!(
             !result.effects.iter().any(|e| matches!(
                 e,
                 Effect::Log {
                     level: LogLevel::Warn,
+                    message
+                } if message.contains("Unhandled")
+            )),
+            "BatchCompleted in Cancelled state should be handled, not logged as unhandled"
+        );
+
+        // Should clear the pending_cancel_batch_id since the batch is now done
+        match &result.state {
+            ReviewMachineState::Cancelled {
+                pending_cancel_batch_id,
+                ..
+            } => {
+                assert_eq!(
+                    *pending_cancel_batch_id, None,
+                    "pending_cancel_batch_id should be cleared after batch completes"
+                );
+            }
+            other => panic!("Expected Cancelled state, got {:?}", other),
+        }
+
+        // Should log an Info message about the batch completing after cancel
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Info,
                     ..
                 }
             )),
-            "BatchCompleted in Cancelled state should be handled, not logged as unhandled"
+            "Should log info about batch completing after cancel was requested"
+        );
+    }
+
+    // =========================================================================
+    // Bug: BatchCompleted/BatchTerminated not handled in AwaitingAncestryCheck
+    // When a batch completes while we're checking ancestry (to see if a new
+    // commit supersedes the old one), the event falls through to the default
+    // handler and results are lost.
+    // =========================================================================
+
+    /// Regression test: BatchCompleted while AwaitingAncestryCheck must be handled.
+    ///
+    /// Bug: The batch can complete while we're waiting for the ancestry check.
+    /// Since AwaitingAncestryCheck has a pending_batch_id(), the polling loop
+    /// will generate BatchCompleted events, but there's no handler for them.
+    /// The event falls through to the default handler and results are discarded.
+    #[test]
+    fn test_batch_completed_while_awaiting_ancestry_check() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base_sha"),
+            new_options: ReviewOptions::default(),
+        };
+
+        // Batch completes while we're waiting for ancestry check
+        let event = Event::BatchCompleted {
+            batch_id: BatchId::from("batch_123".to_string()),
+            result: ReviewResult::NoIssues {
+                summary: "LGTM".to_string(),
+                reasoning: "Code looks good".to_string(),
+            },
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT fall through to default handler (which just logs a warning)
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message
+                } if message.contains("Unhandled")
+            )),
+            "BatchCompleted in AwaitingAncestryCheck should be handled, not logged as unhandled"
+        );
+
+        // Should transition to a state that reflects the batch completed
+        // (either Completed if we process the result, or some intermediate state)
+        assert!(
+            !matches!(result.state, ReviewMachineState::AwaitingAncestryCheck { .. }),
+            "Should not stay in AwaitingAncestryCheck after batch completes - results would be lost"
+        );
+    }
+
+    /// Regression test: BatchTerminated while AwaitingAncestryCheck must be handled.
+    #[test]
+    fn test_batch_terminated_while_awaiting_ancestry_check() {
+        let state = ReviewMachineState::AwaitingAncestryCheck {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("base_sha"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+            new_head_sha: CommitSha::from("new_sha"),
+            new_base_sha: CommitSha::from("new_base_sha"),
+            new_options: ReviewOptions::default(),
+        };
+
+        // Batch fails/expires while we're waiting for ancestry check
+        let event = Event::BatchTerminated {
+            batch_id: BatchId::from("batch_123".to_string()),
+            reason: FailureReason::BatchExpired,
+        };
+
+        let result = transition(state, event);
+
+        // Should NOT fall through to default handler
+        assert!(
+            !result.effects.iter().any(|e| matches!(
+                e,
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message
+                } if message.contains("Unhandled")
+            )),
+            "BatchTerminated in AwaitingAncestryCheck should be handled, not logged as unhandled"
         );
     }
 
@@ -3637,6 +4019,51 @@ mod property_tests {
             )
     }
 
+    fn arb_awaiting_ancestry_check_state() -> impl Strategy<Value = ReviewMachineState> {
+        (
+            any::<bool>(),
+            arb_batch_id(),
+            arb_commit_sha(),
+            arb_commit_sha(),
+            proptest::option::of(arb_comment_id()),
+            arb_check_run_id(),
+            arb_model(),
+            arb_reasoning_effort(),
+            arb_commit_sha(),
+            arb_commit_sha(),
+            arb_review_options(),
+        )
+            .prop_map(
+                |(
+                    reviews_enabled,
+                    batch_id,
+                    head_sha,
+                    base_sha,
+                    comment_id,
+                    check_run_id,
+                    model,
+                    reasoning_effort,
+                    new_head_sha,
+                    new_base_sha,
+                    new_options,
+                )| {
+                    ReviewMachineState::AwaitingAncestryCheck {
+                        reviews_enabled,
+                        batch_id,
+                        head_sha,
+                        base_sha,
+                        comment_id,
+                        check_run_id,
+                        model,
+                        reasoning_effort,
+                        new_head_sha,
+                        new_base_sha,
+                        new_options,
+                    }
+                },
+            )
+    }
+
     fn arb_completed_state() -> impl Strategy<Value = ReviewMachineState> {
         (any::<bool>(), arb_commit_sha(), arb_review_result()).prop_map(
             |(reviews_enabled, head_sha, result)| ReviewMachineState::Completed {
@@ -3689,6 +4116,7 @@ mod property_tests {
             arb_idle_state(),
             arb_preparing_state(),
             arb_batch_pending_state(),
+            arb_awaiting_ancestry_check_state(),
             arb_completed_state(),
             arb_failed_state(),
             arb_cancelled_state(),
