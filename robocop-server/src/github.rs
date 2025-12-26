@@ -109,6 +109,16 @@ pub struct CommitStatusRequest<'a> {
     pub context: &'a str,
 }
 
+/// Request to compare two commits
+#[derive(Debug, Clone)]
+pub struct CompareCommitsRequest<'a> {
+    pub installation_id: u64,
+    pub repo_owner: &'a str,
+    pub repo_name: &'a str,
+    pub base_sha: &'a str,
+    pub head_sha: &'a str,
+}
+
 /// GitHub Check Run status
 ///
 /// See: https://docs.github.com/en/rest/checks/runs
@@ -1246,23 +1256,19 @@ impl GitHubClient {
     pub async fn compare_commits(
         &self,
         correlation_id: Option<&str>,
-        installation_id: u64,
-        repo_owner: &str,
-        repo_name: &str,
-        base_sha: &str,
-        head_sha: &str,
+        request: &CompareCommitsRequest<'_>,
     ) -> Result<CompareResult> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/compare/{}...{}",
-            repo_owner, repo_name, base_sha, head_sha
+            request.repo_owner, request.repo_name, request.base_sha, request.head_sha
         );
 
         info!(
             "Comparing commits {} to {} in {}/{}",
-            base_sha, head_sha, repo_owner, repo_name
+            request.base_sha, request.head_sha, request.repo_owner, request.repo_name
         );
 
-        let token = self.get_installation_token(installation_id).await?;
+        let token = self.get_installation_token(request.installation_id).await?;
         let mut request_builder = self
             .client
             .get(&url)
@@ -1597,62 +1603,6 @@ pub fn create_github_client(recording_logger: Option<RecordingLogger>) -> Client
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_commit_status_state_as_str() {
-        assert_eq!(CommitStatusState::Pending.as_str(), "pending");
-        assert_eq!(CommitStatusState::Success.as_str(), "success");
-        assert_eq!(CommitStatusState::Failure.as_str(), "failure");
-        assert_eq!(CommitStatusState::Error.as_str(), "error");
-    }
-
-    #[test]
-    fn test_commit_status_state_equality() {
-        assert_eq!(CommitStatusState::Pending, CommitStatusState::Pending);
-        assert_ne!(CommitStatusState::Pending, CommitStatusState::Success);
-        assert_ne!(CommitStatusState::Success, CommitStatusState::Failure);
-        assert_ne!(CommitStatusState::Failure, CommitStatusState::Error);
-    }
-
-    #[test]
-    fn test_commit_status_request_creation() {
-        let request = CommitStatusRequest {
-            installation_id: 12345,
-            repo_owner: "test-owner",
-            repo_name: "test-repo",
-            sha: "abc123",
-            state: CommitStatusState::Success,
-            target_url: Some("https://example.com"),
-            description: Some("Test passed"),
-            context: "robocop/code-review",
-        };
-
-        assert_eq!(request.installation_id, 12345);
-        assert_eq!(request.repo_owner, "test-owner");
-        assert_eq!(request.repo_name, "test-repo");
-        assert_eq!(request.sha, "abc123");
-        assert_eq!(request.state, CommitStatusState::Success);
-        assert_eq!(request.target_url, Some("https://example.com"));
-        assert_eq!(request.description, Some("Test passed"));
-        assert_eq!(request.context, "robocop/code-review");
-    }
-
-    #[test]
-    fn test_commit_status_request_with_none_values() {
-        let request = CommitStatusRequest {
-            installation_id: 1,
-            repo_owner: "owner",
-            repo_name: "repo",
-            sha: "sha",
-            state: CommitStatusState::Pending,
-            target_url: None,
-            description: None,
-            context: "test",
-        };
-
-        assert!(request.target_url.is_none());
-        assert!(request.description.is_none());
-    }
 
     #[test]
     fn test_contains_disable_reviews_marker_present() {

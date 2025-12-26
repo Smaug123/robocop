@@ -16,6 +16,7 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
           inherit system overlays;
+          config.allowUnfree = true;
         };
         
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
@@ -101,6 +102,8 @@
             pkgs.pkg-config
             pkgs.openssl
             pkgs.libiconv
+            pkgs.claude-code
+            pkgs.codex
           ];
 
           RUST_BACKTRACE = "1";

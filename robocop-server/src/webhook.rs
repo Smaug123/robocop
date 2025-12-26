@@ -15,52 +15,13 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::command;
-use crate::git::GitOps;
-use crate::github::{
-    CheckRunConclusion, CheckRunOutput, CheckRunStatus, CreateCheckRunRequest, FileContentRequest,
-    FileSizeLimits, PullRequestInfo, UpdateCheckRunRequest,
+use crate::github::PullRequestInfo;
+use crate::state_machine::{
+    cancel_requested_event, disable_reviews_event, enable_reviews_event, pr_updated_event,
+    review_requested_event, InterpreterContext, StateMachinePrId,
 };
-use crate::openai::{ReviewMetadata, DEFAULT_MODEL};
-use crate::{AppState, CHECK_RUN_NAME};
+use crate::AppState;
 use crate::{CorrelationId, Direction, EventType, RecordedEvent, Sanitizer};
-
-/// Safely truncate a SHA to at most 7 characters for display.
-/// Returns the full string if shorter than 7 characters.
-fn truncate_sha(sha: &str) -> &str {
-    &sha[..7.min(sha.len())]
-}
-
-/// Build a check run request for when reviews are disabled/suppressed.
-/// This creates a completed check with "skipped" conclusion.
-fn build_skipped_check_run_request<'a>(
-    installation_id: u64,
-    repo_owner: &'a str,
-    repo_name: &'a str,
-    head_sha: &'a str,
-    completed_at: &'a str,
-) -> CreateCheckRunRequest<'a> {
-    CreateCheckRunRequest {
-        installation_id,
-        repo_owner,
-        repo_name,
-        name: CHECK_RUN_NAME,
-        head_sha,
-        details_url: None,
-        external_id: None,
-        status: Some(CheckRunStatus::Completed),
-        started_at: None,
-        conclusion: Some(CheckRunConclusion::Skipped),
-        completed_at: Some(completed_at),
-        output: Some(CheckRunOutput {
-            title: "Reviews disabled for this PR".to_string(),
-            summary: format!(
-                "Code review for commit {} was skipped because reviews are disabled for this PR.",
-                truncate_sha(head_sha)
-            ),
-            text: None,
-        }),
-    }
-}
 
 #[derive(Debug, Deserialize)]
 pub struct GitHubWebhookPayload {
@@ -583,6 +544,7 @@ pub async fn github_webhook_handler(
     }))
 }
 
+/// Cancel pending reviews using the state machine.
 async fn process_cancel_reviews(
     correlation_id: Option<&str>,
     state: Arc<AppState>,
@@ -598,228 +560,41 @@ async fn process_cancel_reviews(
     let repo_owner = &repo.owner.login;
     let repo_name = &repo.name;
 
-    // Get all pending batches for this PR
-    let batches_to_cancel: Vec<(String, crate::PendingBatch)> = {
-        let pending = state.pending_batches.read().await;
-        pending
-            .iter()
-            .filter(|(_, batch)| {
-                batch.pr_number == pr_number
-                    && batch.repo_owner == *repo_owner
-                    && batch.repo_name == *repo_name
-            })
-            .map(|(id, batch)| (id.clone(), batch.clone()))
-            .collect()
-    };
+    // Create state machine PR ID
+    let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr_number);
 
-    if batches_to_cancel.is_empty() {
-        info!("No pending batches found for PR #{}", pr_number);
+    // Create the cancel event
+    let event = cancel_requested_event();
 
-        // Post a comment indicating there are no reviews to cancel
-        let version = crate::get_bot_version();
-        let no_reviews_content = "ℹ️ **No reviews to cancel**\n\n\
-            There are no pending reviews for this pull request."
-            .to_string();
-
-        let pr_info = PullRequestInfo {
-            installation_id,
-            repo_owner: repo_owner.to_string(),
-            repo_name: repo_name.to_string(),
-            pr_number,
-        };
-
-        state
-            .github_client
-            .manage_robocop_comment(correlation_id, &pr_info, &no_reviews_content, &version)
-            .await?;
-
-        return Ok(());
-    }
-
-    info!(
-        "Found {} pending batches to cancel for PR #{}",
-        batches_to_cancel.len(),
-        pr_number
-    );
-
-    let mut cancelled_count = 0;
-    let mut failed_cancellations = Vec::new();
-    let mut batches_to_remove = Vec::new();
-
-    for (batch_id, batch) in &batches_to_cancel {
-        info!("Attempting to cancel batch {}", batch_id);
-
-        match state
-            .openai_client
-            .cancel_batch(correlation_id, batch_id)
-            .await
-        {
-            Ok(cancel_response) => {
-                info!(
-                    "Successfully cancelled batch {} (status: {})",
-                    batch_id, cancel_response.status
-                );
-                cancelled_count += 1;
-                batches_to_remove.push(batch_id.clone());
-
-                // Update check run with skipped status for user-cancelled batch
-                if batch.check_run_id != 0 {
-                    let completed_at = chrono::Utc::now().to_rfc3339();
-                    let update_request = UpdateCheckRunRequest {
-                        installation_id,
-                        repo_owner,
-                        repo_name,
-                        check_run_id: batch.check_run_id,
-                        name: Some(CHECK_RUN_NAME),
-                        details_url: None,
-                        external_id: None,
-                        status: Some(CheckRunStatus::Completed),
-                        started_at: None,
-                        conclusion: Some(CheckRunConclusion::Skipped),
-                        completed_at: Some(&completed_at),
-                        output: Some(CheckRunOutput {
-                            title: "Review cancelled by user".to_string(),
-                            summary: format!(
-                                "Code review for commit {} was cancelled by user request.",
-                                truncate_sha(&batch.head_sha)
-                            ),
-                            text: None,
-                        }),
-                    };
-                    if let Err(e) = state
-                        .github_client
-                        .update_check_run(correlation_id, &update_request)
-                        .await
-                    {
-                        error!(
-                            "Failed to update check run for cancelled batch {}: {}",
-                            batch_id, e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to cancel batch {}: {}", batch_id, e);
-                failed_cancellations.push((batch_id.clone(), e.to_string()));
-
-                // Check if batch is already completed/failed/cancelled
-                match state
-                    .openai_client
-                    .get_batch(correlation_id, batch_id)
-                    .await
-                {
-                    Ok(status_response) => {
-                        if matches!(
-                            status_response.status.as_str(),
-                            "completed" | "failed" | "cancelled" | "expired"
-                        ) {
-                            info!(
-                                "Batch {} is already in terminal state: {}",
-                                batch_id, status_response.status
-                            );
-                            cancelled_count += 1; // Count as cancelled since it won't be processed
-                            batches_to_remove.push(batch_id.clone());
-
-                            // Update check run even though cancel failed - batch is terminal
-                            if batch.check_run_id != 0 {
-                                let completed_at = chrono::Utc::now().to_rfc3339();
-                                let update_request = UpdateCheckRunRequest {
-                                    installation_id,
-                                    repo_owner,
-                                    repo_name,
-                                    check_run_id: batch.check_run_id,
-                                    name: Some(CHECK_RUN_NAME),
-                                    details_url: None,
-                                    external_id: None,
-                                    status: Some(CheckRunStatus::Completed),
-                                    started_at: None,
-                                    conclusion: Some(CheckRunConclusion::Skipped),
-                                    completed_at: Some(&completed_at),
-                                    output: Some(CheckRunOutput {
-                                        title: "Review cancelled by user".to_string(),
-                                        summary: format!(
-                                            "Code review for commit {} was cancelled by user request (batch was already {}).",
-                                            truncate_sha(&batch.head_sha),
-                                            status_response.status
-                                        ),
-                                        text: None,
-                                    }),
-                                };
-                                if let Err(e) = state
-                                    .github_client
-                                    .update_check_run(correlation_id, &update_request)
-                                    .await
-                                {
-                                    error!(
-                                        "Failed to update check run for terminal batch {}: {}",
-                                        batch_id, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to check status of batch {}: {}", batch_id, e);
-                    }
-                }
-            }
-        }
-    }
-
-    // Remove only successfully cancelled or terminal batches from tracking
-    {
-        let mut pending = state.pending_batches.write().await;
-        for batch_id in &batches_to_remove {
-            pending.remove(batch_id);
-        }
-    }
-
-    info!(
-        "Cancelled {}/{} batches for PR #{}",
-        cancelled_count,
-        batches_to_cancel.len(),
-        pr_number
-    );
-
-    // Post a comment with cancellation results
-    let version = crate::get_bot_version();
-    let cancellation_content = if failed_cancellations.is_empty() {
-        format!(
-            "✅ **Reviews cancelled**\n\n\
-            Successfully cancelled {} pending review{}.",
-            cancelled_count,
-            if cancelled_count == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "⚠️ **Reviews partially cancelled**\n\n\
-            Successfully cancelled {}/{} pending reviews.\n\n\
-            **Failed cancellations:**\n{}",
-            cancelled_count,
-            batches_to_cancel.len(),
-            failed_cancellations
-                .iter()
-                .map(|(id, err)| format!("- Batch `{}`: {}", id, err))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    };
-
-    let pr_info = PullRequestInfo {
+    // Create interpreter context
+    let pr_url = format!("https://github.com/{}/pull/{}", repo.full_name, pr_number);
+    let ctx = InterpreterContext {
+        github_client: state.github_client.clone(),
+        openai_client: state.openai_client.clone(),
         installation_id,
-        repo_owner: repo_owner.to_string(),
-        repo_name: repo_name.to_string(),
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
         pr_number,
+        pr_url: Some(pr_url),
+        branch_name: None,
+        correlation_id: correlation_id.map(|s| s.to_string()),
     };
 
-    state
-        .github_client
-        .manage_robocop_comment(correlation_id, &pr_info, &cancellation_content, &version)
-        .await?;
+    // Process the event through the state machine
+    let final_state = state
+        .state_store
+        .process_event(&sm_pr_id, event, &ctx)
+        .await;
+
+    info!(
+        "Cancel reviews completed for PR #{}, final state: {:?}",
+        pr_number, final_state
+    );
 
     Ok(())
 }
 
+/// Enable reviews for a PR using the state machine.
 async fn process_enable_reviews(
     correlation_id: Option<&str>,
     state: Arc<AppState>,
@@ -834,17 +609,6 @@ async fn process_enable_reviews(
 
     let repo_owner = &repo.owner.login;
     let repo_name = &repo.name;
-    let pr_id = crate::PullRequestId {
-        repo_owner: repo_owner.clone(),
-        repo_name: repo_name.clone(),
-        pr_number,
-    };
-
-    // Update state
-    {
-        let mut states = state.review_states.write().await;
-        states.insert(pr_id, crate::ReviewState::Enabled);
-    }
 
     // Fetch PR details to get current commit
     let pr_details = state
@@ -858,60 +622,66 @@ async fn process_enable_reviews(
         )
         .await?;
 
-    // Post acknowledgment comment with current commit info
-    let version = crate::get_bot_version();
-    let content = format!(
-        "✅ **Reviews enabled**\n\n\
-        Automatic reviews have been enabled for this PR.\n\n\
-        Submitting review for current commit `{}`...",
-        pr_details.head.sha
-    );
-
-    let pr_info = PullRequestInfo {
-        installation_id,
-        repo_owner: repo_owner.to_string(),
-        repo_name: repo_name.to_string(),
-        pr_number,
-    };
-
-    state
-        .github_client
-        .manage_robocop_comment(correlation_id, &pr_info, &content, &version)
-        .await?;
-
-    // Trigger a review for the current commit
     // Extract review options from PR body if present
     let review_options = pr_details
         .body
         .as_ref()
         .and_then(|body| command::extract_review_options(body));
 
-    let pr = PullRequest {
-        number: pr_details.number,
-        head: PullRequestRef {
-            sha: pr_details.head.sha,
-            ref_name: pr_details.head.ref_name,
-        },
-        base: PullRequestRef {
-            sha: pr_details.base.sha,
-            ref_name: pr_details.base.ref_name,
-        },
-        body: pr_details.body,
+    if review_options.is_some() {
+        info!(
+            "Found review options in PR description: {:?}",
+            review_options
+        );
+    }
+
+    // Create state machine PR ID
+    let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr_number);
+
+    // Create enable reviews event with current SHAs and options from PR body
+    let event = enable_reviews_event(&pr_details.head.sha, &pr_details.base.sha, review_options);
+
+    // Create interpreter context
+    let pr_url = format!("https://github.com/{}/pull/{}", repo.full_name, pr_number);
+    let ctx = InterpreterContext {
+        github_client: state.github_client.clone(),
+        openai_client: state.openai_client.clone(),
+        installation_id,
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number,
+        pr_url: Some(pr_url),
+        branch_name: Some(pr_details.head.ref_name.clone()),
+        correlation_id: correlation_id.map(|s| s.to_string()),
     };
 
-    // Use force_review=false since we just enabled reviews
-    process_code_review(
-        correlation_id,
-        state,
-        installation_id,
-        repo,
-        pr,
-        false,
-        review_options,
-    )
-    .await
+    // Process the event through the state machine
+    let final_state = state
+        .state_store
+        .process_event(&sm_pr_id, event, &ctx)
+        .await;
+
+    // Update the cached review state to reflect the enable command
+    let pr_id = crate::PullRequestId {
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number,
+    };
+    state
+        .review_states
+        .write()
+        .await
+        .insert(pr_id, crate::ReviewState::Enabled);
+
+    info!(
+        "Enable reviews completed for PR #{}, final state: {:?}",
+        pr_number, final_state
+    );
+
+    Ok(())
 }
 
+/// Disable reviews for a PR using the state machine.
 async fn process_disable_reviews(
     correlation_id: Option<&str>,
     state: Arc<AppState>,
@@ -926,168 +696,49 @@ async fn process_disable_reviews(
 
     let repo_owner = &repo.owner.login;
     let repo_name = &repo.name;
+
+    // Create state machine PR ID
+    let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr_number);
+
+    // Create disable reviews event
+    let event = disable_reviews_event();
+
+    // Create interpreter context
+    let pr_url = format!("https://github.com/{}/pull/{}", repo.full_name, pr_number);
+    let ctx = InterpreterContext {
+        github_client: state.github_client.clone(),
+        openai_client: state.openai_client.clone(),
+        installation_id,
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
+        pr_number,
+        pr_url: Some(pr_url),
+        branch_name: None,
+        correlation_id: correlation_id.map(|s| s.to_string()),
+    };
+
+    // Process the event through the state machine
+    let final_state = state
+        .state_store
+        .process_event(&sm_pr_id, event, &ctx)
+        .await;
+
+    // Update the cached review state to reflect the disable command
     let pr_id = crate::PullRequestId {
         repo_owner: repo_owner.clone(),
         repo_name: repo_name.clone(),
         pr_number,
     };
-
-    // Update state
-    {
-        let mut states = state.review_states.write().await;
-        states.insert(pr_id, crate::ReviewState::Disabled);
-    }
-
-    // Cancel any pending reviews for this PR
-    let batches_to_cancel: Vec<(String, crate::PendingBatch)> = {
-        let pending = state.pending_batches.read().await;
-        pending
-            .iter()
-            .filter(|(_, batch)| {
-                batch.pr_number == pr_number
-                    && batch.repo_owner == *repo_owner
-                    && batch.repo_name == *repo_name
-            })
-            .map(|(id, batch)| (id.clone(), batch.clone()))
-            .collect()
-    };
-
-    let mut batches_to_remove = Vec::new();
-
-    for (batch_id, batch) in &batches_to_cancel {
-        info!("Cancelling batch {} due to disable-reviews", batch_id);
-
-        let should_update_check_run;
-        let should_remove_from_tracking;
-
-        match state
-            .openai_client
-            .cancel_batch(correlation_id, batch_id)
-            .await
-        {
-            Ok(_) => {
-                should_update_check_run = true;
-                should_remove_from_tracking = true;
-            }
-            Err(e) => {
-                warn!("Failed to cancel batch {}: {}", batch_id, e);
-
-                // Check if batch is already in a terminal state
-                match state
-                    .openai_client
-                    .get_batch(correlation_id, batch_id)
-                    .await
-                {
-                    Ok(status_response) => {
-                        if matches!(
-                            status_response.status.as_str(),
-                            "completed" | "failed" | "cancelled" | "expired"
-                        ) {
-                            info!(
-                                "Batch {} is already in terminal state: {}",
-                                batch_id, status_response.status
-                            );
-                            // Terminal state: update check run and remove from tracking
-                            should_update_check_run = true;
-                            should_remove_from_tracking = true;
-                        } else {
-                            // Not terminal: don't remove, let polling handle it
-                            info!(
-                                "Batch {} is still in state {}, leaving in tracking for polling",
-                                batch_id, status_response.status
-                            );
-                            should_update_check_run = false;
-                            should_remove_from_tracking = false;
-                        }
-                    }
-                    Err(status_e) => {
-                        error!("Failed to check status of batch {}: {}", batch_id, status_e);
-                        // Can't determine state: don't remove, let polling handle it
-                        should_update_check_run = false;
-                        should_remove_from_tracking = false;
-                    }
-                }
-            }
-        }
-
-        // Update check run with skipped status for disabled review
-        if should_update_check_run && batch.check_run_id != 0 {
-            let completed_at = chrono::Utc::now().to_rfc3339();
-            let update_request = UpdateCheckRunRequest {
-                installation_id,
-                repo_owner,
-                repo_name,
-                check_run_id: batch.check_run_id,
-                name: Some(CHECK_RUN_NAME),
-                details_url: None,
-                external_id: None,
-                status: Some(CheckRunStatus::Completed),
-                started_at: None,
-                conclusion: Some(CheckRunConclusion::Skipped),
-                completed_at: Some(&completed_at),
-                output: Some(CheckRunOutput {
-                    title: "Reviews disabled for this PR".to_string(),
-                    summary: format!(
-                        "Code review for commit {} was skipped because reviews are disabled for this PR.",
-                        truncate_sha(&batch.head_sha)
-                    ),
-                    text: None,
-                }),
-            };
-            if let Err(e) = state
-                .github_client
-                .update_check_run(correlation_id, &update_request)
-                .await
-            {
-                error!(
-                    "Failed to update check run for disabled batch {}: {}",
-                    batch_id, e
-                );
-            }
-        }
-
-        if should_remove_from_tracking {
-            batches_to_remove.push(batch_id.clone());
-        }
-    }
-
-    let cancelled_count = batches_to_remove.len();
-
-    // Remove only successfully cancelled or terminal batches from tracking
-    {
-        let mut pending = state.pending_batches.write().await;
-        for batch_id in &batches_to_remove {
-            pending.remove(batch_id);
-        }
-    }
-
-    // Post acknowledgment
-    let version = crate::get_bot_version();
-    let content = if cancelled_count > 0 {
-        format!(
-            "🔕 **Reviews disabled**\n\n\
-            Automatic reviews have been disabled for this PR.\n\n\
-            Cancelled {} pending review{}.",
-            cancelled_count,
-            if cancelled_count == 1 { "" } else { "s" }
-        )
-    } else {
-        "🔕 **Reviews disabled**\n\n\
-        Automatic reviews have been disabled for this PR."
-            .to_string()
-    };
-
-    let pr_info = PullRequestInfo {
-        installation_id,
-        repo_owner: repo_owner.to_string(),
-        repo_name: repo_name.to_string(),
-        pr_number,
-    };
-
     state
-        .github_client
-        .manage_robocop_comment(correlation_id, &pr_info, &content, &version)
-        .await?;
+        .review_states
+        .write()
+        .await
+        .insert(pr_id, crate::ReviewState::Disabled);
+
+    info!(
+        "Disable reviews completed for PR #{}, final state: {:?}",
+        pr_number, final_state
+    );
 
     Ok(())
 }
@@ -1182,7 +833,7 @@ async fn process_manual_review(
         body: pr_details.body,
     };
 
-    // Use the existing code review logic with force flag and review options
+    // Use the state machine code review logic with force flag and review options
     process_code_review(
         correlation_id,
         state,
@@ -1195,6 +846,9 @@ async fn process_manual_review(
     .await
 }
 
+/// Process a code review using the state machine.
+///
+/// This implementation uses an explicit state machine for managing review lifecycle.
 async fn process_code_review(
     correlation_id: Option<&str>,
     state: Arc<AppState>,
@@ -1205,56 +859,29 @@ async fn process_code_review(
     review_options: Option<command::ReviewOptions>,
 ) -> anyhow::Result<()> {
     info!(
-        "Processing code review for PR #{} in {} (force: {}, options: {:?})",
+        "Processing code review (v2) for PR #{} in {} (force: {}, options: {:?})",
         pr.number, repo.full_name, force_review, review_options
     );
 
-    let github_client = &state.github_client;
-    let openai_client = &state.openai_client;
-
-    // Extract repository info
     let repo_owner = &repo.owner.login;
     let repo_name = &repo.name;
-    let base_sha = &pr.base.sha;
-    let head_sha = &pr.head.sha;
-    let branch_name = Some(pr.head.ref_name.as_str());
-
-    // Check if there's already a pending batch for this exact commit
-    {
-        let pending = state.pending_batches.read().await;
-        let existing_batch = pending.values().find(|batch| {
-            batch.pr_number == pr.number
-                && batch.repo_owner == *repo_owner
-                && batch.repo_name == *repo_name
-                && batch.head_sha == *head_sha
-        });
-
-        if let Some(batch) = existing_batch {
-            info!(
-                "Skipping review for PR #{}: batch {} already pending for commit {}",
-                pr.number, batch.batch_id, head_sha
-            );
-            return Ok(());
-        }
-    }
-
     let pr_id = crate::PullRequestId {
         repo_owner: repo_owner.clone(),
         repo_name: repo_name.clone(),
         pr_number: pr.number,
     };
 
-    // Get or rehydrate review state
-    let review_state = {
+    // Get or rehydrate review state to determine if reviews are enabled
+    let reviews_enabled = {
         let states = state.review_states.read().await;
         if let Some(&cached_state) = states.get(&pr_id) {
-            cached_state
+            cached_state == crate::ReviewState::Enabled
         } else {
             drop(states); // Release read lock before expensive operation
 
             // Rehydrate state from PR history
             let rehydrated_state = crate::review_state::rehydrate_review_state(
-                github_client,
+                &state.github_client,
                 correlation_id,
                 installation_id,
                 repo_owner,
@@ -1267,582 +894,55 @@ async fn process_code_review(
             // Store it for future use
             let mut states = state.review_states.write().await;
             states.insert(pr_id.clone(), rehydrated_state);
-            rehydrated_state
+            rehydrated_state == crate::ReviewState::Enabled
         }
     };
 
-    // Check if reviews are suppressed (unless forced by explicit command)
-    if review_state == crate::ReviewState::Disabled && !force_review {
-        info!(
-            "Reviews are disabled for PR #{}, posting suppression notice",
-            pr.number
-        );
+    // Create state machine PR ID
+    let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr.number);
 
-        let version = crate::get_bot_version();
-        let suppression_content = format!(
-            "ℹ️ **Review suppressed**\n\n\
-            Not reviewing commit `{}` due to explicit suppression.\n\n\
-            To enable reviews, comment `@smaug123-robocop enable-reviews` or \
-            request a one-time review with `@smaug123-robocop review`.",
-            pr.head.sha
-        );
+    // Initialize or get existing state from state store
+    let _current_state = state
+        .state_store
+        .get_or_init(&sm_pr_id, reviews_enabled)
+        .await;
 
-        let pr_info = PullRequestInfo {
-            installation_id,
-            repo_owner: repo_owner.to_string(),
-            repo_name: repo_name.to_string(),
-            pr_number: pr.number,
-        };
-
-        github_client
-            .manage_robocop_comment(correlation_id, &pr_info, &suppression_content, &version)
-            .await?;
-
-        // Create a skipped check run so the PR shows the review was intentionally skipped
-        let completed_at = chrono::Utc::now().to_rfc3339();
-        let check_run_request = build_skipped_check_run_request(
-            installation_id,
-            repo_owner,
-            repo_name,
-            head_sha,
-            &completed_at,
-        );
-
-        if let Err(e) = github_client
-            .create_check_run(correlation_id, &check_run_request)
-            .await
-        {
-            // Log but don't fail - check run creation is best-effort
-            error!(
-                "Failed to create skipped check run for PR #{}: {}",
-                pr.number, e
-            );
-        }
-
-        return Ok(());
-    }
-
-    // Get the diff
-    let diff = github_client
-        .get_diff(
-            correlation_id,
-            installation_id,
-            repo_owner,
-            repo_name,
-            base_sha,
-            head_sha,
+    // Create the appropriate event
+    let event = if force_review {
+        review_requested_event(&pr.head.sha, &pr.base.sha, review_options)
+    } else {
+        pr_updated_event(
+            &pr.head.sha,
+            &pr.base.sha,
+            false, // force_review
+            review_options,
         )
-        .await?;
-
-    if diff.trim().is_empty() {
-        info!("No diff found, skipping code review");
-        return Ok(());
-    }
-
-    // Get list of changed files
-    let changed_files = github_client
-        .get_changed_files_from_diff(
-            correlation_id,
-            installation_id,
-            repo_owner,
-            repo_name,
-            base_sha,
-            head_sha,
-        )
-        .await?;
-
-    if changed_files.is_empty() {
-        info!("No changed files found, skipping code review");
-        return Ok(());
-    }
-
-    // Get file contents with size limits (100KB per file, 1MB total)
-    let limits = FileSizeLimits {
-        max_file_size: 100_000,    // 100KB
-        max_total_size: 1_000_000, // 1MB
     };
 
-    let request = FileContentRequest {
+    // Create interpreter context
+    let pr_url = format!("https://github.com/{}/pull/{}", repo.full_name, pr.number);
+    let ctx = InterpreterContext {
+        github_client: state.github_client.clone(),
+        openai_client: state.openai_client.clone(),
         installation_id,
-        repo_owner: repo_owner.to_string(),
-        repo_name: repo_name.to_string(),
-        file_paths: changed_files,
-        sha: head_sha.to_string(),
-    };
-
-    let (file_contents, skipped_files) = github_client
-        .get_multiple_file_contents_with_limits(correlation_id, &request, &limits)
-        .await?;
-
-    // Check if diff is too big for review
-    if file_contents.is_empty() && !skipped_files.is_empty() {
-        info!("All files were skipped due to size limits, posting skipped comment");
-
-        let version = crate::get_bot_version();
-        let total_files = request.file_paths.len();
-        let skipped_content = format!(
-            "🤖 **Review skipped: Diff too large**\n\n\
-            This pull request contains changes that are too large for automated review:\n\n\
-            **Files changed:** {}\n\
-            **Files skipped:** {}\n\n\
-            **Skipped files:**\n{}\n\n\
-            **Limits:** Max 100KB per file, 1MB total\n\n\
-            Please consider splitting this into smaller, more focused changes for automated review.",
-            total_files,
-            skipped_files.len(),
-            {
-                let mut file_list = skipped_files.iter()
-                    .take(10)
-                    .map(|f| format!("- {}", f))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if skipped_files.len() > 10 {
-                    file_list.push_str(&format!("\n- ... and {} more files", skipped_files.len() - 10));
-                }
-                file_list
-            }
-        );
-
-        let pr_info = PullRequestInfo {
-            installation_id,
-            repo_owner: repo_owner.to_string(),
-            repo_name: repo_name.to_string(),
-            pr_number: pr.number,
-        };
-
-        github_client
-            .manage_robocop_comment(correlation_id, &pr_info, &skipped_content, &version)
-            .await?;
-
-        info!(
-            "Posted skip comment due to size limits for PR #{} in {}",
-            pr.number, repo.full_name
-        );
-        return Ok(());
-    }
-
-    if file_contents.is_empty() {
-        info!("No file contents could be retrieved, skipping code review");
-        return Ok(());
-    }
-
-    // Log if some files were skipped but we can still proceed
-    if !skipped_files.is_empty() {
-        info!(
-            "Proceeding with partial review: {} files downloaded, {} skipped",
-            file_contents.len(),
-            skipped_files.len()
-        );
-    }
-
-    // Check for existing batches that should be cancelled due to commit ancestry
-    cancel_superseded_batches(
-        correlation_id,
-        &state,
-        installation_id,
-        repo_owner,
-        repo_name,
-        pr.number,
-        head_sha,
-    )
-    .await?;
-
-    // Process with OpenAI batch API
-    let pull_request_url = format!("https://github.com/{}/pull/{}", repo.full_name, pr.number);
-    let metadata = ReviewMetadata {
-        head_hash: head_sha.to_string(),
-        merge_base: base_sha.to_string(),
-        branch_name: branch_name.map(|s| s.to_string()),
-        repo_name: repo.name.clone(),
-        remote_url: None, // Could extract this from repo data if needed
-        pull_request_url: Some(pull_request_url),
-    };
-
-    let version = crate::get_bot_version();
-
-    // Extract options or use defaults
-    let reasoning_effort = review_options
-        .as_ref()
-        .and_then(|opts| opts.reasoning_effort.as_deref())
-        .unwrap_or("xhigh");
-    let model = review_options
-        .as_ref()
-        .and_then(|opts| opts.model.as_deref());
-
-    let batch_id = openai_client
-        .process_code_review_batch(
-            correlation_id,
-            &diff,
-            &file_contents,
-            &metadata,
-            reasoning_effort,
-            Some(&version),
-            None, // additional_prompt
-            model,
-        )
-        .await?;
-
-    // Determine the actual model used (specified or default)
-    let actual_model = model.unwrap_or(DEFAULT_MODEL);
-
-    info!(
-        "Successfully submitted batch request {} for PR #{} in {}",
-        batch_id, pr.number, repo.full_name
-    );
-    let in_progress_content = format!(
-        "🤖 **Code review in progress...**\n\n\
-        I'm analyzing the changes in this pull request. This may take a long time depending on current OpenAI load.\n\n\
-        **Commit:** `{}`\n\
-        **Batch ID:** `{}`\n\
-        **Model:** `{}`\n\
-        **Reasoning effort:** `{}`\n\
-        **Status:** Processing",
-        head_sha, batch_id, actual_model, reasoning_effort
-    );
-
-    let pr_info = PullRequestInfo {
-        installation_id,
-        repo_owner: repo_owner.to_string(),
-        repo_name: repo_name.to_string(),
+        repo_owner: repo_owner.clone(),
+        repo_name: repo_name.clone(),
         pr_number: pr.number,
+        pr_url: Some(pr_url),
+        branch_name: Some(pr.head.ref_name.clone()),
+        correlation_id: correlation_id.map(|s| s.to_string()),
     };
-    let comment_id = github_client
-        .manage_robocop_comment(correlation_id, &pr_info, &in_progress_content, &version)
-        .await?;
+
+    // Process the event through the state machine
+    let final_state = state
+        .state_store
+        .process_event(&sm_pr_id, event, &ctx)
+        .await;
 
     info!(
-        "Posted in-progress comment {} for batch {} on PR #{} in {}",
-        comment_id, batch_id, pr.number, repo.full_name
+        "Code review completed for PR #{}, final state: {:?}",
+        pr.number, final_state
     );
-
-    // Create check run with in_progress status
-    let check_run_url = format!(
-        "https://github.com/{}/pull/{}#issuecomment-{}",
-        repo.full_name, pr.number, comment_id
-    );
-    let started_at = chrono::Utc::now().to_rfc3339();
-    let check_run_request = CreateCheckRunRequest {
-        installation_id,
-        repo_owner,
-        repo_name,
-        name: CHECK_RUN_NAME,
-        head_sha,
-        details_url: Some(&check_run_url),
-        external_id: Some(&batch_id),
-        status: Some(CheckRunStatus::InProgress),
-        started_at: Some(&started_at),
-        conclusion: None,
-        completed_at: None,
-        output: Some(CheckRunOutput {
-            title: "Code review in progress".to_string(),
-            summary: format!("Reviewing commit {}", truncate_sha(head_sha)),
-            text: None,
-        }),
-    };
-    let check_run_id = match github_client
-        .create_check_run(correlation_id, &check_run_request)
-        .await
-    {
-        Ok(response) => response.id,
-        Err(e) => {
-            // Log but don't fail the review - check run creation is best-effort
-            error!("Failed to create check run for PR #{}: {}", pr.number, e);
-            // Use 0 as a sentinel value indicating no check run was created
-            0
-        }
-    };
-
-    // Store batch for polling
-    let pending_batch = crate::PendingBatch {
-        batch_id: batch_id.clone(),
-        installation_id,
-        repo_owner: repo_owner.to_string(),
-        repo_name: repo_name.to_string(),
-        pr_number: pr.number,
-        comment_id,
-        check_run_id,
-        version: version.clone(),
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-        head_sha: head_sha.to_string(),
-        base_sha: base_sha.to_string(),
-    };
-
-    {
-        let mut pending = state.pending_batches.write().await;
-        pending.insert(batch_id.clone(), pending_batch);
-    }
-
-    info!(
-        "Added batch {} to polling queue for PR #{} in {}",
-        batch_id, pr.number, repo.full_name
-    );
-
-    Ok(())
-}
-
-async fn cancel_superseded_batches(
-    correlation_id: Option<&str>,
-    state: &Arc<AppState>,
-    installation_id: u64,
-    repo_owner: &str,
-    repo_name: &str,
-    pr_number: u64,
-    new_head_sha: &str,
-) -> anyhow::Result<()> {
-    info!(
-        "Checking for batches to cancel due to new commit {} on PR #{} in {}/{}",
-        new_head_sha, pr_number, repo_owner, repo_name
-    );
-
-    // Get all pending batches for this PR
-    let batches_to_check: Vec<(String, crate::PendingBatch)> = {
-        let pending = state.pending_batches.read().await;
-        pending
-            .iter()
-            .filter(|(_, batch)| {
-                batch.pr_number == pr_number
-                    && batch.repo_owner == repo_owner
-                    && batch.repo_name == repo_name
-            })
-            .map(|(id, batch)| (id.clone(), batch.clone()))
-            .collect()
-    };
-
-    if batches_to_check.is_empty() {
-        info!("No existing batches found for PR #{}", pr_number);
-        return Ok(());
-    }
-
-    info!(
-        "Found {} existing batches for PR #{}, checking for superseded commits",
-        batches_to_check.len(),
-        pr_number
-    );
-
-    let mut cancelled_batches = Vec::new();
-
-    for (batch_id, batch) in batches_to_check {
-        // Skip if it's the same commit (shouldn't happen in practice)
-        if batch.head_sha == new_head_sha {
-            continue;
-        }
-
-        // Check if the existing commit is an ancestor of the new commit
-        // is_ancestor(new_sha, existing_sha) returns true when existing_sha is an ancestor of new_sha
-        // In this case: is batch.head_sha (old commit) an ancestor of new_head_sha (new commit)?
-        // If true, the old batch is superseded by the new commit and should be cancelled.
-        let is_ancestor_result = {
-            let github_client = &state.github_client;
-            GitOps::is_ancestor(
-                github_client,
-                installation_id,
-                repo_owner,
-                repo_name,
-                new_head_sha,    // The new commit (descendant)
-                &batch.head_sha, // The old commit (potential ancestor)
-            )
-            .await
-        };
-
-        match is_ancestor_result {
-            Ok(true) => {
-                info!(
-                    "Commit {} is superseded by {}, cancelling batch {}",
-                    batch.head_sha, new_head_sha, batch_id
-                );
-
-                // Attempt to cancel the batch
-                match state
-                    .openai_client
-                    .cancel_batch(correlation_id, &batch_id)
-                    .await
-                {
-                    Ok(cancel_response) => {
-                        info!(
-                            "Successfully cancelled batch {} (status: {})",
-                            batch_id, cancel_response.status
-                        );
-
-                        // Update the PR comment to show cancellation
-                        let cancellation_content = format!(
-                            "❌ **Code review cancelled**\n\n\
-                            This review was cancelled because a newer commit superseded it.\n\n\
-                            **Cancelled Commit:** `{}`\n\
-                            **Superseded by:** `{}`\n\
-                            **Batch ID:** `{}`\n\
-                            **Status:** Cancelled",
-                            batch.head_sha, new_head_sha, batch_id
-                        );
-
-                        let pr_info = PullRequestInfo {
-                            installation_id: batch.installation_id,
-                            repo_owner: batch.repo_owner.clone(),
-                            repo_name: batch.repo_name.clone(),
-                            pr_number: batch.pr_number,
-                        };
-                        let github_client = &state.github_client;
-                        if let Err(e) = github_client
-                            .manage_robocop_comment(
-                                correlation_id,
-                                &pr_info,
-                                &cancellation_content,
-                                &batch.version,
-                            )
-                            .await
-                        {
-                            error!(
-                                "Failed to update comment for cancelled batch {}: {}",
-                                batch_id, e
-                            );
-                        }
-
-                        // Update check run with stale status for superseded commit
-                        if batch.check_run_id != 0 {
-                            let completed_at = chrono::Utc::now().to_rfc3339();
-                            let update_request = UpdateCheckRunRequest {
-                                installation_id: batch.installation_id,
-                                repo_owner: &batch.repo_owner,
-                                repo_name: &batch.repo_name,
-                                check_run_id: batch.check_run_id,
-                                name: Some(CHECK_RUN_NAME),
-                                details_url: None,
-                                external_id: None,
-                                status: Some(CheckRunStatus::Completed),
-                                started_at: None,
-                                conclusion: Some(CheckRunConclusion::Stale),
-                                completed_at: Some(&completed_at),
-                                output: Some(CheckRunOutput {
-                                    title: format!(
-                                        "Review superseded by commit {}",
-                                        truncate_sha(new_head_sha)
-                                    ),
-                                    summary: format!(
-                                        "This review was cancelled because commit {} superseded commit {}.",
-                                        truncate_sha(new_head_sha),
-                                        truncate_sha(&batch.head_sha)
-                                    ),
-                                    text: None,
-                                }),
-                            };
-                            if let Err(e) = github_client
-                                .update_check_run(correlation_id, &update_request)
-                                .await
-                            {
-                                error!(
-                                    "Failed to update check run for superseded batch {}: {}",
-                                    batch_id, e
-                                );
-                            }
-                        }
-
-                        cancelled_batches.push(batch_id.clone());
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to cancel batch {} (it may already be completed): {}",
-                            batch_id, e
-                        );
-
-                        // Check the current status of the batch
-                        match state
-                            .openai_client
-                            .get_batch(correlation_id, &batch_id)
-                            .await
-                        {
-                            Ok(status_response) => {
-                                info!(
-                                    "Batch {} current status: {}",
-                                    batch_id, status_response.status
-                                );
-
-                                // If it's already completed/failed/cancelled, remove it from tracking
-                                if matches!(
-                                    status_response.status.as_str(),
-                                    "completed" | "failed" | "cancelled" | "expired"
-                                ) {
-                                    // Update check run even though cancel failed - batch is terminal
-                                    if batch.check_run_id != 0 {
-                                        let github_client = &state.github_client;
-                                        let completed_at = chrono::Utc::now().to_rfc3339();
-                                        let update_request = UpdateCheckRunRequest {
-                                            installation_id: batch.installation_id,
-                                            repo_owner: &batch.repo_owner,
-                                            repo_name: &batch.repo_name,
-                                            check_run_id: batch.check_run_id,
-                                            name: Some(CHECK_RUN_NAME),
-                                            details_url: None,
-                                            external_id: None,
-                                            status: Some(CheckRunStatus::Completed),
-                                            started_at: None,
-                                            conclusion: Some(CheckRunConclusion::Stale),
-                                            completed_at: Some(&completed_at),
-                                            output: Some(CheckRunOutput {
-                                                title: format!(
-                                                    "Review superseded by commit {}",
-                                                    truncate_sha(new_head_sha)
-                                                ),
-                                                summary: format!(
-                                                    "This review was cancelled because commit {} superseded commit {} (batch was already {}).",
-                                                    truncate_sha(new_head_sha),
-                                                    truncate_sha(&batch.head_sha),
-                                                    status_response.status
-                                                ),
-                                                text: None,
-                                            }),
-                                        };
-                                        if let Err(e) = github_client
-                                            .update_check_run(correlation_id, &update_request)
-                                            .await
-                                        {
-                                            error!(
-                                                "Failed to update check run for terminal superseded batch {}: {}",
-                                                batch_id, e
-                                            );
-                                        }
-                                    }
-
-                                    cancelled_batches.push(batch_id.clone());
-                                }
-                            }
-                            Err(status_e) => {
-                                error!(
-                                    "Failed to check status of batch {}: {}",
-                                    batch_id, status_e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(false) => {
-                info!(
-                    "Commit {} is not superseded by {} (parallel development), keeping batch {}",
-                    batch.head_sha, new_head_sha, batch_id
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to check ancestry between {} and {}: {}",
-                    batch.head_sha, new_head_sha, e
-                );
-            }
-        }
-    }
-
-    // Remove cancelled batches from tracking
-    if !cancelled_batches.is_empty() {
-        let mut pending = state.pending_batches.write().await;
-        for batch_id in &cancelled_batches {
-            pending.remove(batch_id);
-        }
-        info!(
-            "Removed {} cancelled batches from tracking",
-            cancelled_batches.len()
-        );
-    }
 
     Ok(())
 }
@@ -2013,147 +1113,5 @@ mod tests {
 
         let sender = payload.sender.unwrap();
         assert_eq!(sender.id, 456);
-    }
-
-    #[test]
-    fn test_build_skipped_check_run_request() {
-        // This test verifies that when reviews are disabled for a PR,
-        // we create a check run with the correct "skipped" status.
-        //
-        // This is important because GitHub's Checks API allows PRs to show
-        // a clear "skipped" status rather than having no check at all,
-        // which provides better visibility into why no review was performed.
-
-        let completed_at = "2024-01-15T10:30:00Z";
-        let request = build_skipped_check_run_request(
-            12345,          // installation_id
-            "test-owner",   // repo_owner
-            "test-repo",    // repo_name
-            "abc123def456", // head_sha
-            completed_at,
-        );
-
-        // Verify the check run is marked as completed with skipped conclusion
-        assert_eq!(request.status, Some(CheckRunStatus::Completed));
-        assert_eq!(request.conclusion, Some(CheckRunConclusion::Skipped));
-        assert_eq!(request.completed_at, Some(completed_at));
-
-        // Verify the check run name matches the constant
-        assert_eq!(request.name, CHECK_RUN_NAME);
-
-        // Verify the output contains the expected title and summary
-        let output = request.output.expect("output should be present");
-        assert_eq!(output.title, "Reviews disabled for this PR");
-        assert!(
-            output.summary.contains("abc123d"),
-            "summary should contain truncated SHA"
-        );
-        assert!(
-            output.summary.contains("skipped"),
-            "summary should mention 'skipped'"
-        );
-
-        // Verify identifiers are passed through correctly
-        assert_eq!(request.installation_id, 12345);
-        assert_eq!(request.repo_owner, "test-owner");
-        assert_eq!(request.repo_name, "test-repo");
-        assert_eq!(request.head_sha, "abc123def456");
-    }
-
-    fn create_pending_batch(
-        batch_id: &str,
-        repo_owner: &str,
-        repo_name: &str,
-        pr_number: u64,
-        head_sha: &str,
-    ) -> crate::PendingBatch {
-        crate::PendingBatch {
-            batch_id: batch_id.to_string(),
-            installation_id: 12345,
-            repo_owner: repo_owner.to_string(),
-            repo_name: repo_name.to_string(),
-            pr_number,
-            comment_id: 999,
-            check_run_id: 888,
-            version: "1.0.0".to_string(),
-            created_at: 1234567890,
-            head_sha: head_sha.to_string(),
-            base_sha: "base123".to_string(),
-        }
-    }
-
-    /// Helper function that mirrors the detection logic in process_code_review.
-    /// Returns true if a matching batch exists.
-    fn has_existing_batch(
-        pending: &HashMap<String, crate::PendingBatch>,
-        repo_owner: &str,
-        repo_name: &str,
-        pr_number: u64,
-        head_sha: &str,
-    ) -> bool {
-        pending.values().any(|batch| {
-            batch.pr_number == pr_number
-                && batch.repo_owner == repo_owner
-                && batch.repo_name == repo_name
-                && batch.head_sha == head_sha
-        })
-    }
-
-    #[test]
-    fn test_duplicate_batch_detection() {
-        // This test verifies that we correctly detect when a batch already exists
-        // for a given PR and commit, preventing duplicate reviews.
-        //
-        // This is important because:
-        // 1. PR edit events (pull_request.edited) can trigger reviews for commits
-        //    that are already being reviewed
-        // 2. Multiple webhooks can arrive in quick succession for the same commit
-        // 3. Duplicate batches waste OpenAI API credits
-
-        let mut pending_batches: HashMap<String, crate::PendingBatch> = HashMap::new();
-
-        // Add a pending batch for PR #16 in owner/repo at commit abc123
-        pending_batches.insert(
-            "batch_existing".to_string(),
-            create_pending_batch("batch_existing", "owner", "repo", 16, "abc123"),
-        );
-
-        // Test 1: Exact match should be detected as duplicate
-        assert!(
-            has_existing_batch(&pending_batches, "owner", "repo", 16, "abc123"),
-            "Should detect existing batch for same PR and commit"
-        );
-
-        // Test 2: Different PR number should NOT be detected as duplicate
-        assert!(
-            !has_existing_batch(&pending_batches, "owner", "repo", 17, "abc123"),
-            "Different PR number should not match"
-        );
-
-        // Test 3: Different repo owner should NOT be detected as duplicate
-        assert!(
-            !has_existing_batch(&pending_batches, "other", "repo", 16, "abc123"),
-            "Different repo owner should not match"
-        );
-
-        // Test 4: Different repo name should NOT be detected as duplicate
-        assert!(
-            !has_existing_batch(&pending_batches, "owner", "other", 16, "abc123"),
-            "Different repo name should not match"
-        );
-
-        // Test 5: Different commit SHA should NOT be detected as duplicate
-        // This is the key case: a new commit on the same PR should trigger a new review
-        assert!(
-            !has_existing_batch(&pending_batches, "owner", "repo", 16, "def456"),
-            "Different commit SHA should not match - new commits need new reviews"
-        );
-
-        // Test 6: Empty pending batches should not find anything
-        let empty_batches: HashMap<String, crate::PendingBatch> = HashMap::new();
-        assert!(
-            !has_existing_batch(&empty_batches, "owner", "repo", 16, "abc123"),
-            "Empty pending batches should not find anything"
-        );
     }
 }
