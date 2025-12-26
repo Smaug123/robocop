@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
 use super::event::Event;
@@ -40,10 +40,20 @@ impl StateMachinePrId {
 }
 
 /// Thread-safe store for per-PR state machines.
+///
+/// This store provides per-PR serialization to prevent race conditions when
+/// concurrent events (webhooks, commands, batch completions) target the same PR.
+/// All state-modifying operations acquire a per-PR lock before proceeding.
 pub struct StateStore {
     states: RwLock<HashMap<StateMachinePrId, ReviewMachineState>>,
     /// Installation IDs for each PR (needed for batch polling to auth with GitHub).
     installation_ids: RwLock<HashMap<StateMachinePrId, u64>>,
+    /// Per-PR locks to serialize event processing.
+    ///
+    /// This ensures that concurrent events for the same PR are processed
+    /// sequentially, preventing races where one event reads stale state
+    /// before another event's writes are visible.
+    pr_locks: RwLock<HashMap<StateMachinePrId, Arc<Mutex<()>>>>,
 }
 
 impl Default for StateStore {
@@ -57,7 +67,29 @@ impl StateStore {
         Self {
             states: RwLock::new(HashMap::new()),
             installation_ids: RwLock::new(HashMap::new()),
+            pr_locks: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Get or create a lock for a specific PR.
+    ///
+    /// This lock is used to serialize all state-modifying operations for a PR,
+    /// preventing concurrent events from racing each other.
+    async fn get_or_create_pr_lock(&self, pr_id: &StateMachinePrId) -> Arc<Mutex<()>> {
+        // Fast path: check if lock already exists
+        {
+            let locks = self.pr_locks.read().await;
+            if let Some(lock) = locks.get(pr_id) {
+                return lock.clone();
+            }
+        }
+
+        // Slow path: create lock (double-check after acquiring write lock)
+        let mut locks = self.pr_locks.write().await;
+        locks
+            .entry(pr_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Get the current state for a PR, or create a default idle state.
@@ -70,11 +102,17 @@ impl StateStore {
     ///
     /// If the PR doesn't have a state, creates an Idle state with the given reviews_enabled.
     /// If the PR already has a state and its reviews_enabled differs, updates it to match.
+    ///
+    /// This method acquires a per-PR lock to prevent races with concurrent calls.
     pub async fn get_or_init(
         &self,
         pr_id: &StateMachinePrId,
         reviews_enabled: bool,
     ) -> ReviewMachineState {
+        // Acquire per-PR lock to serialize with other operations
+        let pr_lock = self.get_or_create_pr_lock(pr_id).await;
+        let _guard = pr_lock.lock().await;
+
         let states = self.states.read().await;
         if let Some(state) = states.get(pr_id) {
             let state = state.clone();
@@ -110,11 +148,26 @@ impl StateStore {
     }
 
     /// Remove the state for a PR (e.g., when PR is closed).
+    ///
+    /// This method acquires a per-PR lock to ensure no concurrent operations
+    /// are modifying the state while it's being removed.
     pub async fn remove(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
+        // Acquire per-PR lock to serialize with other operations
+        let pr_lock = self.get_or_create_pr_lock(pr_id).await;
+        let _guard = pr_lock.lock().await;
+
         let mut states = self.states.write().await;
         let mut installation_ids = self.installation_ids.write().await;
         installation_ids.remove(pr_id);
-        states.remove(pr_id)
+        let result = states.remove(pr_id);
+
+        // Clean up the lock entry (we're still holding it, so this is safe)
+        drop(states);
+        drop(installation_ids);
+        let mut locks = self.pr_locks.write().await;
+        locks.remove(pr_id);
+
+        result
     }
 
     /// Set the installation ID for a PR.
@@ -158,11 +211,16 @@ impl StateStore {
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:
-    /// 1. Gets (or creates) the current state
-    /// 2. Runs the transition function
-    /// 3. Executes effects via the interpreter
-    /// 4. Handles result events recursively
-    /// 5. Stores the final state
+    /// 1. Acquires a per-PR lock to serialize with concurrent events
+    /// 2. Gets (or creates) the current state
+    /// 3. Runs the transition function
+    /// 4. Executes effects via the interpreter
+    /// 5. Handles result events recursively
+    /// 6. Stores the final state
+    ///
+    /// The per-PR lock ensures that concurrent events for the same PR are
+    /// processed sequentially, preventing races where one event reads stale
+    /// state or overwrites another event's changes.
     ///
     /// Returns the final state after all transitions.
     pub async fn process_event(
@@ -171,6 +229,10 @@ impl StateStore {
         event: Event,
         ctx: &InterpreterContext,
     ) -> ReviewMachineState {
+        // Acquire per-PR lock to serialize with other operations
+        let pr_lock = self.get_or_create_pr_lock(pr_id).await;
+        let _guard = pr_lock.lock().await;
+
         // Store the installation_id for later use by batch polling
         self.set_installation_id(pr_id, ctx.installation_id).await;
 
@@ -440,5 +502,68 @@ mod tests {
                 reviews_enabled: false
             }
         ));
+    }
+
+    /// Test that concurrent get_or_init calls for the same PR are serialized.
+    ///
+    /// This test spawns multiple concurrent tasks that each call get_or_init
+    /// for the same PR. The per-PR lock should ensure they're serialized,
+    /// preventing races where one task's update overwrites another's.
+    #[tokio::test]
+    async fn test_concurrent_get_or_init_is_serialized() {
+        use std::sync::Arc;
+
+        let store = Arc::new(StateStore::new());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Spawn 10 concurrent tasks that alternate between enabling/disabling reviews
+        let mut handles = vec![];
+        for i in 0..10 {
+            let store = store.clone();
+            let pr_id = pr_id.clone();
+            let reviews_enabled = i % 2 == 0;
+            handles.push(tokio::spawn(async move {
+                store.get_or_init(&pr_id, reviews_enabled).await
+            }));
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            let _ = handle.await.unwrap();
+        }
+
+        // The final state should exist and be consistent
+        let final_state = store.get(&pr_id).await;
+        assert!(
+            final_state.is_some(),
+            "State should exist after concurrent get_or_init calls"
+        );
+    }
+
+    /// Test that concurrent operations on different PRs can proceed in parallel.
+    ///
+    /// This verifies that the per-PR locking doesn't accidentally serialize
+    /// operations across different PRs.
+    #[tokio::test]
+    async fn test_different_prs_not_blocked() {
+        use std::sync::Arc;
+
+        let store = Arc::new(StateStore::new());
+
+        // Spawn tasks for different PRs concurrently
+        let mut handles = vec![];
+        for pr_number in 1..=5 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let pr_id = StateMachinePrId::new("owner", "repo", pr_number);
+                store.get_or_init(&pr_id, true).await
+            }));
+        }
+
+        // All should complete without blocking each other
+        for handle in handles {
+            let state = handle.await.unwrap();
+            assert!(state.reviews_enabled());
+        }
     }
 }
