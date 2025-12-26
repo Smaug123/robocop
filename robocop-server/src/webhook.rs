@@ -223,21 +223,6 @@ pub async fn github_webhook_handler(
 
                         if let Some(repo) = payload.repository.clone() {
                             if let Some(installation) = &payload.installation {
-                                // Invalidate cached review state on PR edits to ensure we rehydrate
-                                // from the potentially updated PR description
-                                if payload.action.as_deref() == Some("edited") {
-                                    let pr_id = crate::PullRequestId {
-                                        repo_owner: repo.owner.login.clone(),
-                                        repo_name: repo.name.clone(),
-                                        pr_number: pr.number,
-                                    };
-                                    state.review_states.write().await.remove(&pr_id);
-                                    info!(
-                                        "Invalidated cached review state for PR #{} due to edit",
-                                        pr.number
-                                    );
-                                }
-
                                 // Extract review options from PR description if present
                                 let review_options = pr
                                     .body
@@ -661,18 +646,6 @@ async fn process_enable_reviews(
         .process_event(&sm_pr_id, event, &ctx)
         .await;
 
-    // Update the cached review state to reflect the enable command
-    let pr_id = crate::PullRequestId {
-        repo_owner: repo_owner.clone(),
-        repo_name: repo_name.clone(),
-        pr_number,
-    };
-    state
-        .review_states
-        .write()
-        .await
-        .insert(pr_id, crate::ReviewState::Enabled);
-
     info!(
         "Enable reviews completed for PR #{}, final state: {:?}",
         pr_number, final_state
@@ -722,18 +695,6 @@ async fn process_disable_reviews(
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
         .await;
-
-    // Update the cached review state to reflect the disable command
-    let pr_id = crate::PullRequestId {
-        repo_owner: repo_owner.clone(),
-        repo_name: repo_name.clone(),
-        pr_number,
-    };
-    state
-        .review_states
-        .write()
-        .await
-        .insert(pr_id, crate::ReviewState::Disabled);
 
     info!(
         "Disable reviews completed for PR #{}, final state: {:?}",
@@ -865,41 +826,27 @@ async fn process_code_review(
 
     let repo_owner = &repo.owner.login;
     let repo_name = &repo.name;
-    let pr_id = crate::PullRequestId {
-        repo_owner: repo_owner.clone(),
-        repo_name: repo_name.clone(),
-        pr_number: pr.number,
-    };
-
-    // Get or rehydrate review state to determine if reviews are enabled
-    let reviews_enabled = {
-        let states = state.review_states.read().await;
-        if let Some(&cached_state) = states.get(&pr_id) {
-            cached_state == crate::ReviewState::Enabled
-        } else {
-            drop(states); // Release read lock before expensive operation
-
-            // Rehydrate state from PR history
-            let rehydrated_state = crate::review_state::rehydrate_review_state(
-                &state.github_client,
-                correlation_id,
-                installation_id,
-                repo_owner,
-                repo_name,
-                pr.number,
-                state.target_user_id,
-            )
-            .await?;
-
-            // Store it for future use
-            let mut states = state.review_states.write().await;
-            states.insert(pr_id.clone(), rehydrated_state);
-            rehydrated_state == crate::ReviewState::Enabled
-        }
-    };
 
     // Create state machine PR ID
     let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr.number);
+
+    // Determine reviews_enabled: use persisted state if available, otherwise rehydrate
+    let reviews_enabled = if let Some(existing_state) = state.state_store.get(&sm_pr_id).await {
+        existing_state.reviews_enabled()
+    } else {
+        // No persisted state - rehydrate from PR history
+        let rehydrated_state = crate::review_state::rehydrate_review_state(
+            &state.github_client,
+            correlation_id,
+            installation_id,
+            repo_owner,
+            repo_name,
+            pr.number,
+            state.target_user_id,
+        )
+        .await?;
+        rehydrated_state == crate::ReviewState::Enabled
+    };
 
     // Initialize or get existing state from state store
     let _current_state = state

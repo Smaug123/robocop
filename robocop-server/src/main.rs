@@ -6,11 +6,9 @@ use axum::{
     Router,
 };
 use serde_json::json;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, Level};
@@ -20,7 +18,7 @@ use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
 use robocop_server::webhook::webhook_router;
-use robocop_server::{AppState, RecordingLogger, StateStore};
+use robocop_server::{AppState, PersistentStateStore, RecordingLogger};
 
 async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(json!({
@@ -92,7 +90,8 @@ async fn help_handler(headers: HeaderMap) -> Response {
             "optional_env_vars": [
                 "PORT (default: 3000)",
                 "RECORDING_ENABLED (default: false)",
-                "RECORDING_LOG_PATH (default: recordings.jsonl)"
+                "RECORDING_LOG_PATH (default: recordings.jsonl)",
+                "SQLITE_DB_PATH (default: robocop.db)"
             ]
         },
         "documentation": "https://github.com/Smaug123/robocop"
@@ -150,13 +149,18 @@ async fn main() -> Result<()> {
             .map(|l: &RecordingLogger| l.clone_for_middleware()),
     );
 
+    // Initialize persistent state store (loads persisted states from SQLite)
+    let state_store = PersistentStateStore::new(Path::new(&config.sqlite_db_path))
+        .await
+        .expect("Failed to initialize persistent state store");
+    info!("SQLite database initialized at: {}", config.sqlite_db_path);
+
     let app_state = Arc::new(AppState {
         github_client: Arc::new(github_client),
         openai_client: Arc::new(openai_client),
         webhook_secret: config.github_webhook_secret,
         target_user_id: config.target_user_id,
-        review_states: Arc::new(RwLock::new(HashMap::new())),
-        state_store: Arc::new(StateStore::new()),
+        state_store: Arc::new(state_store),
         recording_logger,
     });
 
