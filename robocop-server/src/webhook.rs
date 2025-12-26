@@ -90,6 +90,20 @@ pub struct WebhookResponse {
     pub message: String,
 }
 
+/// Describes how a code review was triggered.
+///
+/// Groups the parameters that vary based on how the review was requested
+/// (automatic via webhook, manual via comment command, etc.).
+struct CodeReviewTrigger {
+    /// Whether to force a review even if reviews are disabled.
+    force_review: bool,
+    /// Custom options for the review (model, reasoning effort).
+    options: Option<command::ReviewOptions>,
+    /// The webhook action that triggered this review (e.g., "opened", "synchronize", "edited").
+    /// For "edited" events, we rehydrate state to pick up PR description changes.
+    action: Option<String>,
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 fn verify_github_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
@@ -241,6 +255,11 @@ pub async fn github_webhook_handler(
                                 let installation_id = installation.id;
                                 let correlation_id_clone = correlation_id.clone();
 
+                                let trigger = CodeReviewTrigger {
+                                    force_review: false,
+                                    options: review_options,
+                                    action: payload.action.clone(),
+                                };
                                 tokio::spawn(async move {
                                     info!("Spawned background task for code review processing");
 
@@ -250,8 +269,7 @@ pub async fn github_webhook_handler(
                                         installation_id,
                                         repo,
                                         pr_clone,
-                                        false, // force_review: false for automatic triggers
-                                        review_options,
+                                        trigger,
                                     )
                                     .await
                                     {
@@ -795,16 +813,12 @@ async fn process_manual_review(
     };
 
     // Use the state machine code review logic with force flag and review options
-    process_code_review(
-        correlation_id,
-        state,
-        installation_id,
-        repo,
-        pr,
-        true,
-        Some(review_options),
-    )
-    .await
+    let trigger = CodeReviewTrigger {
+        force_review: true,
+        options: Some(review_options),
+        action: None, // Manual reviews don't have a webhook action
+    };
+    process_code_review(correlation_id, state, installation_id, repo, pr, trigger).await
 }
 
 /// Process a code review using the state machine.
@@ -816,12 +830,11 @@ async fn process_code_review(
     installation_id: u64,
     repo: Repository,
     pr: PullRequest,
-    force_review: bool,
-    review_options: Option<command::ReviewOptions>,
+    trigger: CodeReviewTrigger,
 ) -> anyhow::Result<()> {
     info!(
         "Processing code review (v2) for PR #{} in {} (force: {}, options: {:?})",
-        pr.number, repo.full_name, force_review, review_options
+        pr.number, repo.full_name, trigger.force_review, trigger.options
     );
 
     let repo_owner = &repo.owner.login;
@@ -830,11 +843,29 @@ async fn process_code_review(
     // Create state machine PR ID
     let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr.number);
 
-    // Determine reviews_enabled: use persisted state if available, otherwise rehydrate
-    let reviews_enabled = if let Some(existing_state) = state.state_store.get(&sm_pr_id).await {
-        existing_state.reviews_enabled()
+    // Determine reviews_enabled:
+    // - For "edited" events, always rehydrate to pick up PR description changes
+    // - Otherwise, use persisted state if available, or rehydrate if not
+    let is_edited = trigger.action.as_deref() == Some("edited");
+    let reviews_enabled = if !is_edited {
+        if let Some(existing_state) = state.state_store.get(&sm_pr_id).await {
+            existing_state.reviews_enabled()
+        } else {
+            // No persisted state - rehydrate from PR history
+            let rehydrated_state = crate::review_state::rehydrate_review_state(
+                &state.github_client,
+                correlation_id,
+                installation_id,
+                repo_owner,
+                repo_name,
+                pr.number,
+                state.target_user_id,
+            )
+            .await?;
+            rehydrated_state == crate::ReviewState::Enabled
+        }
     } else {
-        // No persisted state - rehydrate from PR history
+        // "edited" event - always rehydrate to pick up PR description changes
         let rehydrated_state = crate::review_state::rehydrate_review_state(
             &state.github_client,
             correlation_id,
@@ -855,14 +886,14 @@ async fn process_code_review(
         .await;
 
     // Create the appropriate event
-    let event = if force_review {
-        review_requested_event(&pr.head.sha, &pr.base.sha, review_options)
+    let event = if trigger.force_review {
+        review_requested_event(&pr.head.sha, &pr.base.sha, trigger.options)
     } else {
         pr_updated_event(
             &pr.head.sha,
             &pr.base.sha,
             false, // force_review
-            review_options,
+            trigger.options,
         )
     };
 
