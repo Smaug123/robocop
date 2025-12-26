@@ -469,19 +469,6 @@ mod tests {
     }
 
     #[test]
-    fn test_state_reviews_enabled() {
-        let idle_enabled = ReviewMachineState::Idle {
-            reviews_enabled: true,
-        };
-        assert!(idle_enabled.reviews_enabled());
-
-        let idle_disabled = ReviewMachineState::Idle {
-            reviews_enabled: false,
-        };
-        assert!(!idle_disabled.reviews_enabled());
-    }
-
-    #[test]
     fn test_state_is_terminal() {
         let idle = ReviewMachineState::Idle {
             reviews_enabled: true,

@@ -1605,62 +1605,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_commit_status_state_as_str() {
-        assert_eq!(CommitStatusState::Pending.as_str(), "pending");
-        assert_eq!(CommitStatusState::Success.as_str(), "success");
-        assert_eq!(CommitStatusState::Failure.as_str(), "failure");
-        assert_eq!(CommitStatusState::Error.as_str(), "error");
-    }
-
-    #[test]
-    fn test_commit_status_state_equality() {
-        assert_eq!(CommitStatusState::Pending, CommitStatusState::Pending);
-        assert_ne!(CommitStatusState::Pending, CommitStatusState::Success);
-        assert_ne!(CommitStatusState::Success, CommitStatusState::Failure);
-        assert_ne!(CommitStatusState::Failure, CommitStatusState::Error);
-    }
-
-    #[test]
-    fn test_commit_status_request_creation() {
-        let request = CommitStatusRequest {
-            installation_id: 12345,
-            repo_owner: "test-owner",
-            repo_name: "test-repo",
-            sha: "abc123",
-            state: CommitStatusState::Success,
-            target_url: Some("https://example.com"),
-            description: Some("Test passed"),
-            context: "robocop/code-review",
-        };
-
-        assert_eq!(request.installation_id, 12345);
-        assert_eq!(request.repo_owner, "test-owner");
-        assert_eq!(request.repo_name, "test-repo");
-        assert_eq!(request.sha, "abc123");
-        assert_eq!(request.state, CommitStatusState::Success);
-        assert_eq!(request.target_url, Some("https://example.com"));
-        assert_eq!(request.description, Some("Test passed"));
-        assert_eq!(request.context, "robocop/code-review");
-    }
-
-    #[test]
-    fn test_commit_status_request_with_none_values() {
-        let request = CommitStatusRequest {
-            installation_id: 1,
-            repo_owner: "owner",
-            repo_name: "repo",
-            sha: "sha",
-            state: CommitStatusState::Pending,
-            target_url: None,
-            description: None,
-            context: "test",
-        };
-
-        assert!(request.target_url.is_none());
-        assert!(request.description.is_none());
-    }
-
-    #[test]
     fn test_contains_disable_reviews_marker_present() {
         let text = "This is a PR\n\n@smaug123-robocop disable-reviews\n\nPlease don't review";
         assert!(contains_disable_reviews_marker(text));

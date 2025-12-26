@@ -348,26 +348,4 @@ mod tests {
         );
         assert_eq!(BatchStatus::parse("unknown"), None);
     }
-
-    #[test]
-    fn test_event_construction() {
-        let event = Event::PrUpdated {
-            head_sha: CommitSha::from("abc123"),
-            base_sha: CommitSha::from("def456"),
-            force_review: false,
-            options: ReviewOptions::default(),
-        };
-
-        if let Event::PrUpdated {
-            head_sha,
-            force_review,
-            ..
-        } = event
-        {
-            assert_eq!(head_sha.0, "abc123");
-            assert!(!force_review);
-        } else {
-            panic!("Expected PrUpdated event");
-        }
-    }
 }

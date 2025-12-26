@@ -77,13 +77,3 @@ impl GitOps {
         sha.len() >= 7 && sha.len() <= 40 && sha.chars().all(|c| c.is_ascii_hexdigit())
     }
 }
-
-#[cfg(test)]
-mod tests {
-
-    #[tokio::test]
-    async fn test_commit_operations() {
-        // These tests would require a proper GitHub mock with snapshot responses
-        // For now, they're commented out
-    }
-}
