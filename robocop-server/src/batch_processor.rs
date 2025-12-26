@@ -229,15 +229,6 @@ struct ResponsesApiContent {
     text: Option<String>,
 }
 
-/// Intermediate struct for parsing the raw JSON response.
-#[derive(Debug, serde::Deserialize)]
-struct ParsedReviewResult {
-    #[serde(rename = "substantiveComments")]
-    substantive_comments: serde_json::Value, // Can be bool or array
-    summary: String,
-    reasoning: Option<String>,
-}
-
 fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
     // Parse the JSONL - should be exactly one line
     let line = jsonl_content.lines().next().context("Empty batch output")?;
@@ -275,52 +266,10 @@ fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
         .find(|c| c.content_type == "output_text" && c.text.is_some())
         .context("No output_text content found in message")?;
 
-    let parsed: ParsedReviewResult = serde_json::from_str(text_content.text.as_ref().unwrap())
+    let result: ReviewResult = serde_json::from_str(text_content.text.as_ref().unwrap())
         .context("Failed to parse review result JSON")?;
 
-    // Convert to state machine ReviewResult
-    let reasoning = parsed.reasoning.unwrap_or_default();
-
-    // Check if substantive_comments is a boolean false or an empty array
-    let has_issues = match &parsed.substantive_comments {
-        serde_json::Value::Bool(b) => *b,
-        serde_json::Value::Array(arr) => !arr.is_empty(),
-        _ => false,
-    };
-
-    if has_issues {
-        // Parse comments if present
-        let comments = if let serde_json::Value::Array(arr) = &parsed.substantive_comments {
-            arr.iter()
-                .filter_map(|c| {
-                    let file_path = c.get("filePath")?.as_str()?.to_string();
-                    let content = c.get("comment")?.as_str()?.to_string();
-                    let line_number = c
-                        .get("lineNumber")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as u32);
-                    Some(crate::state_machine::ReviewComment {
-                        file_path,
-                        line_number,
-                        content,
-                    })
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        Ok(ReviewResult::HasIssues {
-            summary: parsed.summary,
-            reasoning,
-            comments,
-        })
-    } else {
-        Ok(ReviewResult::NoIssues {
-            summary: parsed.summary,
-            reasoning,
-        })
-    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -333,10 +282,9 @@ mod tests {
         // Includes reasoning field as required by the strict schema
         let jsonl = r#"{"response":{"status_code":200,"body":{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"reasoning\":\"No issues found in the code.\",\"substantiveComments\":false,\"summary\":\"All good\"}"}]}]}},"error":null}"#;
         let result = parse_batch_output(jsonl).unwrap();
-        assert!(matches!(result, ReviewResult::NoIssues { .. }));
-        if let ReviewResult::NoIssues { summary, .. } = result {
-            assert_eq!(summary, "All good");
-        }
+        assert!(!result.substantive_comments);
+        assert_eq!(result.summary, "All good");
+        assert_eq!(result.reasoning, "No issues found in the code.");
     }
 
     #[test]
@@ -345,10 +293,12 @@ mod tests {
         // Includes reasoning field as required by the strict schema
         let jsonl = r#"{"response":{"status_code":200,"body":{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"reasoning\":\"Found a potential null pointer dereference.\",\"substantiveComments\":true,\"summary\":\"Found issues\"}"}]}]}},"error":null}"#;
         let result = parse_batch_output(jsonl).unwrap();
-        assert!(matches!(result, ReviewResult::HasIssues { .. }));
-        if let ReviewResult::HasIssues { summary, .. } = result {
-            assert_eq!(summary, "Found issues");
-        }
+        assert!(result.substantive_comments);
+        assert_eq!(result.summary, "Found issues");
+        assert_eq!(
+            result.reasoning,
+            "Found a potential null pointer dereference."
+        );
     }
 
     #[test]

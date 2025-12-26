@@ -186,9 +186,10 @@ mod tests {
         };
         let event = Event::BatchCompleted {
             batch_id: BatchId::from("batch_123".to_string()),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "Code looks good".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 
@@ -312,9 +313,10 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 
@@ -1384,9 +1386,10 @@ mod tests {
         // and the batch completed anyway), we should handle it gracefully
         let event = Event::BatchCompleted {
             batch_id: BatchId::from("batch_123".to_string()),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "All good".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 
@@ -1463,9 +1466,10 @@ mod tests {
         // Batch completes while we're waiting for ancestry check
         let event = Event::BatchCompleted {
             batch_id: BatchId::from("batch_123".to_string()),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "Code looks good".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 
@@ -1685,10 +1689,10 @@ mod tests {
 
         let event = Event::BatchCompleted {
             batch_id: BatchId::from("batch_123".to_string()),
-            result: ReviewResult::HasIssues {
-                summary: long_summary,
+            result: ReviewResult {
                 reasoning: "Detailed reasoning".to_string(),
-                comments: vec![],
+                substantive_comments: true,
+                summary: long_summary,
             },
         };
 
@@ -1733,10 +1737,10 @@ mod tests {
 
         let event = Event::BatchCompleted {
             batch_id: BatchId::from("batch_123".to_string()),
-            result: ReviewResult::HasIssues {
-                summary: multiline_summary.to_string(),
+            result: ReviewResult {
                 reasoning: "Reasoning".to_string(),
-                comments: vec![],
+                substantive_comments: true,
+                summary: multiline_summary.to_string(),
             },
         };
 
@@ -2131,15 +2135,13 @@ mod property_tests {
     }
 
     fn arb_review_result() -> impl Strategy<Value = ReviewResult> {
-        prop_oneof![
-            (".*", ".*")
-                .prop_map(|(summary, reasoning)| ReviewResult::NoIssues { summary, reasoning }),
-            (".*", ".*").prop_map(|(summary, reasoning)| ReviewResult::HasIssues {
-                summary,
+        (".*", proptest::bool::ANY, ".*").prop_map(|(reasoning, substantive_comments, summary)| {
+            ReviewResult {
                 reasoning,
-                comments: vec![], // Simplified for now
-            }),
-        ]
+                substantive_comments,
+                summary,
+            }
+        })
     }
 
     fn arb_failure_reason() -> impl Strategy<Value = FailureReason> {

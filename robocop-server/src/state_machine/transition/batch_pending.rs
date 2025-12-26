@@ -5,9 +5,7 @@ use crate::state_machine::effect::{
     CommentContent, Effect, EffectCheckRunConclusion, EffectCheckRunStatus, LogLevel,
 };
 use crate::state_machine::event::Event;
-use crate::state_machine::state::{
-    CancellationReason, FailureReason, ReviewMachineState, ReviewResult,
-};
+use crate::state_machine::state::{CancellationReason, FailureReason, ReviewMachineState};
 
 /// Handle transitions from the BatchPending state.
 ///
@@ -60,18 +58,21 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 result,
             },
         ) if batch_id == &event_batch_id => {
-            let conclusion = match &result {
-                ReviewResult::NoIssues { .. } => EffectCheckRunConclusion::Success,
-                ReviewResult::HasIssues { .. } => EffectCheckRunConclusion::Failure,
+            let conclusion = if result.substantive_comments {
+                EffectCheckRunConclusion::Failure
+            } else {
+                EffectCheckRunConclusion::Success
             };
-            let (title, result_summary) = match &result {
-                ReviewResult::NoIssues { summary, .. } => {
-                    ("Code review passed".to_string(), summary.clone())
-                }
-                ReviewResult::HasIssues { summary, .. } => (
-                    sanitize_check_run_title(&format!("Code review found issues: {}", summary)),
-                    summary.clone(),
-                ),
+            let (title, result_summary) = if result.substantive_comments {
+                (
+                    sanitize_check_run_title(&format!(
+                        "Code review found issues: {}",
+                        result.summary
+                    )),
+                    result.summary.clone(),
+                )
+            } else {
+                ("Code review passed".to_string(), result.summary.clone())
             };
 
             let new_state = ReviewMachineState::Completed {
@@ -497,7 +498,9 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_machine::state::{BatchId, CheckRunId, CommentId, CommitSha, ReviewOptions};
+    use crate::state_machine::state::{
+        BatchId, CheckRunId, CommentId, CommitSha, ReviewOptions, ReviewResult,
+    };
 
     #[test]
     fn test_batch_pending_to_completed() {
@@ -513,9 +516,10 @@ mod tests {
         };
         let event = Event::BatchCompleted {
             batch_id: BatchId::from("batch_123".to_string()),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "Code looks good".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 

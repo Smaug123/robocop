@@ -196,19 +196,10 @@ impl Event {
                 )
             }
             Event::BatchCompleted { batch_id, result } => {
-                let result_summary = match result {
-                    ReviewResult::NoIssues { .. } => "NoIssues",
-                    ReviewResult::HasIssues { comments, .. } => {
-                        if comments.is_empty() {
-                            "HasIssues(0 comments)"
-                        } else {
-                            return format!(
-                                "BatchCompleted {{ batch: {}, result: HasIssues({} comments) }}",
-                                batch_id,
-                                comments.len()
-                            );
-                        }
-                    }
+                let result_summary = if result.substantive_comments {
+                    "HasIssues"
+                } else {
+                    "NoIssues"
                 };
                 format!(
                     "BatchCompleted {{ batch: {}, result: {} }}",

@@ -12,9 +12,7 @@ use super::effect::{
     CommentContent, Effect, EffectCheckRunConclusion, EffectCheckRunStatus, LogLevel,
 };
 use super::event::{DataFetchFailure, Event, FileContent};
-use super::state::{
-    BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, ReviewOptions, ReviewResult,
-};
+use super::state::{BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, ReviewOptions};
 use crate::github::{
     CheckRunOutput, CheckRunStatus, CreateCheckRunRequest, FileContentRequest, FileSizeLimits,
     GitHubClient, PullRequestInfo, UpdateCheckRunRequest,
@@ -398,45 +396,22 @@ fn format_comment_content(content: &CommentContent) -> String {
             batch_id,
             result,
         } => {
-            let (icon, summary) = match result {
-                ReviewResult::NoIssues { summary, .. } => ("✅", summary.clone()),
-                ReviewResult::HasIssues { summary, .. } => ("🤖", summary.clone()),
-            };
-
-            let reasoning = match result {
-                ReviewResult::NoIssues { reasoning, .. } => reasoning,
-                ReviewResult::HasIssues { reasoning, .. } => reasoning,
-            };
-
-            let comments_section = match result {
-                ReviewResult::HasIssues { comments, .. } if !comments.is_empty() => {
-                    let formatted: Vec<String> = comments
-                        .iter()
-                        .map(|c| {
-                            if let Some(line) = c.line_number {
-                                format!("- **{}:{}**: {}", c.file_path, line, c.content)
-                            } else {
-                                format!("- **{}**: {}", c.file_path, c.content)
-                            }
-                        })
-                        .collect();
-                    format!("\n\n### Comments\n{}", formatted.join("\n"))
-                }
-                _ => String::new(),
+            let icon = if result.substantive_comments {
+                "🤖"
+            } else {
+                "✅"
             };
 
             format!(
                 "{} **Code Review Complete**\n\n\
                 Commit: `{}`\n\n\
                 ## Summary\n{}\n\n\
-                <details>\n<summary>Reasoning</summary>\n\n{}\n</details>\
-                {}\n\n\
+                <details>\n<summary>Reasoning</summary>\n\n{}\n</details>\n\n\
                 ---\n_Robocop v{} | Batch: `{}`_",
                 icon,
                 head_sha.short(),
-                summary,
-                reasoning,
-                comments_section,
+                result.summary,
+                result.reasoning,
                 version,
                 batch_id
             )
@@ -867,6 +842,7 @@ async fn execute_cancel_batch(ctx: &InterpreterContext, batch_id: &BatchId) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_machine::state::ReviewResult;
 
     #[test]
     fn test_format_comment_in_progress() {
@@ -889,9 +865,10 @@ mod tests {
         let content = CommentContent::ReviewComplete {
             head_sha: CommitSha::from("abc123"),
             batch_id: BatchId::from("batch_456".to_string()),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "Code looks good".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 

@@ -283,9 +283,10 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 
@@ -305,9 +306,10 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha::from("old_sha"),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 
@@ -337,9 +339,10 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: false,
             head_sha: CommitSha::from("old_sha"),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 
@@ -366,9 +369,10 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: false,
             head_sha: CommitSha::from("abc123"),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".to_string(),
+            result: ReviewResult {
                 reasoning: "".to_string(),
+                substantive_comments: false,
+                summary: "LGTM".to_string(),
             },
         };
 

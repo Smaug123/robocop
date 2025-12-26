@@ -5,7 +5,7 @@ use crate::state_machine::effect::{
     CommentContent, Effect, EffectCheckRunConclusion, EffectCheckRunStatus, LogLevel,
 };
 use crate::state_machine::event::Event;
-use crate::state_machine::state::{CancellationReason, ReviewMachineState, ReviewResult};
+use crate::state_machine::state::{CancellationReason, ReviewMachineState};
 
 /// Handle transitions from the AwaitingAncestryCheck state.
 ///
@@ -382,14 +382,14 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Stale),
                     title: format!("Superseded by {}", new_head_sha.short()),
                     summary: format!(
-                        "Review completed but superseded by newer commit: {}. Result was: {}",
+                        "Review completed but superseded by newer commit: {}. Result was: {} - {}",
                         new_head_sha.short(),
-                        match &result {
-                            ReviewResult::NoIssues { summary, .. } =>
-                                format!("No issues - {}", summary),
-                            ReviewResult::HasIssues { summary, .. } =>
-                                format!("Issues found - {}", summary),
-                        }
+                        if result.substantive_comments {
+                            "Issues found"
+                        } else {
+                            "No issues"
+                        },
+                        result.summary
                     ),
                     external_id: None,
                 });
@@ -450,12 +450,10 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                     conclusion: Some(EffectCheckRunConclusion::Stale),
                     title: format!("Superseded by {}", new_head_sha.short()),
                     summary: format!(
-                        "Review completed but superseded by newer commit: {} (reviews disabled). Result was: {}",
+                        "Review completed but superseded by newer commit: {} (reviews disabled). Result was: {} - {}",
                         new_head_sha.short(),
-                        match &result {
-                            ReviewResult::NoIssues { summary, .. } => format!("No issues - {}", summary),
-                            ReviewResult::HasIssues { summary, .. } => format!("Issues found - {}", summary),
-                        }
+                        if result.substantive_comments { "Issues found" } else { "No issues" },
+                        result.summary
                     ),
                     external_id: None,
                 });

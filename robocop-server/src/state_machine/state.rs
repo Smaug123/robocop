@@ -4,6 +4,7 @@
 //! Following the principle of "make illegal states unrepresentable", we use
 //! an enum that captures exactly what states are valid.
 
+use serde::Deserialize;
 use std::fmt;
 
 /// Newtype for commit SHA to prevent mixing with other strings.
@@ -72,24 +73,13 @@ impl From<u64> for CheckRunId {
 }
 
 /// Result of a completed code review.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewResult {
-    /// No issues found in the code.
-    NoIssues { summary: String, reasoning: String },
-    /// Issues were found that need attention.
-    HasIssues {
-        summary: String,
-        reasoning: String,
-        comments: Vec<ReviewComment>,
-    },
-}
-
-/// A single comment from the code review.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewComment {
-    pub file_path: String,
-    pub line_number: Option<u32>,
-    pub content: String,
+/// Matches the schema sent to OpenAI.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReviewResult {
+    pub reasoning: String,
+    #[serde(rename = "substantiveComments")]
+    pub substantive_comments: bool,
+    pub summary: String,
 }
 
 /// Reason why a batch failed.
@@ -501,9 +491,10 @@ mod tests {
         let completed = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha("abc123".into()),
-            result: ReviewResult::NoIssues {
-                summary: "LGTM".into(),
+            result: ReviewResult {
                 reasoning: "Code looks good".into(),
+                substantive_comments: false,
+                summary: "LGTM".into(),
             },
         };
         assert!(completed.is_terminal());
