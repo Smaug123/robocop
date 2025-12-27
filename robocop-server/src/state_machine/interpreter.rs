@@ -694,7 +694,7 @@ async fn execute_submit_batch(
     base_sha: &CommitSha,
     options: &ReviewOptions,
 ) -> EffectResult {
-    use crate::db::BatchSubmissionKey;
+    use crate::db::{BatchSubmissionData, BatchSubmissionKey};
     use robocop_core::ReviewMetadata;
 
     let correlation_id = ctx.correlation_id.as_deref();
@@ -717,12 +717,12 @@ async fn execute_submit_batch(
         head_sha: head_sha.0.clone(),
     };
 
-    // Phase 1: Reserve slot (or get cached batch_id if already submitted)
-    let existing_batch_id = {
+    // Phase 1: Reserve slot (or get cached batch data if already submitted)
+    let cached_submission = {
         let db = ctx.db.clone();
         let key = key.clone();
         match tokio::task::spawn_blocking(move || db.reserve_batch_submission(&key)).await {
-            Ok(Ok(batch_id)) => batch_id,
+            Ok(Ok(cached)) => cached,
             Ok(Err(e)) => {
                 error!("Failed to reserve batch submission: {}", e);
                 // Continue without idempotency protection
@@ -735,20 +735,21 @@ async fn execute_submit_batch(
         }
     };
 
-    // If already submitted, return cached result
-    if let Some(batch_id) = existing_batch_id {
+    // If already submitted, return cached result with preserved UI IDs and options
+    if let Some(cached) = cached_submission {
         info!(
             "Returning cached batch {} for PR #{} commit {}",
-            batch_id,
+            cached.batch_id,
             ctx.pr_number,
             head_sha.short()
         );
         return EffectResult::single(Event::BatchSubmitted {
-            batch_id: BatchId(batch_id),
-            comment_id: None, // UI was already created on prior submission
-            check_run_id: None,
-            model,
-            reasoning_effort,
+            batch_id: BatchId(cached.batch_id),
+            comment_id: cached.comment_id.map(CommentId),
+            check_run_id: cached.check_run_id.map(CheckRunId),
+            // Use cached model/reasoning_effort if available, otherwise fall back to current options
+            model: cached.model.unwrap_or(model),
+            reasoning_effort: cached.reasoning_effort.unwrap_or(reasoning_effort),
         });
     }
 
@@ -859,15 +860,30 @@ async fn execute_submit_batch(
         Ok(batch_id) => {
             info!("Submitted batch {} for PR #{}", batch_id, ctx.pr_number);
 
-            // Phase 3: Confirm submission in SQLite
+            // Phase 3: Confirm submission in SQLite with all recovery data
             let db = ctx.db.clone();
             let key = key.clone();
-            let bid = batch_id.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || db.confirm_batch_submission(&key, &bid)).await
+            let data = BatchSubmissionData {
+                batch_id: batch_id.clone(),
+                comment_id: comment_id.map(|c| c.0),
+                check_run_id: check_run_id.map(|c| c.0),
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+            };
+            match tokio::task::spawn_blocking(move || db.confirm_batch_submission(&key, &data))
+                .await
             {
-                // Log but don't fail - the batch was submitted successfully
-                error!("Failed to confirm batch submission in db: {}", e);
+                Ok(Ok(())) => {
+                    // Confirmation succeeded
+                }
+                Ok(Err(db_err)) => {
+                    // DB operation failed - log but don't fail since batch was submitted
+                    error!("Failed to confirm batch submission in db: {}", db_err);
+                }
+                Err(join_err) => {
+                    // spawn_blocking panicked - log but don't fail since batch was submitted
+                    error!("spawn_blocking panicked during confirm: {}", join_err);
+                }
             }
 
             EffectResult::single(Event::BatchSubmitted {

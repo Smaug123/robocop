@@ -99,9 +99,6 @@ struct CodeReviewTrigger {
     force_review: bool,
     /// Custom options for the review (model, reasoning effort).
     options: Option<command::ReviewOptions>,
-    /// The webhook action that triggered this review (e.g., "opened", "synchronize", "edited").
-    /// For "edited" events, we rehydrate state to pick up PR description changes.
-    action: Option<String>,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -258,7 +255,6 @@ pub async fn github_webhook_handler(
                                 let trigger = CodeReviewTrigger {
                                     force_review: false,
                                     options: review_options,
-                                    action: payload.action.clone(),
                                 };
                                 tokio::spawn(async move {
                                     info!("Spawned background task for code review processing");
@@ -819,7 +815,6 @@ async fn process_manual_review(
     let trigger = CodeReviewTrigger {
         force_review: true,
         options: Some(review_options),
-        action: None, // Manual reviews don't have a webhook action
     };
     process_code_review(correlation_id, state, installation_id, repo, pr, trigger).await
 }
@@ -846,41 +841,25 @@ async fn process_code_review(
     // Create state machine PR ID
     let sm_pr_id = StateMachinePrId::new(repo_owner, repo_name, pr.number);
 
-    // Determine reviews_enabled:
-    // - For "edited" events, always rehydrate to pick up PR description changes
-    // - Otherwise, use persisted state if available, or rehydrate if not
-    let is_edited = trigger.action.as_deref() == Some("edited");
-    let reviews_enabled = if !is_edited {
-        if let Some(existing_state) = state.state_store.get(&sm_pr_id).await {
-            existing_state.reviews_enabled()
-        } else {
-            // No persisted state - rehydrate from PR history
-            let rehydrated_state = crate::review_state::rehydrate_review_state(
-                &state.github_client,
-                correlation_id,
-                installation_id,
-                repo_owner,
-                repo_name,
-                pr.number,
-                state.target_user_id,
-            )
-            .await?;
-            rehydrated_state == crate::ReviewState::Enabled
-        }
-    } else {
-        // "edited" event - always rehydrate to pick up PR description changes
-        let rehydrated_state = crate::review_state::rehydrate_review_state(
-            &state.github_client,
-            correlation_id,
-            installation_id,
-            repo_owner,
-            repo_name,
-            pr.number,
-            state.target_user_id,
-        )
-        .await?;
-        rehydrated_state == crate::ReviewState::Enabled
-    };
+    // Always rehydrate reviews_enabled from GitHub history.
+    //
+    // We cannot rely on persisted state because:
+    // 1. Webhooks may have been missed while the server was down
+    // 2. Enable/disable commands may have been processed by another instance
+    // 3. The PR description (which can contain enable/disable directives) may have changed
+    //
+    // Rehydrating from GitHub ensures we have the authoritative state.
+    let rehydrated_state = crate::review_state::rehydrate_review_state(
+        &state.github_client,
+        correlation_id,
+        installation_id,
+        repo_owner,
+        repo_name,
+        pr.number,
+        state.target_user_id,
+    )
+    .await?;
+    let reviews_enabled = rehydrated_state == crate::ReviewState::Enabled;
 
     // Initialize or get existing state from state store
     let _current_state = state

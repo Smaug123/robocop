@@ -28,7 +28,7 @@ use crate::state_machine::store::StateMachinePrId;
 /// 1. Increment this constant
 /// 2. Add a migration function `migrate_v{N}_to_v{N+1}`
 /// 3. Call it from `run_migrations`
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Key for batch submission idempotency.
 ///
@@ -39,6 +39,29 @@ pub struct BatchSubmissionKey {
     pub repo_name: String,
     pub pr_number: u64,
     pub head_sha: String,
+}
+
+/// Cached batch submission data returned when a batch was already submitted.
+///
+/// Contains all the data needed to reconstruct the `BatchSubmitted` event
+/// after recovering from a crash.
+#[derive(Debug, Clone)]
+pub struct CachedBatchSubmission {
+    pub batch_id: String,
+    pub comment_id: Option<u64>,
+    pub check_run_id: Option<u64>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Data to store when confirming a batch submission.
+#[derive(Debug, Clone)]
+pub struct BatchSubmissionData {
+    pub batch_id: String,
+    pub comment_id: Option<u64>,
+    pub check_run_id: Option<u64>,
+    pub model: String,
+    pub reasoning_effort: String,
 }
 
 /// SQLite database for persisting PR state machine states.
@@ -115,10 +138,10 @@ impl SqliteDb {
             Self::migrate_v0_to_v1(conn)?;
         }
 
-        // Future migrations go here:
-        // if from_version < 2 {
-        //     Self::migrate_v1_to_v2(conn)?;
-        // }
+        // Migration v1 -> v2: Add UI IDs and options to batch_submissions
+        if from_version < 2 {
+            Self::migrate_v1_to_v2(conn)?;
+        }
 
         Ok(())
     }
@@ -206,6 +229,25 @@ impl SqliteDb {
             "#,
         )
         .context("Failed to create initial schema (v0 -> v1)")?;
+
+        Ok(())
+    }
+
+    /// Migration v1 -> v2: Add UI IDs and options to batch_submissions for recovery.
+    ///
+    /// These columns allow returning the correct comment_id, check_run_id, model,
+    /// and reasoning_effort when a batch submission is retrieved from cache after
+    /// a crash between submission and state persistence.
+    fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE batch_submissions ADD COLUMN comment_id INTEGER;
+            ALTER TABLE batch_submissions ADD COLUMN check_run_id INTEGER;
+            ALTER TABLE batch_submissions ADD COLUMN model TEXT;
+            ALTER TABLE batch_submissions ADD COLUMN reasoning_effort TEXT;
+            "#,
+        )
+        .context("Failed to add UI columns to batch_submissions (v1 -> v2)")?;
 
         Ok(())
     }
@@ -611,18 +653,32 @@ impl SqliteDb {
     ///
     /// Returns:
     /// - `Ok(None)` if slot was reserved (caller should submit to OpenAI)
-    /// - `Ok(Some(batch_id))` if already submitted (caller should skip OpenAI)
+    /// - `Ok(Some(CachedBatchSubmission))` if already submitted (caller should skip OpenAI)
     ///
     /// If a row exists with `status = 'submitting'` (prior crash mid-submission),
     /// this returns `Ok(None)` and the caller will re-submit, potentially creating
     /// a duplicate batch in OpenAI. The old batch will expire after 24h.
-    pub fn reserve_batch_submission(&self, key: &BatchSubmissionKey) -> Result<Option<String>> {
+    pub fn reserve_batch_submission(
+        &self,
+        key: &BatchSubmissionKey,
+    ) -> Result<Option<CachedBatchSubmission>> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
+        // Intermediate struct for query result
+        struct BatchRow {
+            status: String,
+            batch_id: Option<String>,
+            comment_id: Option<u64>,
+            check_run_id: Option<u64>,
+            model: Option<String>,
+            reasoning_effort: Option<String>,
+        }
+
         // Check if already submitted
-        let existing: Option<(String, Option<String>)> = conn
+        let existing: Option<BatchRow> = conn
             .query_row(
-                "SELECT status, batch_id FROM batch_submissions \
+                "SELECT status, batch_id, comment_id, check_run_id, model, reasoning_effort \
+                 FROM batch_submissions \
                  WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
                 rusqlite::params![
                     &key.repo_owner,
@@ -630,15 +686,61 @@ impl SqliteDb {
                     key.pr_number,
                     &key.head_sha
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok(BatchRow {
+                        status: row.get(0)?,
+                        batch_id: row.get(1)?,
+                        comment_id: row.get(2)?,
+                        check_run_id: row.get(3)?,
+                        model: row.get(4)?,
+                        reasoning_effort: row.get(5)?,
+                    })
+                },
             )
             .optional()
             .context("Failed to query batch_submissions")?;
 
         match existing {
-            Some((status, batch_id)) if status == "submitted" => {
-                // Already submitted - return cached batch_id
-                Ok(batch_id)
+            Some(row) if row.status == "submitted" => {
+                // Already submitted - return cached data
+                // batch_id should always be Some for submitted status, but handle None defensively
+                match row.batch_id {
+                    Some(bid) => Ok(Some(CachedBatchSubmission {
+                        batch_id: bid,
+                        comment_id: row.comment_id,
+                        check_run_id: row.check_run_id,
+                        model: row.model,
+                        reasoning_effort: row.reasoning_effort,
+                    })),
+                    None => {
+                        // Corrupted state: submitted without batch_id. Treat as stale.
+                        conn.execute(
+                            "DELETE FROM batch_submissions \
+                             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
+                            rusqlite::params![
+                                &key.repo_owner,
+                                &key.repo_name,
+                                key.pr_number,
+                                &key.head_sha
+                            ],
+                        )
+                        .context("Failed to delete corrupted submission")?;
+
+                        conn.execute(
+                            "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, status) \
+                             VALUES (?1, ?2, ?3, ?4, 'submitting')",
+                            rusqlite::params![
+                                &key.repo_owner,
+                                &key.repo_name,
+                                key.pr_number,
+                                &key.head_sha
+                            ],
+                        )
+                        .context("Failed to reserve batch submission")?;
+
+                        Ok(None)
+                    }
+                }
             }
             Some(_) => {
                 // Status is 'submitting' - prior crash mid-submission.
@@ -681,19 +783,34 @@ impl SqliteDb {
 
     /// Confirm a batch submission after OpenAI returns successfully.
     ///
-    /// Updates the row from 'submitting' to 'submitted' and records the batch_id.
-    pub fn confirm_batch_submission(&self, key: &BatchSubmissionKey, batch_id: &str) -> Result<()> {
+    /// Updates the row from 'submitting' to 'submitted' and records the batch_id
+    /// along with UI IDs and options for crash recovery.
+    pub fn confirm_batch_submission(
+        &self,
+        key: &BatchSubmissionKey,
+        data: &BatchSubmissionData,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
         conn.execute(
-            "UPDATE batch_submissions SET status = 'submitted', batch_id = ?5 \
+            "UPDATE batch_submissions SET \
+                status = 'submitted', \
+                batch_id = ?5, \
+                comment_id = ?6, \
+                check_run_id = ?7, \
+                model = ?8, \
+                reasoning_effort = ?9 \
              WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
             rusqlite::params![
                 &key.repo_owner,
                 &key.repo_name,
                 key.pr_number,
                 &key.head_sha,
-                batch_id
+                &data.batch_id,
+                data.comment_id,
+                data.check_run_id,
+                &data.model,
+                &data.reasoning_effort,
             ],
         )
         .context("Failed to confirm batch submission")?;
@@ -1354,16 +1471,29 @@ mod tests {
 
         // Reserve and confirm
         db.reserve_batch_submission(&key).expect("should reserve");
-        db.confirm_batch_submission(&key, "batch_123")
+        let data = BatchSubmissionData {
+            batch_id: "batch_123".to_string(),
+            comment_id: Some(100),
+            check_run_id: Some(200),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        db.confirm_batch_submission(&key, &data)
             .expect("should confirm");
 
-        // Second reservation should return the existing batch_id
-        let result = db.reserve_batch_submission(&key).expect("should reserve");
+        // Second reservation should return the cached data
+        let result = db
+            .reserve_batch_submission(&key)
+            .expect("should reserve")
+            .expect("should have cached data");
         assert_eq!(
-            result,
-            Some("batch_123".to_string()),
+            result.batch_id, "batch_123",
             "should return cached batch_id"
         );
+        assert_eq!(result.comment_id, Some(100));
+        assert_eq!(result.check_run_id, Some(200));
+        assert_eq!(result.model, Some("gpt-4".to_string()));
+        assert_eq!(result.reasoning_effort, Some("high".to_string()));
     }
 
     #[test]
@@ -1401,12 +1531,22 @@ mod tests {
 
         // Reserve and confirm
         db.reserve_batch_submission(&key).expect("should reserve");
-        db.confirm_batch_submission(&key, "batch_456")
+        let data = BatchSubmissionData {
+            batch_id: "batch_456".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4o".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        db.confirm_batch_submission(&key, &data)
             .expect("should confirm");
 
         // Verify it's now 'submitted'
-        let result = db.reserve_batch_submission(&key).expect("should reserve");
-        assert_eq!(result, Some("batch_456".to_string()));
+        let result = db
+            .reserve_batch_submission(&key)
+            .expect("should reserve")
+            .expect("should have cached data");
+        assert_eq!(result.batch_id, "batch_456");
     }
 
     #[test]
@@ -1459,7 +1599,14 @@ mod tests {
 
         // key2: submitted (complete)
         db.reserve_batch_submission(&key2).expect("should reserve");
-        db.confirm_batch_submission(&key2, "batch_2")
+        let data2 = BatchSubmissionData {
+            batch_id: "batch_2".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        db.confirm_batch_submission(&key2, &data2)
             .expect("should confirm");
 
         // key3: submitting (incomplete)
@@ -1497,7 +1644,14 @@ mod tests {
 
         // Reserve and confirm key1
         db.reserve_batch_submission(&key1).expect("should reserve");
-        db.confirm_batch_submission(&key1, "batch_1")
+        let data1 = BatchSubmissionData {
+            batch_id: "batch_1".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        db.confirm_batch_submission(&key1, &data1)
             .expect("should confirm");
 
         // key2 should be independent
