@@ -255,7 +255,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::Preparing {
                 reviews_enabled: *reviews_enabled,
                 head_sha: head_sha.clone(),
-                base_sha: new_base_sha,
+                base_sha: new_base_sha.clone(),
                 options,
             },
             vec![
@@ -268,7 +268,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 },
                 Effect::FetchData {
                     head_sha: head_sha.clone(),
-                    base_sha: base_sha.clone(),
+                    base_sha: new_base_sha,
                 },
             ],
         ),
@@ -529,5 +529,48 @@ mod tests {
             .effects
             .iter()
             .any(|e| matches!(e, Effect::Log { .. })));
+    }
+
+    /// Regression test: When re-driving FetchData for the same head_sha but different
+    /// base_sha, both the state and the FetchData effect must use the NEW base_sha.
+    /// Previously, the state was updated correctly but the effect used the old base_sha,
+    /// causing the diff to be fetched for the wrong merge-base.
+    #[test]
+    fn test_same_head_different_base_uses_new_base_in_effect() {
+        let state = ReviewMachineState::Preparing {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("old_base"),
+            options: ReviewOptions::default(),
+        };
+
+        // Same head_sha but different base_sha (base branch moved)
+        let event = Event::ReviewRequested {
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("new_base"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = handle(state, event);
+
+        // Should stay in Preparing with the NEW base_sha
+        if let ReviewMachineState::Preparing { base_sha, .. } = &result.state {
+            assert_eq!(base_sha.0, "new_base", "State should use new base_sha");
+        } else {
+            panic!("Expected Preparing state, got {:?}", result.state);
+        }
+
+        // FetchData effect must use the NEW base_sha (not the old one!)
+        let fetch_effect = result
+            .effects
+            .iter()
+            .find(|e| matches!(e, Effect::FetchData { .. }));
+        assert!(fetch_effect.is_some(), "Should emit FetchData effect");
+        if let Some(Effect::FetchData { base_sha, .. }) = fetch_effect {
+            assert_eq!(
+                base_sha.0, "new_base",
+                "FetchData effect must use new base_sha, not old"
+            );
+        }
     }
 }

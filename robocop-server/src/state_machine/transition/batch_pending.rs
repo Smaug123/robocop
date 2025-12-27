@@ -355,26 +355,33 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             }],
         ),
 
-        // ReviewRequested for SAME commit while batch pending -> no-op (de-dup)
+        // ReviewRequested for SAME (head_sha, base_sha) while batch pending -> no-op (de-dup)
+        // Note: We must check BOTH head_sha AND base_sha because the diff depends on both.
+        // If the base branch moved, the diff is different and we need a new review.
         (
             ReviewMachineState::BatchPending {
-                head_sha: pending_sha,
+                head_sha: pending_head,
+                base_sha: pending_base,
                 ..
             },
             Event::ReviewRequested {
-                head_sha: requested_sha,
+                head_sha: requested_head,
+                base_sha: requested_base,
                 ..
             },
-        ) if pending_sha == &requested_sha => TransitionResult::new(
-            state.clone(),
-            vec![Effect::Log {
-                level: LogLevel::Info,
-                message: format!(
-                    "Review already pending for commit {}, ignoring duplicate request",
-                    pending_sha.short()
-                ),
-            }],
-        ),
+        ) if pending_head == &requested_head && pending_base == &requested_base => {
+            TransitionResult::new(
+                state.clone(),
+                vec![Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Review already pending for commit {} (base {}), ignoring duplicate request",
+                        pending_head.short(),
+                        pending_base.short()
+                    ),
+                }],
+            )
+        }
 
         // ReviewRequested while batch pending -> cancel current and start new
         (
@@ -832,6 +839,117 @@ mod tests {
                 Effect::FetchData { head_sha, .. } if head_sha.0 == "new_sha"
             )),
             "Should fetch data for new commit"
+        );
+    }
+
+    /// Regression test: ReviewRequested with same head_sha but different base_sha
+    /// should NOT be treated as a duplicate. The diff depends on both head and base,
+    /// so if the base moved, we need a new review.
+    #[test]
+    fn test_review_requested_same_head_different_base_not_duplicate() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+
+        // Same head_sha but different base_sha (base branch moved)
+        let event = Event::ReviewRequested {
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("new_base"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = handle(state, event);
+
+        // Should NOT stay in BatchPending - should cancel and restart
+        assert!(
+            matches!(result.state, ReviewMachineState::Preparing { .. }),
+            "Should transition to Preparing, not ignore as duplicate. Got: {:?}",
+            result.state
+        );
+
+        // Should cancel the old batch
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should cancel the old batch"
+        );
+
+        // Should fetch data with the NEW base_sha
+        let fetch_effect = result
+            .effects
+            .iter()
+            .find(|e| matches!(e, Effect::FetchData { .. }));
+        assert!(fetch_effect.is_some(), "Should emit FetchData effect");
+        if let Some(Effect::FetchData {
+            head_sha, base_sha, ..
+        }) = fetch_effect
+        {
+            assert_eq!(head_sha.0, "abc123", "Should use same head_sha");
+            assert_eq!(base_sha.0, "new_base", "Should use new base_sha");
+        }
+    }
+
+    /// Test that exact duplicate (same head AND base) IS ignored
+    #[test]
+    fn test_review_requested_exact_duplicate_ignored() {
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+
+        // Exact same head_sha AND base_sha
+        let event = Event::ReviewRequested {
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        let result = handle(state.clone(), event);
+
+        // Should stay in BatchPending (duplicate)
+        assert!(
+            matches!(result.state, ReviewMachineState::BatchPending { .. }),
+            "Should stay in BatchPending for exact duplicate"
+        );
+
+        // Should NOT cancel or fetch
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should NOT cancel batch for duplicate"
+        );
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchData { .. })),
+            "Should NOT fetch data for duplicate"
+        );
+
+        // Should log
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::Log { .. })),
+            "Should log duplicate request"
         );
     }
 }

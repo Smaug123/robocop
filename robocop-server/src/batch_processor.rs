@@ -34,31 +34,49 @@ pub async fn batch_polling_loop(state: Arc<AppState>) {
     }
 }
 
-/// Clean up stale batch submission reservations.
+/// Clean up stale batch submission reservations and re-trigger stuck PRs.
 ///
 /// This handles the case where another instance reserved a slot (status='submitting')
 /// but crashed before confirming. Without cleanup, PRs deferred via
-/// `InProgressByOtherInstance` would be stuck until the next server restart.
+/// `InProgressByOtherInstance` would be stuck.
+///
+/// After cleaning up stale reservations, we call `recover_preparing_states` to
+/// re-trigger any PRs that are stuck in `Preparing` state. This ensures the
+/// state machine gets another chance to submit the batch now that the stale
+/// reservation is gone.
 async fn cleanup_stale_submissions(state: &Arc<AppState>) {
     let db = state.state_store.db();
-    match tokio::task::spawn_blocking(move || db.delete_stale_incomplete_submissions()).await {
+    let had_stale_submissions = match tokio::task::spawn_blocking(move || {
+        db.delete_stale_incomplete_submissions()
+    })
+    .await
+    {
         Ok(Ok(stale_keys)) => {
             for key in &stale_keys {
                 info!(
-                    "Cleaned up stale batch submission for {}/{} PR#{} sha {} (older than 10 minutes)",
-                    key.repo_owner, key.repo_name, key.pr_number, key.head_sha
-                );
+                        "Cleaned up stale batch submission for {}/{} PR#{} sha {} (older than 10 minutes)",
+                        key.repo_owner, key.repo_name, key.pr_number, key.head_sha
+                    );
             }
+            !stale_keys.is_empty()
         }
         Ok(Err(e)) => {
             tracing::warn!("Failed to clean up stale submissions: {}", e);
+            false
         }
         Err(e) => {
             tracing::warn!(
                 "spawn_blocking panicked cleaning up stale submissions: {}",
                 e
             );
+            false
         }
+    };
+
+    // If we cleaned up any stale submissions, re-trigger PRs stuck in Preparing state.
+    // This gives them another chance to submit now that the reservation is gone.
+    if had_stale_submissions {
+        recover_preparing_states(state).await;
     }
 }
 
