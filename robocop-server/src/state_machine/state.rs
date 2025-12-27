@@ -226,9 +226,14 @@ pub enum ReviewMachineState {
     Completed {
         reviews_enabled: bool,
         head_sha: CommitSha,
-        /// Base SHA for batch submission cache cleanup on restart.
-        /// If we crash after persisting but before clearing the cache, we need
-        /// this to clear the cache on restart.
+        /// Base SHA for batch submission cache cleanup.
+        ///
+        /// When transitioning to this terminal state, the state machine emits
+        /// a `ClearBatchSubmission` effect with both `head_sha` and `base_sha`.
+        /// If we crash after persisting the state but before executing the
+        /// effect, the cache entry remains (but is harmless - terminal states
+        /// won't re-submit). This field is retained for consistency and to
+        /// support potential future manual cleanup.
         base_sha: CommitSha,
         result: ReviewResult,
     },
@@ -237,7 +242,9 @@ pub enum ReviewMachineState {
     Failed {
         reviews_enabled: bool,
         head_sha: CommitSha,
-        /// Base SHA for batch submission cache cleanup on restart.
+        /// Base SHA for batch submission cache cleanup.
+        ///
+        /// See `Completed::base_sha` for details on cleanup behavior.
         base_sha: CommitSha,
         reason: FailureReason,
     },
@@ -246,7 +253,9 @@ pub enum ReviewMachineState {
     Cancelled {
         reviews_enabled: bool,
         head_sha: CommitSha,
-        /// Base SHA for batch submission cache cleanup on restart.
+        /// Base SHA for batch submission cache cleanup.
+        ///
+        /// See `Completed::base_sha` for details on cleanup behavior.
         base_sha: CommitSha,
         reason: CancellationReason,
         /// Batch ID still being cancelled (for polling in case cancel fails).

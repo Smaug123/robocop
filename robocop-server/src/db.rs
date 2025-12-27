@@ -221,9 +221,14 @@ impl SqliteDb {
                 PRIMARY KEY (repo_owner, repo_name, pr_number)
             );
 
+            -- Index for efficiently finding PRs with pending batches.
+            -- This matches the logic in ReviewMachineState::pending_batch_id():
+            -- - BatchPending and AwaitingAncestryCheck always have pending batches
+            -- - Cancelled states may have pending_cancel_batch_id if cancel failed
             CREATE INDEX IF NOT EXISTS idx_pending_batches
             ON pr_states(repo_owner, repo_name, pr_number)
-            WHERE state_type IN ('BatchPending', 'AwaitingAncestryCheck');
+            WHERE state_type IN ('BatchPending', 'AwaitingAncestryCheck')
+               OR (state_type = 'Cancelled' AND pending_cancel_batch_id IS NOT NULL);
 
             -- Batch submission idempotency table.
             -- Tracks batch submissions to prevent duplicates after crashes.
@@ -1599,6 +1604,42 @@ mod tests {
         std::fs::remove_file(&db_path).ok();
     }
 
+    /// Test that Cancelled state with pending_cancel_batch_id is recognized as having a pending batch.
+    ///
+    /// The idx_pending_batches index must cover all states where pending_batch_id() returns Some.
+    /// This includes Cancelled states with pending_cancel_batch_id (used when cancel API fails
+    /// and we need to keep polling for the batch result).
+    #[test]
+    fn test_cancelled_with_pending_batch_is_recognized() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        // Insert a Cancelled state with pending_cancel_batch_id
+        let pr_id = StateMachinePrId::new("owner", "repo", 42);
+        let state = ReviewMachineState::Cancelled {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            reason: CancellationReason::UserRequested,
+            pending_cancel_batch_id: Some(BatchId::from("batch_pending_cancel".to_string())),
+        };
+        db.upsert_state(&pr_id, &state, 100).expect("should upsert");
+
+        // Verify pending_batch_id() returns the batch
+        assert_eq!(
+            state.pending_batch_id().map(|b| b.0.as_str()),
+            Some("batch_pending_cancel"),
+            "Cancelled state with pending_cancel_batch_id should have pending batch"
+        );
+
+        // Verify the state can be loaded back
+        let (loaded, _) = db.get_state(&pr_id).expect("should get").unwrap();
+        assert_eq!(
+            loaded.pending_batch_id().map(|b| b.0.as_str()),
+            Some("batch_pending_cancel"),
+            "Loaded state should preserve pending_cancel_batch_id"
+        );
+    }
+
     #[test]
     fn test_migrations_are_idempotent() {
         // Opening the same database twice should not fail
@@ -1709,6 +1750,72 @@ mod tests {
         assert!(
             matches!(result, ReservationResult::InProgressByOtherInstance),
             "should return InProgressByOtherInstance for fresh submitting row"
+        );
+    }
+
+    /// Regression test: When another instance is actively submitting a batch,
+    /// the caller should NOT treat this as a failure.
+    ///
+    /// `InProgressByOtherInstance` is a de-duplication outcome, not a failure.
+    /// The interpreter should return no event (or a log-only event), allowing
+    /// the state machine to stay in its current state while the other instance
+    /// completes the submission.
+    ///
+    /// Bug: Previously, the interpreter would return `BatchSubmissionFailed`
+    /// when `InProgressByOtherInstance` was returned, which drove the state
+    /// machine into `Failed` state and posted failure UI even though another
+    /// instance was successfully handling the submission.
+    #[test]
+    fn test_in_progress_by_other_instance_is_not_a_failure() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let key = BatchSubmissionKey {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
+        };
+
+        // First instance reserves
+        let result1 = db
+            .reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
+        assert!(
+            matches!(result1, ReservationResult::Reserved),
+            "first instance should get Reserved"
+        );
+
+        // Second instance tries to reserve while first is still submitting
+        let result2 = db
+            .reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
+
+        // This is NOT a failure - it's de-duplication.
+        // The second instance should silently defer to the first instance.
+        assert!(
+            matches!(result2, ReservationResult::InProgressByOtherInstance),
+            "second instance should get InProgressByOtherInstance, not fail"
+        );
+
+        // Verify the first instance can still confirm (proving it's not broken)
+        let data = BatchSubmissionData {
+            batch_id: "batch_123".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        db.confirm_batch_submission(&key, &data)
+            .expect("first instance should be able to confirm");
+
+        // Now the second instance's next attempt would see AlreadySubmitted
+        let result3 = db
+            .reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
+        assert!(
+            matches!(result3, ReservationResult::AlreadySubmitted(_)),
+            "third attempt should see AlreadySubmitted with cached data"
         );
     }
 

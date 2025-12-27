@@ -687,9 +687,13 @@ async fn execute_update_check_run(
 /// 2. Submit: POST to OpenAI
 /// 3. Confirm: Update row with status='submitted' and batch_id
 ///
-/// If we crash after step 2 but before step 3, on restart the reservation
-/// will be deleted and we'll re-submit (creating a duplicate batch in OpenAI,
-/// but the old one will expire after 24h).
+/// If we crash after step 2 but before step 3, the reservation will be
+/// considered stale after 10 minutes and deleted by the next reservation
+/// attempt or by the startup cleanup. At that point, we'll re-submit
+/// (creating a duplicate batch in OpenAI, but the old one will expire
+/// after 24h). This window is a trade-off: shorter thresholds risk
+/// cleaning up reservations from slow-but-alive instances; longer
+/// thresholds delay recovery after crashes.
 async fn execute_submit_batch(
     ctx: &InterpreterContext,
     diff: &str,
@@ -773,17 +777,24 @@ async fn execute_submit_batch(
             });
         }
         ReservationResult::InProgressByOtherInstance => {
-            // Another instance is actively submitting - don't interfere
+            // Another instance is actively submitting - defer to it.
+            // This is NOT a failure - it's de-duplication. We should NOT
+            // transition to Failed state or post failure UI.
+            //
+            // By returning no events, the state machine stays in its current
+            // state (Preparing). The other instance will complete the submission,
+            // and the batch will be picked up by:
+            // - The next webhook for this PR (which will see AlreadySubmitted), or
+            // - Polling once the batch enters BatchPending state.
+            //
+            // If the other instance crashes before confirming, the staleness
+            // threshold (10 minutes) will eventually allow re-submission.
             info!(
-                "Skipping batch submission for PR #{} commit {} - another instance is submitting",
+                "Deferring batch submission for PR #{} commit {} - another instance is actively submitting",
                 ctx.pr_number,
                 head_sha.short()
             );
-            return EffectResult::single(Event::BatchSubmissionFailed {
-                error: "Another server instance is already submitting this batch".to_string(),
-                comment_id: None,
-                check_run_id: None,
-            });
+            return EffectResult::none();
         }
         ReservationResult::Reserved => {
             // Slot reserved - proceed with full submission flow below
