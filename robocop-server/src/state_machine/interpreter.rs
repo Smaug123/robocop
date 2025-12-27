@@ -134,6 +134,10 @@ async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResul
 
         Effect::CancelBatch { batch_id } => execute_cancel_batch(ctx, &batch_id).await,
 
+        Effect::ClearBatchSubmission { head_sha, base_sha } => {
+            execute_clear_batch_submission(ctx, &head_sha, &base_sha).await
+        }
+
         Effect::Log { level, message } => {
             match level {
                 LogLevel::Debug => tracing::debug!("{}", message),
@@ -722,7 +726,13 @@ async fn execute_submit_batch(
     let cached_submission = {
         let db = ctx.db.clone();
         let key = key.clone();
-        match tokio::task::spawn_blocking(move || db.reserve_batch_submission(&key)).await {
+        let model_for_check = model.clone();
+        let reasoning_effort_for_check = reasoning_effort.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.reserve_batch_submission(&key, &model_for_check, &reasoning_effort_for_check)
+        })
+        .await
+        {
             Ok(Ok(cached)) => cached,
             Ok(Err(e)) => {
                 error!("Failed to reserve batch submission: {}", e);
@@ -942,6 +952,65 @@ async fn execute_cancel_batch(ctx: &InterpreterContext, batch_id: &BatchId) -> E
         Err(e) => {
             // Log but don't fail - batch may already be cancelled
             warn!("Failed to cancel batch {}: {}", batch_id, e);
+            EffectResult::none()
+        }
+    }
+}
+
+/// Clear the batch submission cache entry.
+///
+/// This is called when a batch reaches a terminal state (Completed, Failed,
+/// Cancelled) to allow re-submission for the same commit if the user requests
+/// a new review.
+async fn execute_clear_batch_submission(
+    ctx: &InterpreterContext,
+    head_sha: &CommitSha,
+    base_sha: &CommitSha,
+) -> EffectResult {
+    use crate::db::BatchSubmissionKey;
+
+    info!(
+        "Clearing batch submission cache for {}...{}",
+        base_sha.short(),
+        head_sha.short()
+    );
+
+    let key = BatchSubmissionKey {
+        repo_owner: ctx.repo_owner.clone(),
+        repo_name: ctx.repo_name.clone(),
+        pr_number: ctx.pr_number,
+        head_sha: head_sha.0.clone(),
+        base_sha: base_sha.0.clone(),
+    };
+
+    let db = ctx.db.clone();
+    match tokio::task::spawn_blocking(move || db.delete_batch_submission(&key)).await {
+        Ok(Ok(())) => {
+            info!(
+                "Cleared batch submission cache for {}...{}",
+                base_sha.short(),
+                head_sha.short()
+            );
+            EffectResult::none()
+        }
+        Ok(Err(e)) => {
+            // Log but don't fail - this is best-effort cleanup
+            warn!(
+                "Failed to clear batch submission cache for {}...{}: {}",
+                base_sha.short(),
+                head_sha.short(),
+                e
+            );
+            EffectResult::none()
+        }
+        Err(e) => {
+            // Log but don't fail - this is best-effort cleanup
+            warn!(
+                "Task panicked while clearing batch submission cache for {}...{}: {}",
+                base_sha.short(),
+                head_sha.short(),
+                e
+            );
             EffectResult::none()
         }
     }

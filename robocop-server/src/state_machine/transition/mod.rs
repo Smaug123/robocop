@@ -196,14 +196,19 @@ mod tests {
         let result = transition(state, event);
 
         assert!(matches!(result.state, ReviewMachineState::Completed { .. }));
-        assert_eq!(result.effects.len(), 2);
+        // Effects: UpdateComment, ClearBatchSubmission, UpdateCheckRun
+        assert_eq!(result.effects.len(), 3);
         assert!(matches!(
             &result.effects[0],
             Effect::UpdateComment {
                 content: CommentContent::ReviewComplete { .. }
             }
         ));
-        assert!(matches!(&result.effects[1], Effect::UpdateCheckRun { .. }));
+        assert!(matches!(
+            &result.effects[1],
+            Effect::ClearBatchSubmission { .. }
+        ));
+        assert!(matches!(&result.effects[2], Effect::UpdateCheckRun { .. }));
     }
 
     #[test]
@@ -229,8 +234,13 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(result.effects.len(), 3);
+        // Effects: CancelBatch, UpdateComment, ClearBatchSubmission, UpdateCheckRun
+        assert_eq!(result.effects.len(), 4);
         assert!(matches!(&result.effects[0], Effect::CancelBatch { .. }));
+        assert!(matches!(
+            &result.effects[2],
+            Effect::ClearBatchSubmission { .. }
+        ));
     }
 
     #[test]

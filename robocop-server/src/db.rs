@@ -641,12 +641,24 @@ impl SqliteDb {
     /// - `Ok(None)` if slot was reserved (caller should submit to OpenAI)
     /// - `Ok(Some(CachedBatchSubmission))` if already submitted (caller should skip OpenAI)
     ///
+    /// The `requested_model` and `requested_reasoning_effort` parameters are used to
+    /// validate that the cached batch (if any) matches the requested options. If the
+    /// cached batch used different options, the cache is invalidated and a new
+    /// submission is allowed.
+    ///
     /// If a row exists with `status = 'submitting'` (prior crash mid-submission),
     /// this returns `Ok(None)` and the caller will re-submit, potentially creating
     /// a duplicate batch in OpenAI. The old batch will expire after 24h.
+    ///
+    /// # Multi-instance safety
+    ///
+    /// This method uses `INSERT ... ON CONFLICT DO NOTHING` to avoid races when
+    /// multiple server instances share the same database.
     pub fn reserve_batch_submission(
         &self,
         key: &BatchSubmissionKey,
+        requested_model: &str,
+        requested_reasoning_effort: &str,
     ) -> Result<Option<CachedBatchSubmission>> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
@@ -660,9 +672,9 @@ impl SqliteDb {
             reasoning_effort: Option<String>,
         }
 
-        // Check if already submitted
-        let existing: Option<BatchRow> = conn
-            .query_row(
+        // Helper to fetch existing row
+        let fetch_existing = |conn: &Connection| -> Result<Option<BatchRow>> {
+            conn.query_row(
                 "SELECT status, batch_id, comment_id, check_run_id, model, reasoning_effort \
                  FROM batch_submissions \
                  WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
@@ -685,35 +697,62 @@ impl SqliteDb {
                 },
             )
             .optional()
-            .context("Failed to query batch_submissions")?;
+            .context("Failed to query batch_submissions")
+        };
 
-        match existing {
-            Some(row) if row.status == "submitted" => {
-                // Already submitted - return cached data
-                // batch_id should always be Some for submitted status, but handle None defensively
-                match row.batch_id {
-                    Some(bid) => Ok(Some(CachedBatchSubmission {
-                        batch_id: bid,
-                        comment_id: row.comment_id,
-                        check_run_id: row.check_run_id,
-                        model: row.model,
-                        reasoning_effort: row.reasoning_effort,
-                    })),
+        // Helper to delete existing row
+        let delete_existing = |conn: &Connection| -> Result<()> {
+            conn.execute(
+                "DELETE FROM batch_submissions \
+                 WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
+                rusqlite::params![
+                    &key.repo_owner,
+                    &key.repo_name,
+                    key.pr_number,
+                    &key.head_sha,
+                    &key.base_sha
+                ],
+            )
+            .context("Failed to delete batch submission")?;
+            Ok(())
+        };
+
+        // Try to atomically insert a reservation. This handles the race condition:
+        // if two instances try to reserve simultaneously, one will succeed and the
+        // other will see rows_affected=0 and fetch the existing row.
+        let rows_affected = conn
+            .execute(
+                "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'submitting') \
+                 ON CONFLICT (repo_owner, repo_name, pr_number, head_sha, base_sha) DO NOTHING",
+                rusqlite::params![
+                    &key.repo_owner,
+                    &key.repo_name,
+                    key.pr_number,
+                    &key.head_sha,
+                    &key.base_sha
+                ],
+            )
+            .context("Failed to reserve batch submission")?;
+
+        if rows_affected > 0 {
+            // Successfully inserted - no existing row, proceed with submission
+            return Ok(None);
+        }
+
+        // Row already exists - fetch it to check status and options
+        let existing = fetch_existing(&conn)?.ok_or_else(|| {
+            anyhow!("Row disappeared after conflict - possible concurrent delete")
+        })?;
+
+        match existing.status.as_str() {
+            "submitted" => {
+                // Check if batch_id is present (should always be for 'submitted')
+                let batch_id = match existing.batch_id {
+                    Some(bid) => bid,
                     None => {
-                        // Corrupted state: submitted without batch_id. Treat as stale.
-                        conn.execute(
-                            "DELETE FROM batch_submissions \
-                             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
-                            rusqlite::params![
-                                &key.repo_owner,
-                                &key.repo_name,
-                                key.pr_number,
-                                &key.head_sha,
-                                &key.base_sha
-                            ],
-                        )
-                        .context("Failed to delete corrupted submission")?;
-
+                        // Corrupted state: submitted without batch_id. Invalidate.
+                        delete_existing(&conn)?;
                         conn.execute(
                             "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
                              VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
@@ -725,18 +764,52 @@ impl SqliteDb {
                                 &key.base_sha
                             ],
                         )
-                        .context("Failed to reserve batch submission")?;
-
-                        Ok(None)
+                        .context("Failed to reserve batch submission after corruption")?;
+                        return Ok(None);
                     }
+                };
+
+                // Check if the cached batch used the same options as requested.
+                // If options differ, the user is requesting a re-review with different
+                // settings, so we should invalidate the cache and allow a new submission.
+                let options_match = existing.model.as_deref() == Some(requested_model)
+                    && existing.reasoning_effort.as_deref() == Some(requested_reasoning_effort);
+
+                if !options_match {
+                    // Options mismatch: invalidate cache and allow new submission.
+                    // Note: this creates an orphaned batch in OpenAI (the old one),
+                    // but it will expire after 24h.
+                    delete_existing(&conn)?;
+                    conn.execute(
+                        "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
+                        rusqlite::params![
+                            &key.repo_owner,
+                            &key.repo_name,
+                            key.pr_number,
+                            &key.head_sha,
+                            &key.base_sha
+                        ],
+                    )
+                    .context("Failed to reserve batch submission after options mismatch")?;
+                    return Ok(None);
                 }
+
+                // Options match - return cached data
+                Ok(Some(CachedBatchSubmission {
+                    batch_id,
+                    comment_id: existing.comment_id,
+                    check_run_id: existing.check_run_id,
+                    model: existing.model,
+                    reasoning_effort: existing.reasoning_effort,
+                }))
             }
-            Some(_) => {
-                // Status is 'submitting' - prior crash mid-submission.
-                // Delete the stale row and reserve fresh.
+            "submitting" => {
+                // Prior crash mid-submission. Delete stale row and reserve fresh.
+                delete_existing(&conn)?;
                 conn.execute(
-                    "DELETE FROM batch_submissions \
-                     WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
+                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
                     rusqlite::params![
                         &key.repo_owner,
                         &key.repo_name,
@@ -745,28 +818,12 @@ impl SqliteDb {
                         &key.base_sha
                     ],
                 )
-                .context("Failed to delete stale submission")?;
-
-                // Insert new reservation
-                conn.execute(
-                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
-                    rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number, &key.head_sha, &key.base_sha],
-                )
-                .context("Failed to reserve batch submission")?;
-
+                .context("Failed to reserve batch submission after stale cleanup")?;
                 Ok(None)
             }
-            None => {
-                // No existing row - insert reservation
-                conn.execute(
-                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
-                    rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number, &key.head_sha, &key.base_sha],
-                )
-                .context("Failed to reserve batch submission")?;
-
-                Ok(None)
+            other => {
+                // Unknown status - treat as corrupted
+                Err(anyhow!("Unknown batch submission status: {}", other))
             }
         }
     }
@@ -1462,7 +1519,9 @@ mod tests {
         };
 
         // First reservation should succeed and return None (no existing batch)
-        let result = db.reserve_batch_submission(&key).expect("should reserve");
+        let result = db
+            .reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
         assert!(result.is_none(), "should return None for new reservation");
     }
 
@@ -1479,7 +1538,8 @@ mod tests {
         };
 
         // Reserve and confirm
-        db.reserve_batch_submission(&key).expect("should reserve");
+        db.reserve_batch_submission(&key, "gpt-4", "high")
+            .expect("should reserve");
         let data = BatchSubmissionData {
             batch_id: "batch_123".to_string(),
             comment_id: Some(100),
@@ -1490,9 +1550,9 @@ mod tests {
         db.confirm_batch_submission(&key, &data)
             .expect("should confirm");
 
-        // Second reservation should return the cached data
+        // Second reservation with same options should return the cached data
         let result = db
-            .reserve_batch_submission(&key)
+            .reserve_batch_submission(&key, "gpt-4", "high")
             .expect("should reserve")
             .expect("should have cached data");
         assert_eq!(
@@ -1518,10 +1578,13 @@ mod tests {
         };
 
         // Reserve but don't confirm (simulating crash)
-        db.reserve_batch_submission(&key).expect("should reserve");
+        db.reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
 
         // Second reservation should delete stale row and reserve fresh
-        let result = db.reserve_batch_submission(&key).expect("should reserve");
+        let result = db
+            .reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
         assert!(
             result.is_none(),
             "should return None after deleting stale row"
@@ -1541,7 +1604,8 @@ mod tests {
         };
 
         // Reserve and confirm
-        db.reserve_batch_submission(&key).expect("should reserve");
+        db.reserve_batch_submission(&key, "gpt-4o", "medium")
+            .expect("should reserve");
         let data = BatchSubmissionData {
             batch_id: "batch_456".to_string(),
             comment_id: None,
@@ -1554,7 +1618,7 @@ mod tests {
 
         // Verify it's now 'submitted'
         let result = db
-            .reserve_batch_submission(&key)
+            .reserve_batch_submission(&key, "gpt-4o", "medium")
             .expect("should reserve")
             .expect("should have cached data");
         assert_eq!(result.batch_id, "batch_456");
@@ -1604,13 +1668,16 @@ mod tests {
         };
 
         // Reserve
-        db.reserve_batch_submission(&key).expect("should reserve");
+        db.reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
 
         // Delete
         db.delete_batch_submission(&key).expect("should delete");
 
         // Should be able to reserve again
-        let result = db.reserve_batch_submission(&key).expect("should reserve");
+        let result = db
+            .reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
         assert!(result.is_none(), "should return None after delete");
     }
 
@@ -1641,10 +1708,12 @@ mod tests {
         };
 
         // key1: submitting (incomplete)
-        db.reserve_batch_submission(&key1).expect("should reserve");
+        db.reserve_batch_submission(&key1, "gpt-4", "medium")
+            .expect("should reserve");
 
         // key2: submitted (complete)
-        db.reserve_batch_submission(&key2).expect("should reserve");
+        db.reserve_batch_submission(&key2, "gpt-4", "medium")
+            .expect("should reserve");
         let data2 = BatchSubmissionData {
             batch_id: "batch_2".to_string(),
             comment_id: None,
@@ -1656,7 +1725,8 @@ mod tests {
             .expect("should confirm");
 
         // key3: submitting (incomplete)
-        db.reserve_batch_submission(&key3).expect("should reserve");
+        db.reserve_batch_submission(&key3, "gpt-4", "medium")
+            .expect("should reserve");
 
         // Find incomplete
         let incomplete = db
@@ -1691,7 +1761,8 @@ mod tests {
         };
 
         // Reserve and confirm key1
-        db.reserve_batch_submission(&key1).expect("should reserve");
+        db.reserve_batch_submission(&key1, "gpt-4", "medium")
+            .expect("should reserve");
         let data1 = BatchSubmissionData {
             batch_id: "batch_1".to_string(),
             comment_id: None,
@@ -1703,7 +1774,9 @@ mod tests {
             .expect("should confirm");
 
         // key2 should be independent (different head_sha)
-        let result = db.reserve_batch_submission(&key2).expect("should reserve");
+        let result = db
+            .reserve_batch_submission(&key2, "gpt-4", "medium")
+            .expect("should reserve");
         assert!(result.is_none(), "different head_sha should be independent");
     }
 
@@ -1727,7 +1800,8 @@ mod tests {
         };
 
         // Reserve and confirm key1
-        db.reserve_batch_submission(&key1).expect("should reserve");
+        db.reserve_batch_submission(&key1, "gpt-4", "medium")
+            .expect("should reserve");
         let data1 = BatchSubmissionData {
             batch_id: "batch_1".to_string(),
             comment_id: None,
@@ -1739,10 +1813,100 @@ mod tests {
             .expect("should confirm");
 
         // key2 should be independent (different base_sha)
-        let result = db.reserve_batch_submission(&key2).expect("should reserve");
+        let result = db
+            .reserve_batch_submission(&key2, "gpt-4", "medium")
+            .expect("should reserve");
         assert!(
             result.is_none(),
             "different base_sha should be independent - this tests Issue 2"
+        );
+    }
+
+    #[test]
+    fn test_options_mismatch_invalidates_cache() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let key = BatchSubmissionKey {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
+        };
+
+        // Reserve and confirm with model=gpt-4, reasoning=high
+        db.reserve_batch_submission(&key, "gpt-4", "high")
+            .expect("should reserve");
+        let data = BatchSubmissionData {
+            batch_id: "batch_123".to_string(),
+            comment_id: Some(100),
+            check_run_id: Some(200),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        db.confirm_batch_submission(&key, &data)
+            .expect("should confirm");
+
+        // Second reservation with DIFFERENT model should invalidate cache
+        let result = db
+            .reserve_batch_submission(&key, "gpt-4o", "high")
+            .expect("should reserve");
+        assert!(
+            result.is_none(),
+            "different model should invalidate cache and return None"
+        );
+
+        // After invalidation, we should be able to confirm again
+        let data2 = BatchSubmissionData {
+            batch_id: "batch_456".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4o".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        db.confirm_batch_submission(&key, &data2)
+            .expect("should confirm");
+
+        // Verify the new batch is cached
+        let result = db
+            .reserve_batch_submission(&key, "gpt-4o", "high")
+            .expect("should reserve")
+            .expect("should have cached data");
+        assert_eq!(result.batch_id, "batch_456");
+    }
+
+    #[test]
+    fn test_reasoning_effort_mismatch_invalidates_cache() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let key = BatchSubmissionKey {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
+        };
+
+        // Reserve and confirm with reasoning=medium
+        db.reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
+        let data = BatchSubmissionData {
+            batch_id: "batch_123".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        db.confirm_batch_submission(&key, &data)
+            .expect("should confirm");
+
+        // Second reservation with DIFFERENT reasoning_effort should invalidate cache
+        let result = db
+            .reserve_batch_submission(&key, "gpt-4", "high")
+            .expect("should reserve");
+        assert!(
+            result.is_none(),
+            "different reasoning_effort should invalidate cache and return None"
         );
     }
 }

@@ -49,6 +49,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::BatchPending {
                 batch_id,
                 head_sha,
+                base_sha,
                 check_run_id,
                 reviews_enabled,
                 ..
@@ -81,13 +82,20 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 result: result.clone(),
             };
 
-            let mut effects = vec![Effect::UpdateComment {
-                content: CommentContent::ReviewComplete {
-                    head_sha: head_sha.clone(),
-                    batch_id: batch_id.clone(),
-                    result,
+            let mut effects = vec![
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewComplete {
+                        head_sha: head_sha.clone(),
+                        batch_id: batch_id.clone(),
+                        result,
+                    },
                 },
-            }];
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
+            ];
 
             if let Some(cr_id) = check_run_id {
                 effects.push(Effect::UpdateCheckRun {
@@ -109,6 +117,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::BatchPending {
                 batch_id,
                 head_sha,
+                base_sha,
                 check_run_id,
                 reviews_enabled,
                 ..
@@ -118,12 +127,19 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 reason: FailureReason::BatchCancelled,
             },
         ) if batch_id == &event_batch_id => {
-            let mut effects = vec![Effect::UpdateComment {
-                content: CommentContent::ReviewCancelled {
-                    head_sha: head_sha.clone(),
-                    reason: CancellationReason::External, // Batch was cancelled externally
+            let mut effects = vec![
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewCancelled {
+                        head_sha: head_sha.clone(),
+                        reason: CancellationReason::External, // Batch was cancelled externally
+                    },
                 },
-            }];
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
+            ];
 
             if let Some(cr_id) = check_run_id {
                 effects.push(Effect::UpdateCheckRun {
@@ -152,6 +168,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::BatchPending {
                 batch_id,
                 head_sha,
+                base_sha,
                 check_run_id,
                 reviews_enabled,
                 ..
@@ -172,13 +189,20 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 reason: reason.clone(),
             };
 
-            let mut effects = vec![Effect::UpdateComment {
-                content: CommentContent::ReviewFailed {
-                    head_sha: head_sha.clone(),
-                    batch_id: batch_id.clone(),
-                    reason,
+            let mut effects = vec![
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewFailed {
+                        head_sha: head_sha.clone(),
+                        batch_id: batch_id.clone(),
+                        reason,
+                    },
                 },
-            }];
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
+            ];
 
             if let Some(cr_id) = check_run_id {
                 effects.push(Effect::UpdateCheckRun {
@@ -199,6 +223,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::BatchPending {
                 batch_id,
                 head_sha,
+                base_sha,
                 check_run_id,
                 reviews_enabled,
                 ..
@@ -214,6 +239,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                         head_sha: head_sha.clone(),
                         reason: CancellationReason::UserRequested,
                     },
+                },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                 },
             ];
 
@@ -245,6 +275,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::BatchPending {
                 batch_id,
                 head_sha,
+                base_sha,
                 check_run_id,
                 ..
             },
@@ -256,6 +287,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 },
                 Effect::UpdateComment {
                     content: CommentContent::ReviewsDisabled { cancelled_count: 1 },
+                },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                 },
             ];
 
@@ -526,14 +562,19 @@ mod tests {
         let result = handle(state, event);
 
         assert!(matches!(result.state, ReviewMachineState::Completed { .. }));
-        assert_eq!(result.effects.len(), 2);
+        // Effects: UpdateComment, ClearBatchSubmission, UpdateCheckRun
+        assert_eq!(result.effects.len(), 3);
         assert!(matches!(
             &result.effects[0],
             Effect::UpdateComment {
                 content: CommentContent::ReviewComplete { .. }
             }
         ));
-        assert!(matches!(&result.effects[1], Effect::UpdateCheckRun { .. }));
+        assert!(matches!(
+            &result.effects[1],
+            Effect::ClearBatchSubmission { .. }
+        ));
+        assert!(matches!(&result.effects[2], Effect::UpdateCheckRun { .. }));
     }
 
     #[test]
@@ -559,8 +600,13 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(result.effects.len(), 3);
+        // Effects: CancelBatch, UpdateComment, ClearBatchSubmission, UpdateCheckRun
+        assert_eq!(result.effects.len(), 4);
         assert!(matches!(&result.effects[0], Effect::CancelBatch { .. }));
+        assert!(matches!(
+            &result.effects[2],
+            Effect::ClearBatchSubmission { .. }
+        ));
     }
 
     #[test]

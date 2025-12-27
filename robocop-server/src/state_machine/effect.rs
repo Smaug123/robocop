@@ -65,6 +65,16 @@ pub enum Effect {
     /// Cancel a pending batch.
     CancelBatch { batch_id: BatchId },
 
+    /// Clear the batch submission cache entry for idempotency cleanup.
+    ///
+    /// This should be emitted when a batch reaches a terminal state (Completed,
+    /// Failed, Cancelled) to allow re-submission for the same commit if the user
+    /// requests a new review.
+    ClearBatchSubmission {
+        head_sha: CommitSha,
+        base_sha: CommitSha,
+    },
+
     // =========================================================================
     // Logging Effects
     // =========================================================================
