@@ -226,10 +226,10 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 head_sha,
                 base_sha,
                 reason,
-                pending_cancel_batch_id: Some(_),
+                pending_cancel_batch_id: Some(pending_batch_id),
             },
             Event::BatchCompleted { batch_id, .. } | Event::BatchTerminated { batch_id, .. },
-        ) => TransitionResult::new(
+        ) if batch_id == *pending_batch_id => TransitionResult::new(
             ReviewMachineState::Cancelled {
                 reviews_enabled: *reviews_enabled,
                 head_sha: head_sha.clone(),
@@ -295,7 +295,9 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_machine::state::{CommitSha, ReviewOptions, ReviewResult};
+    use crate::state_machine::state::{
+        BatchId, CancellationReason, CommitSha, ReviewOptions, ReviewResult,
+    };
 
     #[test]
     fn test_terminal_state_stable_for_same_commit() {
@@ -414,5 +416,95 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_cancelled_with_pending_batch_clears_on_matching_batch_completion() {
+        let state = ReviewMachineState::Cancelled {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            reason: CancellationReason::UserRequested,
+            pending_cancel_batch_id: Some(BatchId::from("batch_pending".to_string())),
+        };
+
+        // Event with matching batch_id should clear the pending_cancel_batch_id
+        let event = Event::BatchCompleted {
+            batch_id: BatchId::from("batch_pending".to_string()),
+            result: ReviewResult {
+                reasoning: "".to_string(),
+                substantive_comments: false,
+                summary: "".to_string(),
+            },
+        };
+
+        let result = handle(state, event);
+
+        // Should stay Cancelled but with pending_cancel_batch_id cleared
+        match result.state {
+            ReviewMachineState::Cancelled {
+                pending_cancel_batch_id,
+                ..
+            } => {
+                assert!(
+                    pending_cancel_batch_id.is_none(),
+                    "pending_cancel_batch_id should be cleared when batch_id matches"
+                );
+            }
+            other => panic!("expected Cancelled, got {:?}", other),
+        }
+    }
+
+    /// Regression test: mismatched batch_id should NOT clear pending_cancel_batch_id.
+    ///
+    /// Bug: Previously, the handler cleared pending_cancel_batch_id without checking
+    /// that the incoming batch_id matched. This could incorrectly stop tracking the
+    /// real pending-cancel batch if a stale/unrelated batch result event arrived.
+    #[test]
+    fn test_cancelled_with_pending_batch_ignores_mismatched_batch_completion() {
+        let state = ReviewMachineState::Cancelled {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            reason: CancellationReason::UserRequested,
+            pending_cancel_batch_id: Some(BatchId::from("batch_pending".to_string())),
+        };
+
+        // Event with DIFFERENT batch_id should NOT clear pending_cancel_batch_id
+        let event = Event::BatchCompleted {
+            batch_id: BatchId::from("stale_batch".to_string()),
+            result: ReviewResult {
+                reasoning: "".to_string(),
+                substantive_comments: false,
+                summary: "".to_string(),
+            },
+        };
+
+        let result = handle(state, event);
+
+        // Should stay Cancelled with pending_cancel_batch_id PRESERVED
+        match result.state {
+            ReviewMachineState::Cancelled {
+                pending_cancel_batch_id,
+                ..
+            } => {
+                assert!(
+                    pending_cancel_batch_id.is_some(),
+                    "pending_cancel_batch_id should NOT be cleared for mismatched batch_id"
+                );
+                assert_eq!(
+                    pending_cancel_batch_id.unwrap().0,
+                    "batch_pending",
+                    "pending_cancel_batch_id should remain unchanged"
+                );
+            }
+            other => panic!("expected Cancelled, got {:?}", other),
+        }
+
+        // Should log that it's ignoring a stale event
+        assert!(result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Log { .. })));
     }
 }

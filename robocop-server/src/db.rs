@@ -1753,18 +1753,18 @@ mod tests {
         );
     }
 
-    /// Regression test: When another instance is actively submitting a batch,
-    /// the caller should NOT treat this as a failure.
+    /// Test that `InProgressByOtherInstance` is returned (not an error) when
+    /// another instance holds a fresh reservation.
     ///
-    /// `InProgressByOtherInstance` is a de-duplication outcome, not a failure.
-    /// The interpreter should return no event (or a log-only event), allowing
-    /// the state machine to stay in its current state while the other instance
-    /// completes the submission.
+    /// This tests the DB-level API that enables de-duplication. The semantics:
+    /// - `InProgressByOtherInstance` signals that a concurrent instance is actively
+    ///   submitting a batch for this (PR, head_sha, base_sha) tuple.
+    /// - The caller should NOT treat this as a failure - it's a de-duplication outcome.
+    /// - The first instance can still confirm successfully after the second sees
+    ///   `InProgressByOtherInstance`.
     ///
-    /// Bug: Previously, the interpreter would return `BatchSubmissionFailed`
-    /// when `InProgressByOtherInstance` was returned, which drove the state
-    /// machine into `Failed` state and posted failure UI even though another
-    /// instance was successfully handling the submission.
+    /// Note: This test covers the DB reservation behavior, not the interpreter's
+    /// handling of this result. For interpreter behavior, see the interpreter tests.
     #[test]
     fn test_in_progress_by_other_instance_is_not_a_failure() {
         let db = SqliteDb::new_in_memory().expect("should create in-memory db");

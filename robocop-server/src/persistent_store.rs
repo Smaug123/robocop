@@ -30,12 +30,26 @@
 //! The two-phase commit in `execute_submit_batch` (reserve/submit/confirm)
 //! ensures idempotency even if we crash during the OpenAI call.
 //!
-//! ## Multi-Instance Deployments
+//! # Single-Instance Design
 //!
-//! When multiple instances share the same SQLite database:
-//! - Stale submission reservations are cleaned up periodically (every 5 min)
-//! - If instance A crashes mid-submission, instance B can eventually proceed
-//! - The staleness threshold (10 minutes) prevents interfering with active submissions
+//! **IMPORTANT**: This store is designed for single-instance deployments only.
+//!
+//! State is loaded into memory at startup and all reads come from memory. The
+//! store does NOT re-read from the database on each operation. This means:
+//! - Multiple instances sharing a database will NOT see each other's state changes
+//! - A second instance can overwrite the first instance's newer state with stale data
+//! - There is no read-through caching, locking, or optimistic concurrency control
+//!
+//! The only multi-instance safety is for batch submissions: the two-phase commit
+//! in `batch_submissions` table prevents duplicate OpenAI batch submissions when
+//! multiple instances race. This is handled via `SqliteDb::reserve_batch_submission`:
+//! - Stale submission reservations (older than 10 min) are cleaned up periodically
+//! - Fresh reservations from other instances return `InProgressByOtherInstance`
+//!
+//! For true multi-instance support, you would need to either:
+//! 1. Use a shared database with read-through caching and optimistic concurrency
+//! 2. Partition PRs across instances (e.g., by PR number modulo instance count)
+//! 3. Use a distributed coordination service (e.g., etcd, Redis)
 
 use std::collections::HashMap;
 use std::path::Path;
