@@ -1,19 +1,20 @@
 pub mod batch_processor;
 pub mod command;
 pub mod config;
+pub mod db;
 pub mod git;
 pub mod github;
 pub mod openai;
+pub mod persistent_store;
 pub mod review_state;
 pub mod state_machine;
 pub mod webhook;
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 pub use github::*;
 pub use openai::*;
+pub use persistent_store::PersistentStateStore;
 pub use review_state::{PullRequestId, ReviewState};
 pub use state_machine::{StateMachinePrId, StateStore};
 
@@ -37,7 +38,6 @@ pub struct AppState {
     pub openai_client: Arc<OpenAIClient>,
     pub webhook_secret: String,
     pub target_user_id: u64,
-    pub review_states: Arc<RwLock<HashMap<PullRequestId, ReviewState>>>,
-    pub state_store: Arc<StateStore>,
+    pub state_store: Arc<PersistentStateStore>,
     pub recording_logger: Option<RecordingLogger>,
 }

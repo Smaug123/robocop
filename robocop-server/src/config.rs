@@ -11,6 +11,7 @@ pub struct Config {
     pub port: u16,
     pub recording_enabled: bool,
     pub recording_log_path: String,
+    pub sqlite_db_path: String,
 }
 
 impl Config {
@@ -48,6 +49,9 @@ impl Config {
         let recording_log_path =
             env::var("RECORDING_LOG_PATH").unwrap_or_else(|_| "recordings.jsonl".to_string());
 
+        let sqlite_db_path =
+            env::var("SQLITE_DB_PATH").unwrap_or_else(|_| "robocop.db".to_string());
+
         Ok(Config {
             github_app_id,
             github_private_key,
@@ -57,6 +61,7 @@ impl Config {
             port,
             recording_enabled,
             recording_log_path,
+            sqlite_db_path,
         })
     }
 }

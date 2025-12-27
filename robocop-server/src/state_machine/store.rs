@@ -18,7 +18,7 @@ use crate::github::GitHubClient;
 use crate::openai::OpenAIClient;
 
 /// Unique identifier for a pull request across repositories.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StateMachinePrId {
     pub repo_owner: String,
     pub repo_name: String,

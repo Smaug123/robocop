@@ -4,11 +4,11 @@
 //! Following the principle of "make illegal states unrepresentable", we use
 //! an enum that captures exactly what states are valid.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Newtype for commit SHA to prevent mixing with other strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommitSha(pub String);
 
 impl CommitSha {
@@ -37,7 +37,7 @@ impl From<&str> for CommitSha {
 }
 
 /// Newtype for OpenAI batch ID.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BatchId(pub String);
 
 impl fmt::Display for BatchId {
@@ -53,7 +53,7 @@ impl From<String> for BatchId {
 }
 
 /// Newtype for GitHub comment ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommentId(pub u64);
 
 impl From<u64> for CommentId {
@@ -63,7 +63,7 @@ impl From<u64> for CommentId {
 }
 
 /// Newtype for GitHub check run ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CheckRunId(pub u64);
 
 impl From<u64> for CheckRunId {
@@ -74,7 +74,7 @@ impl From<u64> for CheckRunId {
 
 /// Result of a completed code review.
 /// Matches the schema sent to OpenAI.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewResult {
     pub reasoning: String,
     #[serde(rename = "substantiveComments")]
@@ -83,7 +83,7 @@ pub struct ReviewResult {
 }
 
 /// Reason why a batch failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureReason {
     /// OpenAI batch processing failed.
     BatchFailed { error: Option<String> },
@@ -122,7 +122,7 @@ impl fmt::Display for FailureReason {
 }
 
 /// Reason why a review was cancelled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancellationReason {
     /// User explicitly requested cancellation via command.
     UserRequested,
@@ -155,7 +155,7 @@ impl fmt::Display for CancellationReason {
 }
 
 /// Options for a review request.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReviewOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -174,7 +174,8 @@ impl From<crate::command::ReviewOptions> for ReviewOptions {
 ///
 /// Each variant represents a distinct state the review can be in.
 /// The `reviews_enabled` field tracks whether automatic reviews are on/off for this PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum ReviewMachineState {
     /// No active review for this PR/commit.
     Idle { reviews_enabled: bool },
@@ -542,5 +543,171 @@ mod tests {
             new_sha: CommitSha("abc123def".into()),
         };
         assert_eq!(format!("{}", reason), "superseded by abc123d");
+    }
+
+    // =========================================================================
+    // Serialization round-trip tests
+    // =========================================================================
+
+    /// Test that all state variants survive JSON serialization round-trip.
+    #[test]
+    fn test_serialization_roundtrip_all_variants() {
+        let states = vec![
+            ReviewMachineState::Idle {
+                reviews_enabled: true,
+            },
+            ReviewMachineState::Idle {
+                reviews_enabled: false,
+            },
+            ReviewMachineState::Preparing {
+                reviews_enabled: true,
+                head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
+                options: ReviewOptions {
+                    model: Some("gpt-4".into()),
+                    reasoning_effort: Some("high".into()),
+                },
+            },
+            ReviewMachineState::AwaitingAncestryCheck {
+                reviews_enabled: true,
+                batch_id: BatchId("batch_123".into()),
+                head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
+                comment_id: Some(CommentId(100)),
+                check_run_id: Some(CheckRunId(200)),
+                model: "gpt-4".into(),
+                reasoning_effort: "high".into(),
+                new_head_sha: CommitSha("new123".into()),
+                new_base_sha: CommitSha("new456".into()),
+                new_options: ReviewOptions::default(),
+            },
+            ReviewMachineState::BatchPending {
+                reviews_enabled: true,
+                batch_id: BatchId("batch_456".into()),
+                head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
+                comment_id: None,
+                check_run_id: None,
+                model: "gpt-4".into(),
+                reasoning_effort: "medium".into(),
+            },
+            ReviewMachineState::Completed {
+                reviews_enabled: true,
+                head_sha: CommitSha("abc123".into()),
+                result: ReviewResult {
+                    reasoning: "Analysis complete".into(),
+                    substantive_comments: true,
+                    summary: "Found issues".into(),
+                },
+            },
+            ReviewMachineState::Failed {
+                reviews_enabled: false,
+                head_sha: CommitSha("abc123".into()),
+                reason: FailureReason::BatchExpired,
+            },
+            ReviewMachineState::Failed {
+                reviews_enabled: true,
+                head_sha: CommitSha("abc123".into()),
+                reason: FailureReason::BatchFailed {
+                    error: Some("timeout".into()),
+                },
+            },
+            ReviewMachineState::Cancelled {
+                reviews_enabled: true,
+                head_sha: CommitSha("abc123".into()),
+                reason: CancellationReason::UserRequested,
+                pending_cancel_batch_id: None,
+            },
+            ReviewMachineState::Cancelled {
+                reviews_enabled: true,
+                head_sha: CommitSha("abc123".into()),
+                reason: CancellationReason::Superseded {
+                    new_sha: CommitSha("new123".into()),
+                },
+                pending_cancel_batch_id: Some(BatchId("batch_old".into())),
+            },
+        ];
+
+        for state in states {
+            let json = serde_json::to_string(&state).expect("serialization should succeed");
+            let deserialized: ReviewMachineState =
+                serde_json::from_str(&json).expect("deserialization should succeed");
+            assert_eq!(
+                state, deserialized,
+                "Round-trip failed for state: {:?}",
+                state
+            );
+        }
+    }
+
+    /// Test that the JSON format uses tagged unions (has "type" field).
+    #[test]
+    fn test_serialization_format_has_type_tag() {
+        let state = ReviewMachineState::Idle {
+            reviews_enabled: true,
+        };
+        let json = serde_json::to_string(&state).expect("serialization should succeed");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("should be valid JSON");
+        assert_eq!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some("Idle"),
+            "JSON should have 'type' field with variant name"
+        );
+    }
+
+    /// Test all FailureReason variants serialize correctly.
+    #[test]
+    fn test_failure_reason_serialization() {
+        let reasons = vec![
+            FailureReason::BatchFailed { error: None },
+            FailureReason::BatchFailed {
+                error: Some("error msg".into()),
+            },
+            FailureReason::BatchExpired,
+            FailureReason::BatchCancelled,
+            FailureReason::DownloadFailed {
+                error: "download error".into(),
+            },
+            FailureReason::ParseFailed {
+                error: "parse error".into(),
+            },
+            FailureReason::NoOutputFile,
+            FailureReason::SubmissionFailed {
+                error: "submit error".into(),
+            },
+            FailureReason::DataFetchFailed {
+                reason: "fetch error".into(),
+            },
+        ];
+
+        for reason in reasons {
+            let json = serde_json::to_string(&reason).expect("serialization should succeed");
+            let deserialized: FailureReason =
+                serde_json::from_str(&json).expect("deserialization should succeed");
+            assert_eq!(reason, deserialized);
+        }
+    }
+
+    /// Test all CancellationReason variants serialize correctly.
+    #[test]
+    fn test_cancellation_reason_serialization() {
+        let reasons = vec![
+            CancellationReason::UserRequested,
+            CancellationReason::Superseded {
+                new_sha: CommitSha("abc123".into()),
+            },
+            CancellationReason::ReviewsDisabled,
+            CancellationReason::External,
+            CancellationReason::NoChanges,
+            CancellationReason::DiffTooLarge,
+            CancellationReason::NoFiles,
+        ];
+
+        for reason in reasons {
+            let json = serde_json::to_string(&reason).expect("serialization should succeed");
+            let deserialized: CancellationReason =
+                serde_json::from_str(&json).expect("deserialization should succeed");
+            assert_eq!(reason, deserialized);
+        }
     }
 }

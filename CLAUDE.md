@@ -62,21 +62,7 @@ The library handles:
 
 This is a GitHub webhook-based bot that provides automated code reviews using OpenAI's batch API. The system uses async processing with background polling for batch completion and internally uses robocop-core types.
 
-**Core Flow:**
-1. **Webhook Reception**: Receives GitHub PR webhooks on `/webhook` endpoint
-2. **Event Filtering**: Only processes events from the configured target user ID
-3. **Diff Collection**: Gets diffs and changed file contents via GitHub API
-4. **Batch Submission**: Submits review request to OpenAI batch API for async processing
-5. **Polling Loop**: Background task polls batch status every 60 seconds
-6. **Result Processing**: Updates PR comments with review results when batches complete
-
-**Key Components:**
-- **AppState**: Central state container with GitHub/OpenAI clients and pending batch tracking
-- **Webhook Handler** (`robocop-server/src/webhook.rs`): Processes GitHub webhooks with signature verification
-- **GitHub Client** (`robocop-server/src/github.rs`): Handles GitHub API interactions with JWT authentication
-- **OpenAI Client** (`robocop-server/src/openai.rs`): Async wrapper around OpenAI batch API requests (uses types from robocop-core)
-- **Recording System** (`robocop-server/src/recording/`): Optional HTTP request/response logging for debugging
-- **Git Operations** (`robocop-server/src/git.rs`): Git ancestry checking for superseded commit handling
+The server is built around a state machine and an effects mechanism, with the core logic fully pure and testable.
 
 **Batch Processing:**
 The system uses OpenAI's batch API for cost-effective async processing. When new commits supersede existing ones, it automatically cancels obsolete batches using git ancestry checks.
@@ -111,6 +97,7 @@ Environment variables required:
 - `PORT`: Server port (default: 3000)
 - `RECORDING_ENABLED`: Enable HTTP recording (default: false)
 - `RECORDING_LOG_PATH`: Recording log file path (default: recordings.jsonl)
+- `SQLITE_DB_PATH`: SQLite database path for state persistence (default: robocop.db)
 
 
 ### Review Dashboard
@@ -177,6 +164,7 @@ nix develop --command cargo run -p robocop-cli -- list-models
 - **Batch Processing**: Uses OpenAI's batch API for cost-effective async processing (wraps robocop-core types)
 - **HTTP Recording**: Optional request/response logging for debugging
 - **Async Runtime**: Uses tokio for async webhook handling and polling
+- **State Persistence**: SQLite-backed state store for restart safety; PR states and pending batches survive server restarts
 
 ### Robocop CLI
 - **Async Runtime**: Uses tokio with single-threaded runtime for async operations
@@ -205,6 +193,7 @@ nix develop --command cargo run -p robocop-cli -- list-models
 - **axum**: Web framework for webhook handling
 - **GitHub API**: JWT authentication and webhook processing
 - **reqwest-middleware**: HTTP middleware for recording
+- **rusqlite**: SQLite database for state persistence
 
 ### Robocop CLI
 - **robocop-core**: Core library for OpenAI integration and prompt management
