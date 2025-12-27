@@ -3,10 +3,12 @@
 //! This module wraps the in-memory `StateStore` with SQLite persistence,
 //! providing restart safety for the PR state machine.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 
 use crate::db::SqliteDb;
@@ -19,9 +21,21 @@ use crate::state_machine::store::{StateMachinePrId, StateStore};
 ///
 /// Uses write-through caching: the in-memory `StateStore` is the fast path,
 /// and changes are persisted to SQLite after each mutation.
+///
+/// # Concurrency
+///
+/// This store maintains per-PR locks to ensure that memory mutations and their
+/// corresponding DB writes are atomic. Without this, concurrent events for the
+/// same PR could interleave such that DB writes complete out-of-order, leaving
+/// the database with stale state after a restart.
 pub struct PersistentStateStore {
     memory_store: StateStore,
     db: Arc<SqliteDb>,
+    /// Per-PR locks to serialize memory mutations and DB persistence together.
+    ///
+    /// This ensures that for any given PR, the sequence "mutate memory → persist to DB"
+    /// is atomic with respect to other operations on the same PR.
+    pr_locks: RwLock<HashMap<StateMachinePrId, Arc<Mutex<()>>>>,
 }
 
 impl PersistentStateStore {
@@ -57,14 +71,43 @@ impl PersistentStateStore {
                 .await;
         }
 
-        Ok(Self { memory_store, db })
+        Ok(Self {
+            memory_store,
+            db,
+            pr_locks: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Create a persistent store with an in-memory database (for testing).
     pub fn new_in_memory() -> Result<Self> {
         let db = Arc::new(SqliteDb::new_in_memory()?);
         let memory_store = StateStore::new();
-        Ok(Self { memory_store, db })
+        Ok(Self {
+            memory_store,
+            db,
+            pr_locks: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Get or create a lock for a specific PR.
+    ///
+    /// This lock serializes memory mutations and DB persistence for a PR,
+    /// ensuring they complete atomically with respect to other operations.
+    async fn get_or_create_pr_lock(&self, pr_id: &StateMachinePrId) -> Arc<Mutex<()>> {
+        // Fast path: check if lock already exists
+        {
+            let locks = self.pr_locks.read().await;
+            if let Some(lock) = locks.get(pr_id) {
+                return lock.clone();
+            }
+        }
+
+        // Slow path: create lock (double-check after acquiring write lock)
+        let mut locks = self.pr_locks.write().await;
+        locks
+            .entry(pr_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Persist a state to the database.
@@ -132,11 +175,17 @@ impl PersistentStateStore {
     /// Get or initialize the state for a PR with the given reviews_enabled setting.
     ///
     /// If the state is created or modified, it will be persisted to the database.
+    ///
+    /// This method holds a per-PR lock to ensure the memory mutation and DB
+    /// persistence are atomic.
     pub async fn get_or_init(
         &self,
         pr_id: &StateMachinePrId,
         reviews_enabled: bool,
     ) -> ReviewMachineState {
+        let pr_lock = self.get_or_create_pr_lock(pr_id).await;
+        let _guard = pr_lock.lock().await;
+
         let state = self.memory_store.get_or_init(pr_id, reviews_enabled).await;
         self.persist(pr_id, &state).await;
         state
@@ -148,15 +197,33 @@ impl PersistentStateStore {
     }
 
     /// Set the state for a PR and persist to database.
+    ///
+    /// This method holds a per-PR lock to ensure the memory mutation and DB
+    /// persistence are atomic.
     pub async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) {
+        let pr_lock = self.get_or_create_pr_lock(&pr_id).await;
+        let _guard = pr_lock.lock().await;
+
         self.memory_store.set(pr_id.clone(), state.clone()).await;
         self.persist(&pr_id, &state).await;
     }
 
     /// Remove the state for a PR and delete from database.
+    ///
+    /// This method holds a per-PR lock to ensure the memory mutation and DB
+    /// deletion are atomic.
     pub async fn remove(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
+        let pr_lock = self.get_or_create_pr_lock(pr_id).await;
+        let _guard = pr_lock.lock().await;
+
         let result = self.memory_store.remove(pr_id).await;
         self.delete_from_db(pr_id).await;
+
+        // Clean up the lock entry after deletion (we're still holding it, so this is safe)
+        drop(_guard);
+        let mut locks = self.pr_locks.write().await;
+        locks.remove(pr_id);
+
         result
     }
 
@@ -188,12 +255,20 @@ impl PersistentStateStore {
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// After processing, the final state is persisted to the database.
+    ///
+    /// This method holds a per-PR lock to ensure the memory mutation and DB
+    /// persistence are atomic. This prevents concurrent events for the same PR
+    /// from interleaving their DB writes, which could leave the database with
+    /// stale state after a restart.
     pub async fn process_event(
         &self,
         pr_id: &StateMachinePrId,
         event: Event,
         ctx: &InterpreterContext,
     ) -> ReviewMachineState {
+        let pr_lock = self.get_or_create_pr_lock(pr_id).await;
+        let _guard = pr_lock.lock().await;
+
         let final_state = self.memory_store.process_event(pr_id, event, ctx).await;
         self.persist(pr_id, &final_state).await;
         final_state

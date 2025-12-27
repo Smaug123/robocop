@@ -32,9 +32,10 @@ const SCHEMA_VERSION: i32 = 1;
 
 /// SQLite database for persisting PR state machine states.
 ///
-/// Uses a `Mutex<Connection>` because rusqlite connections are not `Send`.
-/// Callers should wrap operations in `tokio::task::spawn_blocking` for
-/// async compatibility.
+/// Uses a `Mutex<Connection>` because `rusqlite::Connection` is not `Sync`
+/// (it cannot be shared between threads without synchronization). The Mutex
+/// provides the required synchronization. Callers should wrap operations in
+/// `tokio::task::spawn_blocking` for async compatibility.
 pub struct SqliteDb {
     conn: Mutex<Connection>,
 }
