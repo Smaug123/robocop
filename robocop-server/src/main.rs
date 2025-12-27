@@ -13,7 +13,7 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, Level};
 
-use robocop_server::batch_processor::batch_polling_loop;
+use robocop_server::batch_processor::{batch_polling_loop, recover_preparing_states};
 use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
@@ -195,6 +195,10 @@ async fn main() -> Result<()> {
         state_store: Arc::new(state_store),
         recording_logger,
     });
+
+    // Recover any PRs stuck in Preparing state from a prior crash.
+    // This re-drives FetchData for each stuck PR to avoid them being stuck indefinitely.
+    recover_preparing_states(&app_state).await;
 
     let app = Router::new()
         .route("/health", get(health_check))

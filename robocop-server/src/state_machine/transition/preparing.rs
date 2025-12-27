@@ -235,22 +235,42 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             }],
         ),
 
-        // Same commit while preparing -> no change (duplicate request)
+        // Same commit while preparing -> re-drive FetchData
+        // This handles the case where we crashed during FetchData on a previous attempt.
+        // Instead of ignoring the duplicate request, we restart the fetch.
+        // This is also useful for manual retries via `/review` command.
         (
-            ReviewMachineState::Preparing { head_sha, .. },
-            Event::ReviewRequested {
-                head_sha: new_head_sha,
+            ReviewMachineState::Preparing {
+                head_sha,
+                base_sha,
+                reviews_enabled,
                 ..
             },
+            Event::ReviewRequested {
+                head_sha: new_head_sha,
+                base_sha: new_base_sha,
+                options,
+            },
         ) if head_sha == &new_head_sha => TransitionResult::new(
-            state.clone(),
-            vec![Effect::Log {
-                level: LogLevel::Info,
-                message: format!(
-                    "Ignoring duplicate ReviewRequested for same commit {}",
-                    head_sha.short()
-                ),
-            }],
+            ReviewMachineState::Preparing {
+                reviews_enabled: *reviews_enabled,
+                head_sha: head_sha.clone(),
+                base_sha: new_base_sha,
+                options,
+            },
+            vec![
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Re-driving FetchData for commit {} (duplicate ReviewRequested, may be recovery)",
+                        head_sha.short()
+                    ),
+                },
+                Effect::FetchData {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
+            ],
         ),
 
         // ReviewRequested while preparing -> restart with new options

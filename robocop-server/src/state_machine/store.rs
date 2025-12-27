@@ -17,6 +17,16 @@ use super::transition::{transition, TransitionResult};
 use crate::github::GitHubClient;
 use crate::openai::OpenAIClient;
 
+/// Information about a PR in the `Preparing` state, used for startup recovery.
+#[derive(Debug, Clone)]
+pub struct PreparingPrInfo {
+    pub pr_id: StateMachinePrId,
+    pub installation_id: u64,
+    pub head_sha: CommitSha,
+    pub base_sha: CommitSha,
+    pub options: ReviewOptions,
+}
+
 /// Unique identifier for a pull request across repositories.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StateMachinePrId {
@@ -207,6 +217,39 @@ impl StateStore {
                 let batch_id = state.pending_batch_id()?;
                 let installation_id = installation_ids.get(id).copied()?;
                 Some((id.clone(), batch_id.clone(), installation_id))
+            })
+            .collect()
+    }
+
+    /// Get all PRs in `Preparing` state with their information.
+    ///
+    /// Used for startup recovery: if the server crashed after persisting a PR
+    /// in `Preparing` state but before/during `FetchData` execution, we need
+    /// to re-drive the effect to avoid the PR being stuck indefinitely.
+    pub async fn get_preparing_pr_ids(&self) -> Vec<PreparingPrInfo> {
+        let states = self.states.read().await;
+        let installation_ids = self.installation_ids.read().await;
+        states
+            .iter()
+            .filter_map(|(id, state)| {
+                if let ReviewMachineState::Preparing {
+                    head_sha,
+                    base_sha,
+                    options,
+                    ..
+                } = state
+                {
+                    let installation_id = installation_ids.get(id).copied()?;
+                    Some(PreparingPrInfo {
+                        pr_id: id.clone(),
+                        installation_id,
+                        head_sha: head_sha.clone(),
+                        base_sha: base_sha.clone(),
+                        options: options.clone(),
+                    })
+                } else {
+                    None
+                }
             })
             .collect()
     }

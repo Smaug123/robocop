@@ -19,17 +19,23 @@
 //! persisted. Effects are designed to be idempotent (via the two-phase commit
 //! in `execute_submit_batch`), so re-executing them is safe.
 //!
-//! For example, when processing a `DataFetched` event:
-//! 1. Transition: `Preparing` stays `Preparing`, effects = [SubmitBatch]
-//! 2. Persist `Preparing` (no-op, already persisted)
-//! 3. Execute `SubmitBatch` → may crash here
-//! 4. If SubmitBatch succeeds, returns `BatchSubmitted`
-//! 5. Transition: `Preparing` + `BatchSubmitted` → `BatchPending`
-//! 6. Persist `BatchPending` (now we have the batch_id saved)
-//! 7. Execute UI effects (UpdateComment, etc.)
+//! ## Preparing State Recovery
+//!
+//! If the server crashes during `FetchData` while in `Preparing` state:
+//! - On startup, `recover_preparing_states()` re-drives `FetchData` for stuck PRs
+//! - Manual retry via `/review` command also re-drives `FetchData`
+//!
+//! ## Batch Submission Idempotency
 //!
 //! The two-phase commit in `execute_submit_batch` (reserve/submit/confirm)
 //! ensures idempotency even if we crash during the OpenAI call.
+//!
+//! ## Multi-Instance Deployments
+//!
+//! When multiple instances share the same SQLite database:
+//! - Stale submission reservations are cleaned up periodically (every 5 min)
+//! - If instance A crashes mid-submission, instance B can eventually proceed
+//! - The staleness threshold (10 minutes) prevents interfering with active submissions
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,7 +49,7 @@ use crate::db::SqliteDb;
 use crate::state_machine::event::Event;
 use crate::state_machine::interpreter::InterpreterContext;
 use crate::state_machine::state::{BatchId, ReviewMachineState};
-use crate::state_machine::store::{StateMachinePrId, StateStore};
+use crate::state_machine::store::{PreparingPrInfo, StateMachinePrId, StateStore};
 
 /// Persistent state store that wraps `StateStore` with SQLite persistence.
 ///
@@ -287,6 +293,15 @@ impl PersistentStateStore {
     /// Get all pending batches with their PR information.
     pub async fn get_pending_batches(&self) -> Vec<(StateMachinePrId, BatchId, u64)> {
         self.memory_store.get_pending_batches().await
+    }
+
+    /// Get all PR IDs that are stuck in `Preparing` state.
+    ///
+    /// Used for startup recovery: if the server crashed after persisting a PR
+    /// in `Preparing` state but before/during `FetchData` execution, we need
+    /// to re-drive the effect to avoid the PR being stuck indefinitely.
+    pub async fn get_preparing_pr_ids(&self) -> Vec<PreparingPrInfo> {
+        self.memory_store.get_preparing_pr_ids().await
     }
 
     /// Process an event for a PR: transition the state and execute effects.

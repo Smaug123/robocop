@@ -16,7 +16,7 @@ pub use github::*;
 pub use openai::*;
 pub use persistent_store::PersistentStateStore;
 pub use review_state::{PullRequestId, ReviewState};
-pub use state_machine::{StateMachinePrId, StateStore};
+pub use state_machine::{PreparingPrInfo, StateMachinePrId, StateStore};
 
 // Re-export recording types from robocop_core
 pub use robocop_core::{

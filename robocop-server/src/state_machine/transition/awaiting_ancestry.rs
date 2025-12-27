@@ -113,6 +113,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                         },
                     },
                 },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
             ];
 
             if let Some(cr_id) = check_run_id {
@@ -180,6 +185,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                             new_sha: new_head_sha.clone(),
                         },
                     },
+                },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
                 },
             ];
 
@@ -446,6 +456,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                         },
                     },
                 },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
             ];
 
             if let Some(cr_id) = check_run_id {
@@ -573,6 +588,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                             new_sha: new_head_sha.clone(),
                         },
                     },
+                },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
                 },
             ];
 
@@ -709,6 +729,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 Effect::UpdateComment {
                     content: CommentContent::ReviewsDisabled { cancelled_count: 1 },
                 },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
             ];
 
             if let Some(cr_id) = check_run_id {
@@ -794,6 +819,11 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                         head_sha: head_sha.clone(),
                         reason: CancellationReason::UserRequested,
                     },
+                },
+                // Clear the batch submission cache so re-reviews are possible
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                 },
             ];
 

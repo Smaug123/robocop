@@ -985,13 +985,18 @@ mod tests {
         );
     }
 
-    /// Regression test: ReviewRequested for the SAME commit while Preparing
-    /// should NOT restart FetchData - it's a duplicate request.
+    /// Test that ReviewRequested for the same commit while in Preparing state
+    /// re-drives FetchData.
     ///
-    /// Bug: Without SHA comparison, concurrent review requests for the same commit
-    /// can each trigger FetchData, leading to multiple batch submissions.
+    /// This behavior supports crash recovery: if the server crashed during FetchData,
+    /// the PR would be stuck in Preparing state. By re-driving FetchData on duplicate
+    /// ReviewRequested, we allow recovery via manual `/review` command or startup
+    /// recovery.
+    ///
+    /// Duplicate batch submissions are prevented by the two-phase commit idempotency
+    /// mechanism in `execute_submit_batch`, so re-fetching is safe.
     #[test]
-    fn test_review_requested_same_commit_while_preparing_does_not_restart() {
+    fn test_review_requested_same_commit_while_preparing_redrives_fetch() {
         let state = ReviewMachineState::Preparing {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
@@ -1008,13 +1013,13 @@ mod tests {
 
         let result = transition(state, event);
 
-        // Should NOT emit FetchData (would cause duplicate batch)
+        // Should re-drive FetchData (for crash recovery)
         assert!(
-            !result
+            result
                 .effects
                 .iter()
                 .any(|e| matches!(e, Effect::FetchData { .. })),
-            "Should NOT restart FetchData for same commit - got: {:?}",
+            "Should re-drive FetchData for same commit - got: {:?}",
             result.effects
         );
 
@@ -1025,7 +1030,7 @@ mod tests {
             result.state
         );
 
-        // Should log the duplicate (matching BatchPending pattern)
+        // Should log the recovery
         assert!(
             result.effects.iter().any(|e| matches!(
                 e,
@@ -1034,7 +1039,7 @@ mod tests {
                     ..
                 }
             )),
-            "Should log the duplicate event"
+            "Should log the recovery attempt"
         );
     }
 
@@ -3094,6 +3099,78 @@ mod property_tests {
                         "Batch {:?} was orphaned! Old batch: {:?}, New batch: {:?}, \
                          Event: {:?}, New state: {:?}, Effects: {:?}",
                         old_id, old_batch, new_batch,
+                        event.log_summary(),
+                        std::mem::discriminant(&result.state),
+                        result.effects.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+
+        /// Property: When transitioning from a batch-processing state to a terminal
+        /// state, the effects MUST include ClearBatchSubmission for the batch's
+        /// (head_sha, base_sha) pair.
+        ///
+        /// This invariant ensures that the batch_submissions cache is properly
+        /// cleared when a review reaches a terminal state (Completed, Failed,
+        /// Cancelled). Without this, the cache entry would prevent future
+        /// re-submissions for the same commit.
+        ///
+        /// States with pending batches:
+        /// - BatchPending (batch_id, head_sha, base_sha)
+        /// - AwaitingAncestryCheck (batch_id, head_sha, base_sha)
+        /// - Cancelled with pending_cancel_batch_id (for failed cancels)
+        ///
+        /// Terminal states:
+        /// - Completed
+        /// - Failed
+        /// - Cancelled (without pending_cancel_batch_id)
+        #[test]
+        fn terminal_transitions_clear_batch_submission(
+            (state, event) in arb_state_and_contextual_event()
+        ) {
+            // Only test states that have a pending batch
+            let has_batch_before = state.pending_batch_id().is_some();
+            if !has_batch_before {
+                return Ok(()); // Skip states without batches
+            }
+
+            // Extract head_sha and base_sha from the state
+            let (expected_head_sha, expected_base_sha) = match &state {
+                ReviewMachineState::BatchPending { head_sha, base_sha, .. } |
+                ReviewMachineState::AwaitingAncestryCheck { head_sha, base_sha, .. } => {
+                    (Some(head_sha.clone()), Some(base_sha.clone()))
+                }
+                ReviewMachineState::Cancelled { head_sha, base_sha, pending_cancel_batch_id: Some(_), .. } => {
+                    (Some(head_sha.clone()), Some(base_sha.clone()))
+                }
+                _ => (None, None),
+            };
+
+            let result = transition(state.clone(), event.clone());
+
+            // Check if we transitioned to a terminal state without a pending batch
+            let is_terminal_without_batch = result.state.is_terminal()
+                && result.state.pending_batch_id().is_none();
+
+            if is_terminal_without_batch {
+                // Must have ClearBatchSubmission for the original head_sha/base_sha
+                if let (Some(head_sha), Some(base_sha)) = (expected_head_sha, expected_base_sha) {
+                    let has_clear_effect = result.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            Effect::ClearBatchSubmission {
+                                head_sha: clear_head,
+                                base_sha: clear_base,
+                            } if clear_head == &head_sha && clear_base == &base_sha
+                        )
+                    });
+
+                    prop_assert!(
+                        has_clear_effect,
+                        "Transition to terminal state without ClearBatchSubmission! \
+                         From state: {:?}, Event: {:?}, To state: {:?}, Effects: {:?}",
+                        std::mem::discriminant(&state),
                         event.log_summary(),
                         std::mem::discriminant(&result.state),
                         result.effects.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()

@@ -11,16 +11,53 @@ use crate::AppState;
 
 /// Main batch polling loop that runs in the background.
 ///
-/// This loop polls the state store for pending batches and generates
-/// appropriate events when batch status changes.
+/// This loop:
+/// 1. Polls the state store for pending batches and generates appropriate
+///    events when batch status changes
+/// 2. Cleans up stale batch submission reservations to prevent stuck PRs
+///    when another instance crashes mid-submission
 pub async fn batch_polling_loop(state: Arc<AppState>) {
-    let mut interval = interval(Duration::from_secs(60)); // Poll every minute
+    let mut batch_poll_interval = interval(Duration::from_secs(60)); // Poll every minute
+    let mut cleanup_interval = interval(Duration::from_secs(300)); // Cleanup every 5 minutes
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = batch_poll_interval.tick() => {
+                if let Err(e) = poll_pending_batches(&state).await {
+                    error!("Error polling batches: {}", e);
+                }
+            }
+            _ = cleanup_interval.tick() => {
+                cleanup_stale_submissions(&state).await;
+            }
+        }
+    }
+}
 
-        if let Err(e) = poll_pending_batches(&state).await {
-            error!("Error polling batches: {}", e);
+/// Clean up stale batch submission reservations.
+///
+/// This handles the case where another instance reserved a slot (status='submitting')
+/// but crashed before confirming. Without cleanup, PRs deferred via
+/// `InProgressByOtherInstance` would be stuck until the next server restart.
+async fn cleanup_stale_submissions(state: &Arc<AppState>) {
+    let db = state.state_store.db();
+    match tokio::task::spawn_blocking(move || db.delete_stale_incomplete_submissions()).await {
+        Ok(Ok(stale_keys)) => {
+            for key in &stale_keys {
+                info!(
+                    "Cleaned up stale batch submission for {}/{} PR#{} sha {} (older than 10 minutes)",
+                    key.repo_owner, key.repo_name, key.pr_number, key.head_sha
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Failed to clean up stale submissions: {}", e);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "spawn_blocking panicked cleaning up stale submissions: {}",
+                e
+            );
         }
     }
 }
@@ -228,6 +265,52 @@ struct ResponsesApiContent {
     content_type: String,
     /// Text is optional because some content types (e.g., refusal) may not have it
     text: Option<String>,
+}
+
+/// Recover PRs stuck in `Preparing` state.
+///
+/// Called during startup to re-drive `FetchData` for any PRs that were in the
+/// `Preparing` state when the server crashed. Without this, these PRs would
+/// remain stuck indefinitely because:
+/// - The webhook was already acknowledged before background processing started
+/// - The polling loop only handles pending batches, not `Preparing` states
+///
+/// This function sends a `ReviewRequested` event for each stuck PR, which
+/// triggers the state machine to re-run `FetchData`.
+pub async fn recover_preparing_states(state: &Arc<AppState>) {
+    let preparing_prs = state.state_store.get_preparing_pr_ids().await;
+
+    if preparing_prs.is_empty() {
+        return;
+    }
+
+    info!(
+        "Recovering {} PRs stuck in Preparing state",
+        preparing_prs.len()
+    );
+
+    for pr_info in preparing_prs {
+        info!(
+            "Recovering PR #{} ({}/{}) at commit {}",
+            pr_info.pr_id.pr_number,
+            pr_info.pr_id.repo_owner,
+            pr_info.pr_id.repo_name,
+            pr_info.head_sha.short()
+        );
+
+        // Send a ReviewRequested event to re-trigger FetchData
+        let event = crate::state_machine::Event::ReviewRequested {
+            head_sha: pr_info.head_sha.clone(),
+            base_sha: pr_info.base_sha.clone(),
+            options: pr_info.options.clone(),
+        };
+
+        if let Err(e) =
+            create_and_process_event(state, &pr_info.pr_id, event, pr_info.installation_id).await
+        {
+            error!("Failed to recover PR #{}: {}", pr_info.pr_id.pr_number, e);
+        }
+    }
 }
 
 fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {

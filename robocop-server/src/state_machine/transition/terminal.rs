@@ -238,13 +238,21 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 // Clear the tracking - batch is done
                 pending_cancel_batch_id: None,
             },
-            vec![Effect::Log {
-                level: LogLevel::Info,
-                message: format!(
-                    "Batch {} completed after cancel was requested, ignoring result",
-                    batch_id
-                ),
-            }],
+            vec![
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Batch {} completed after cancel was requested, ignoring result",
+                        batch_id
+                    ),
+                },
+                // Clear the batch submission cache so re-reviews are possible
+                // (retry in case initial clear failed when transitioning to Cancelled)
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
+            ],
         ),
 
         // =====================================================================
