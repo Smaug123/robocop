@@ -5,30 +5,31 @@
 //!
 //! # Restart Safety
 //!
-//! State is persisted after EACH transition step, not just at the end of
-//! processing. This ensures that if we crash after an external effect (like
-//! submitting a batch to OpenAI), we still have the intermediate state saved.
+//! State is persisted BEFORE executing effects, not after. This ensures that
+//! if we crash during an external effect (like submitting a batch to OpenAI),
+//! we've already recorded the new state.
 //!
-//! For example, when a `BatchSubmitted` event transitions us to `BatchPending`,
-//! we persist that state immediately. If we crash during subsequent UI update
-//! effects, on restart we'll have the `BatchPending` state with the batch_id.
+//! The sequence for each event is:
+//! 1. Compute transition (pure) → get new state and effects
+//! 2. Persist new state to SQLite
+//! 3. Execute effects (may call external APIs)
+//! 4. Process result events from effects
 //!
-//! ## Remaining Limitation
+//! If we crash during step 3, on restart we'll have the new state already
+//! persisted. Effects are designed to be idempotent (via the two-phase commit
+//! in `execute_submit_batch`), so re-executing them is safe.
 //!
-//! There is still a small window during the `SubmitBatch` effect execution
-//! where a crash could orphan a batch. The sequence is:
-//! 1. Transition to `Preparing`, persist
-//! 2. Execute `SubmitBatch` effect → batch created in OpenAI
-//! 3. Effect returns `BatchSubmitted` event
-//! 4. Process event → transition to `BatchPending`, persist
+//! For example, when processing a `DataFetched` event:
+//! 1. Transition: `Preparing` stays `Preparing`, effects = [SubmitBatch]
+//! 2. Persist `Preparing` (no-op, already persisted)
+//! 3. Execute `SubmitBatch` → may crash here
+//! 4. If SubmitBatch succeeds, returns `BatchSubmitted`
+//! 5. Transition: `Preparing` + `BatchSubmitted` → `BatchPending`
+//! 6. Persist `BatchPending` (now we have the batch_id saved)
+//! 7. Execute UI effects (UpdateComment, etc.)
 //!
-//! If we crash between steps 2 and 3, the batch exists in OpenAI but we have
-//! no record of it. Fully solving this would require either:
-//! - Idempotency keys for OpenAI batch submission
-//! - A write-ahead log approach with "submitting" and "submitted" phases
-//!
-//! The current design significantly reduces the crash window compared to
-//! persisting only at the end of the event loop.
+//! The two-phase commit in `execute_submit_batch` (reserve/submit/confirm)
+//! ensures idempotency even if we crash during the OpenAI call.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -290,15 +291,16 @@ impl PersistentStateStore {
 
     /// Process an event for a PR: transition the state and execute effects.
     ///
-    /// This method persists state to the database after EACH transition step,
-    /// not just at the end. This provides better crash recovery: if we crash
-    /// after an external effect (like submitting a batch to OpenAI) but before
-    /// the final persist, we still have the intermediate state saved.
+    /// This method persists state to the database BEFORE executing effects,
+    /// providing crash safety. The sequence for each event is:
+    /// 1. Compute transition (pure) → get new state and effects
+    /// 2. Persist new state to memory and SQLite
+    /// 3. Execute effects (may call external APIs)
+    /// 4. Process result events from effects
     ///
-    /// For example, when processing a `BatchSubmitted` event that transitions
-    /// to `BatchPending`, we persist immediately after that transition. If we
-    /// crash during the subsequent UI update effects, we still have the
-    /// `BatchPending` state with the batch_id recorded.
+    /// If we crash during step 3, on restart we'll have the new state already
+    /// persisted. Effects are designed to be idempotent (via the two-phase
+    /// commit in `execute_submit_batch`), so re-executing them is safe.
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic. This prevents concurrent events for the same PR
@@ -324,26 +326,26 @@ impl PersistentStateStore {
         let mut events_to_process = vec![event];
 
         while let Some(event) = events_to_process.pop() {
-            // Process one transition step
-            let (new_state, result_events) = self
-                .memory_store
-                .process_event_step(pr_id, current_state, event, ctx)
-                .await;
+            // Step 1: Compute transition (pure, no I/O)
+            let (new_state, effects) =
+                self.memory_store
+                    .compute_transition(pr_id, current_state, event);
             current_state = new_state;
 
-            // Persist AFTER each transition, BEFORE processing result events.
-            // This ensures that if we crash during effect execution, we've
-            // already saved the state that resulted from processing the event.
-            //
-            // Critical case: after `BatchSubmitted` transitions us to `BatchPending`,
-            // we persist immediately. If we crash during the UI update effects,
-            // on restart we'll have the `BatchPending` state with the batch_id.
+            // Step 2: Persist BEFORE executing effects.
+            // This ensures that if we crash during effect execution, the new
+            // state is already saved. Effects are idempotent, so re-executing
+            // them on restart is safe.
             self.memory_store
                 .set(pr_id.clone(), current_state.clone())
                 .await;
             self.persist(pr_id, &current_state).await;
 
-            // Add result events to be processed (in reverse order so they're processed in order)
+            // Step 3: Execute effects (may call external APIs like OpenAI)
+            let result_events = self.memory_store.execute_effects(pr_id, effects, ctx).await;
+
+            // Step 4: Add result events to be processed
+            // (in reverse order so they're processed in order)
             for result_event in result_events.into_iter().rev() {
                 events_to_process.push(result_event);
             }

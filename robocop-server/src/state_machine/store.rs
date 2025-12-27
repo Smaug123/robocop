@@ -211,6 +211,58 @@ impl StateStore {
             .collect()
     }
 
+    /// Compute a transition without executing effects.
+    ///
+    /// This method performs the pure transition function, returning the new state
+    /// and the effects that should be executed. The effects are NOT executed.
+    ///
+    /// This is useful for `PersistentStateStore` which needs to persist state
+    /// BEFORE executing effects to ensure crash safety.
+    ///
+    /// Note: This method does NOT acquire the per-PR lock. The caller must
+    /// ensure proper serialization.
+    pub fn compute_transition(
+        &self,
+        pr_id: &StateMachinePrId,
+        current_state: ReviewMachineState,
+        event: Event,
+    ) -> (ReviewMachineState, Vec<super::effect::Effect>) {
+        info!(
+            "Computing transition for event {} on PR #{} in state {:?}",
+            event.log_summary(),
+            pr_id.pr_number,
+            current_state
+        );
+
+        let TransitionResult { state, effects } = transition(current_state, event);
+        (state, effects)
+    }
+
+    /// Execute effects and return result events.
+    ///
+    /// This is the effectful part of processing, separated from the pure transition
+    /// so that `PersistentStateStore` can persist state between transition and effects.
+    ///
+    /// Note: This method does NOT acquire the per-PR lock. The caller must
+    /// ensure proper serialization.
+    pub async fn execute_effects(
+        &self,
+        pr_id: &StateMachinePrId,
+        effects: Vec<super::effect::Effect>,
+        ctx: &InterpreterContext,
+    ) -> Vec<Event> {
+        if !effects.is_empty() {
+            info!(
+                "Executing {} effects for PR #{}",
+                effects.len(),
+                pr_id.pr_number
+            );
+            execute_effects(ctx, effects).await
+        } else {
+            vec![]
+        }
+    }
+
     /// Process a single event step: transition and execute effects.
     ///
     /// This method performs ONE transition and executes its effects, returning
@@ -231,26 +283,8 @@ impl StateStore {
         event: Event,
         ctx: &InterpreterContext,
     ) -> (ReviewMachineState, Vec<Event>) {
-        info!(
-            "Processing event {} for PR #{} in state {:?}",
-            event.log_summary(),
-            pr_id.pr_number,
-            current_state
-        );
-
-        let TransitionResult { state, effects } = transition(current_state, event);
-
-        let result_events = if !effects.is_empty() {
-            info!(
-                "Executing {} effects for PR #{}",
-                effects.len(),
-                pr_id.pr_number
-            );
-            execute_effects(ctx, effects).await
-        } else {
-            vec![]
-        };
-
+        let (state, effects) = self.compute_transition(pr_id, current_state, event);
+        let result_events = self.execute_effects(pr_id, effects, ctx).await;
         (state, result_events)
     }
 

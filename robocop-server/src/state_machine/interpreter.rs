@@ -709,12 +709,13 @@ async fn execute_submit_batch(
         .clone()
         .unwrap_or_else(|| "xhigh".to_string());
 
-    // Build idempotency key
+    // Build idempotency key (includes both head_sha and base_sha because the diff depends on both)
     let key = BatchSubmissionKey {
         repo_owner: ctx.repo_owner.clone(),
         repo_name: ctx.repo_name.clone(),
         pr_number: ctx.pr_number,
         head_sha: head_sha.0.clone(),
+        base_sha: base_sha.0.clone(),
     };
 
     // Phase 1: Reserve slot (or get cached batch data if already submitted)
@@ -725,12 +726,19 @@ async fn execute_submit_batch(
             Ok(Ok(cached)) => cached,
             Ok(Err(e)) => {
                 error!("Failed to reserve batch submission: {}", e);
-                // Continue without idempotency protection
-                None
+                return EffectResult::single(Event::BatchSubmissionFailed {
+                    error: format!("Database error: failed to reserve submission slot: {}", e),
+                    comment_id: None,
+                    check_run_id: None,
+                });
             }
             Err(e) => {
                 error!("spawn_blocking panicked during reserve: {}", e);
-                None
+                return EffectResult::single(Event::BatchSubmissionFailed {
+                    error: format!("Internal error: reservation task panicked: {}", e),
+                    comment_id: None,
+                    check_run_id: None,
+                });
             }
         }
     };
@@ -874,15 +882,22 @@ async fn execute_submit_batch(
                 .await
             {
                 Ok(Ok(())) => {
-                    // Confirmation succeeded
+                    info!("Confirmed batch submission {} in database", batch_id);
                 }
                 Ok(Err(db_err)) => {
-                    // DB operation failed - log but don't fail since batch was submitted
-                    error!("Failed to confirm batch submission in db: {}", db_err);
+                    // Log as critical - batch exists in OpenAI but DB state is inconsistent.
+                    // The batch will still be processed, but idempotency is compromised.
+                    error!(
+                        "CRITICAL: Batch {} submitted to OpenAI for PR #{} but confirmation failed: {}. \
+                         Batch may be orphaned and will expire in 24h.",
+                        batch_id, ctx.pr_number, db_err
+                    );
                 }
                 Err(join_err) => {
-                    // spawn_blocking panicked - log but don't fail since batch was submitted
-                    error!("spawn_blocking panicked during confirm: {}", join_err);
+                    error!(
+                        "CRITICAL: Task panicked while confirming batch {} for PR #{}: {}",
+                        batch_id, ctx.pr_number, join_err
+                    );
                 }
             }
 

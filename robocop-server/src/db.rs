@@ -28,17 +28,21 @@ use crate::state_machine::store::StateMachinePrId;
 /// 1. Increment this constant
 /// 2. Add a migration function `migrate_v{N}_to_v{N+1}`
 /// 3. Call it from `run_migrations`
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 1;
 
 /// Key for batch submission idempotency.
 ///
 /// Used to prevent duplicate batch submissions after crashes.
+/// Includes both head_sha and base_sha because the diff (and thus the review)
+/// depends on both - if the target branch moves, base_sha changes and we need
+/// a new review even if head_sha is the same.
 #[derive(Debug, Clone)]
 pub struct BatchSubmissionKey {
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
     pub head_sha: String,
+    pub base_sha: String,
 }
 
 /// Cached batch submission data returned when a batch was already submitted.
@@ -138,11 +142,6 @@ impl SqliteDb {
             Self::migrate_v0_to_v1(conn)?;
         }
 
-        // Migration v1 -> v2: Add UI IDs and options to batch_submissions
-        if from_version < 2 {
-            Self::migrate_v1_to_v2(conn)?;
-        }
-
         Ok(())
     }
 
@@ -216,38 +215,25 @@ impl SqliteDb {
 
             -- Batch submission idempotency table.
             -- Tracks batch submissions to prevent duplicates after crashes.
+            -- Key includes both head_sha and base_sha because the diff depends on both.
             CREATE TABLE IF NOT EXISTS batch_submissions (
                 repo_owner TEXT NOT NULL,
                 repo_name TEXT NOT NULL,
                 pr_number INTEGER NOT NULL,
                 head_sha TEXT NOT NULL,
+                base_sha TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('submitting', 'submitted')),
                 batch_id TEXT,  -- NULL while submitting, set after OpenAI confirms
+                comment_id INTEGER,
+                check_run_id INTEGER,
+                model TEXT,
+                reasoning_effort TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (repo_owner, repo_name, pr_number, head_sha)
+                PRIMARY KEY (repo_owner, repo_name, pr_number, head_sha, base_sha)
             );
             "#,
         )
         .context("Failed to create initial schema (v0 -> v1)")?;
-
-        Ok(())
-    }
-
-    /// Migration v1 -> v2: Add UI IDs and options to batch_submissions for recovery.
-    ///
-    /// These columns allow returning the correct comment_id, check_run_id, model,
-    /// and reasoning_effort when a batch submission is retrieved from cache after
-    /// a crash between submission and state persistence.
-    fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            r#"
-            ALTER TABLE batch_submissions ADD COLUMN comment_id INTEGER;
-            ALTER TABLE batch_submissions ADD COLUMN check_run_id INTEGER;
-            ALTER TABLE batch_submissions ADD COLUMN model TEXT;
-            ALTER TABLE batch_submissions ADD COLUMN reasoning_effort TEXT;
-            "#,
-        )
-        .context("Failed to add UI columns to batch_submissions (v1 -> v2)")?;
 
         Ok(())
     }
@@ -679,12 +665,13 @@ impl SqliteDb {
             .query_row(
                 "SELECT status, batch_id, comment_id, check_run_id, model, reasoning_effort \
                  FROM batch_submissions \
-                 WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
+                 WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
                 rusqlite::params![
                     &key.repo_owner,
                     &key.repo_name,
                     key.pr_number,
-                    &key.head_sha
+                    &key.head_sha,
+                    &key.base_sha
                 ],
                 |row| {
                     Ok(BatchRow {
@@ -716,24 +703,26 @@ impl SqliteDb {
                         // Corrupted state: submitted without batch_id. Treat as stale.
                         conn.execute(
                             "DELETE FROM batch_submissions \
-                             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
+                             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
                             rusqlite::params![
                                 &key.repo_owner,
                                 &key.repo_name,
                                 key.pr_number,
-                                &key.head_sha
+                                &key.head_sha,
+                                &key.base_sha
                             ],
                         )
                         .context("Failed to delete corrupted submission")?;
 
                         conn.execute(
-                            "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, status) \
-                             VALUES (?1, ?2, ?3, ?4, 'submitting')",
+                            "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
                             rusqlite::params![
                                 &key.repo_owner,
                                 &key.repo_name,
                                 key.pr_number,
-                                &key.head_sha
+                                &key.head_sha,
+                                &key.base_sha
                             ],
                         )
                         .context("Failed to reserve batch submission")?;
@@ -747,21 +736,22 @@ impl SqliteDb {
                 // Delete the stale row and reserve fresh.
                 conn.execute(
                     "DELETE FROM batch_submissions \
-                     WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
+                     WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
                     rusqlite::params![
                         &key.repo_owner,
                         &key.repo_name,
                         key.pr_number,
-                        &key.head_sha
+                        &key.head_sha,
+                        &key.base_sha
                     ],
                 )
                 .context("Failed to delete stale submission")?;
 
                 // Insert new reservation
                 conn.execute(
-                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, status) \
-                     VALUES (?1, ?2, ?3, ?4, 'submitting')",
-                    rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number, &key.head_sha],
+                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
+                    rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number, &key.head_sha, &key.base_sha],
                 )
                 .context("Failed to reserve batch submission")?;
 
@@ -770,9 +760,9 @@ impl SqliteDb {
             None => {
                 // No existing row - insert reservation
                 conn.execute(
-                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, status) \
-                     VALUES (?1, ?2, ?3, ?4, 'submitting')",
-                    rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number, &key.head_sha],
+                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
+                    rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number, &key.head_sha, &key.base_sha],
                 )
                 .context("Failed to reserve batch submission")?;
 
@@ -785,6 +775,9 @@ impl SqliteDb {
     ///
     /// Updates the row from 'submitting' to 'submitted' and records the batch_id
     /// along with UI IDs and options for crash recovery.
+    ///
+    /// Returns an error if no reservation row exists (e.g., if reserve failed
+    /// but the caller proceeded anyway).
     pub fn confirm_batch_submission(
         &self,
         key: &BatchSubmissionKey,
@@ -792,20 +785,21 @@ impl SqliteDb {
     ) -> Result<()> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
-        conn.execute(
+        let rows_affected = conn.execute(
             "UPDATE batch_submissions SET \
                 status = 'submitted', \
-                batch_id = ?5, \
-                comment_id = ?6, \
-                check_run_id = ?7, \
-                model = ?8, \
-                reasoning_effort = ?9 \
-             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
+                batch_id = ?6, \
+                comment_id = ?7, \
+                check_run_id = ?8, \
+                model = ?9, \
+                reasoning_effort = ?10 \
+             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
             rusqlite::params![
                 &key.repo_owner,
                 &key.repo_name,
                 key.pr_number,
                 &key.head_sha,
+                &key.base_sha,
                 &data.batch_id,
                 data.comment_id,
                 data.check_run_id,
@@ -814,6 +808,17 @@ impl SqliteDb {
             ],
         )
         .context("Failed to confirm batch submission")?;
+
+        if rows_affected == 0 {
+            return Err(anyhow!(
+                "No pending submission found to confirm (owner={}, repo={}, pr={}, head={}, base={})",
+                key.repo_owner,
+                key.repo_name,
+                key.pr_number,
+                key.head_sha,
+                key.base_sha
+            ));
+        }
 
         Ok(())
     }
@@ -824,12 +829,13 @@ impl SqliteDb {
 
         conn.execute(
             "DELETE FROM batch_submissions \
-             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4",
+             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
             rusqlite::params![
                 &key.repo_owner,
                 &key.repo_name,
                 key.pr_number,
-                &key.head_sha
+                &key.head_sha,
+                &key.base_sha
             ],
         )
         .context("Failed to delete batch submission")?;
@@ -846,7 +852,7 @@ impl SqliteDb {
 
         let mut stmt = conn
             .prepare(
-                "SELECT repo_owner, repo_name, pr_number, head_sha \
+                "SELECT repo_owner, repo_name, pr_number, head_sha, base_sha \
                  FROM batch_submissions WHERE status = 'submitting'",
             )
             .context("Failed to prepare find_incomplete_submissions")?;
@@ -858,6 +864,7 @@ impl SqliteDb {
                     repo_name: row.get(1)?,
                     pr_number: row.get(2)?,
                     head_sha: row.get(3)?,
+                    base_sha: row.get(4)?,
                 })
             })
             .context("Failed to query incomplete submissions")?;
@@ -1451,6 +1458,7 @@ mod tests {
             repo_name: "repo".to_string(),
             pr_number: 42,
             head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
         };
 
         // First reservation should succeed and return None (no existing batch)
@@ -1467,6 +1475,7 @@ mod tests {
             repo_name: "repo".to_string(),
             pr_number: 42,
             head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
         };
 
         // Reserve and confirm
@@ -1505,6 +1514,7 @@ mod tests {
             repo_name: "repo".to_string(),
             pr_number: 42,
             head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
         };
 
         // Reserve but don't confirm (simulating crash)
@@ -1527,6 +1537,7 @@ mod tests {
             repo_name: "repo".to_string(),
             pr_number: 42,
             head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
         };
 
         // Reserve and confirm
@@ -1550,6 +1561,37 @@ mod tests {
     }
 
     #[test]
+    fn test_confirm_without_reserve_fails() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let key = BatchSubmissionKey {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
+        };
+
+        // Try to confirm without reserving first
+        let data = BatchSubmissionData {
+            batch_id: "batch_456".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4o".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        let result = db.confirm_batch_submission(&key, &data);
+        assert!(result.is_err(), "confirm without reserve should fail");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No pending submission"),
+            "error should indicate no pending submission"
+        );
+    }
+
+    #[test]
     fn test_delete_batch_submission() {
         let db = SqliteDb::new_in_memory().expect("should create in-memory db");
 
@@ -1558,6 +1600,7 @@ mod tests {
             repo_name: "repo".to_string(),
             pr_number: 42,
             head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
         };
 
         // Reserve
@@ -1580,18 +1623,21 @@ mod tests {
             repo_name: "repo".to_string(),
             pr_number: 1,
             head_sha: "sha1".to_string(),
+            base_sha: "base1".to_string(),
         };
         let key2 = BatchSubmissionKey {
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 2,
             head_sha: "sha2".to_string(),
+            base_sha: "base2".to_string(),
         };
         let key3 = BatchSubmissionKey {
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 3,
             head_sha: "sha3".to_string(),
+            base_sha: "base3".to_string(),
         };
 
         // key1: submitting (incomplete)
@@ -1626,20 +1672,22 @@ mod tests {
     }
 
     #[test]
-    fn test_different_shas_are_separate() {
+    fn test_different_head_shas_are_separate() {
         let db = SqliteDb::new_in_memory().expect("should create in-memory db");
 
         let key1 = BatchSubmissionKey {
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 42,
-            head_sha: "sha1".to_string(),
+            head_sha: "head1".to_string(),
+            base_sha: "base".to_string(),
         };
         let key2 = BatchSubmissionKey {
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
             pr_number: 42,
-            head_sha: "sha2".to_string(),
+            head_sha: "head2".to_string(),
+            base_sha: "base".to_string(),
         };
 
         // Reserve and confirm key1
@@ -1654,8 +1702,47 @@ mod tests {
         db.confirm_batch_submission(&key1, &data1)
             .expect("should confirm");
 
-        // key2 should be independent
+        // key2 should be independent (different head_sha)
         let result = db.reserve_batch_submission(&key2).expect("should reserve");
-        assert!(result.is_none(), "different SHA should be independent");
+        assert!(result.is_none(), "different head_sha should be independent");
+    }
+
+    #[test]
+    fn test_different_base_shas_are_separate() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let key1 = BatchSubmissionKey {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+            base_sha: "base1".to_string(),
+        };
+        let key2 = BatchSubmissionKey {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+            base_sha: "base2".to_string(),
+        };
+
+        // Reserve and confirm key1
+        db.reserve_batch_submission(&key1).expect("should reserve");
+        let data1 = BatchSubmissionData {
+            batch_id: "batch_1".to_string(),
+            comment_id: None,
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "medium".to_string(),
+        };
+        db.confirm_batch_submission(&key1, &data1)
+            .expect("should confirm");
+
+        // key2 should be independent (different base_sha)
+        let result = db.reserve_batch_submission(&key2).expect("should reserve");
+        assert!(
+            result.is_none(),
+            "different base_sha should be independent - this tests Issue 2"
+        );
     }
 }
