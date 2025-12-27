@@ -2,6 +2,33 @@
 //!
 //! This module wraps the in-memory `StateStore` with SQLite persistence,
 //! providing restart safety for the PR state machine.
+//!
+//! # Restart Safety
+//!
+//! State is persisted after EACH transition step, not just at the end of
+//! processing. This ensures that if we crash after an external effect (like
+//! submitting a batch to OpenAI), we still have the intermediate state saved.
+//!
+//! For example, when a `BatchSubmitted` event transitions us to `BatchPending`,
+//! we persist that state immediately. If we crash during subsequent UI update
+//! effects, on restart we'll have the `BatchPending` state with the batch_id.
+//!
+//! ## Remaining Limitation
+//!
+//! There is still a small window during the `SubmitBatch` effect execution
+//! where a crash could orphan a batch. The sequence is:
+//! 1. Transition to `Preparing`, persist
+//! 2. Execute `SubmitBatch` effect → batch created in OpenAI
+//! 3. Effect returns `BatchSubmitted` event
+//! 4. Process event → transition to `BatchPending`, persist
+//!
+//! If we crash between steps 2 and 3, the batch exists in OpenAI but we have
+//! no record of it. Fully solving this would require either:
+//! - Idempotency keys for OpenAI batch submission
+//! - A write-ahead log approach with "submitting" and "submitted" phases
+//!
+//! The current design significantly reduces the crash window compared to
+//! persisting only at the end of the event loop.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -212,17 +239,19 @@ impl PersistentStateStore {
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// deletion are atomic.
+    ///
+    /// Note: We intentionally do NOT remove the lock entry from `pr_locks` after deletion.
+    /// Removing the lock creates a race condition: if another task already cloned the Arc
+    /// and is waiting on the mutex, they will proceed after we release. If we then remove
+    /// the lock entry, a third task could create a NEW lock, allowing concurrent operations
+    /// on the same PR. The memory overhead of keeping lock entries is negligible (one
+    /// Arc<Mutex<()>> per PR ever seen).
     pub async fn remove(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
         let result = self.memory_store.remove(pr_id).await;
         self.delete_from_db(pr_id).await;
-
-        // Clean up the lock entry after deletion (we're still holding it, so this is safe)
-        drop(_guard);
-        let mut locks = self.pr_locks.write().await;
-        locks.remove(pr_id);
 
         result
     }
@@ -254,7 +283,15 @@ impl PersistentStateStore {
 
     /// Process an event for a PR: transition the state and execute effects.
     ///
-    /// After processing, the final state is persisted to the database.
+    /// This method persists state to the database after EACH transition step,
+    /// not just at the end. This provides better crash recovery: if we crash
+    /// after an external effect (like submitting a batch to OpenAI) but before
+    /// the final persist, we still have the intermediate state saved.
+    ///
+    /// For example, when processing a `BatchSubmitted` event that transitions
+    /// to `BatchPending`, we persist immediately after that transition. If we
+    /// crash during the subsequent UI update effects, we still have the
+    /// `BatchPending` state with the batch_id recorded.
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic. This prevents concurrent events for the same PR
@@ -269,9 +306,48 @@ impl PersistentStateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        let final_state = self.memory_store.process_event(pr_id, event, ctx).await;
-        self.persist(pr_id, &final_state).await;
-        final_state
+        // Store the installation_id for later use by batch polling
+        self.memory_store
+            .set_installation_id(pr_id, ctx.installation_id)
+            .await;
+
+        let mut current_state = self.memory_store.get_or_default(pr_id).await;
+
+        // Event loop: process initial event and any result events from effects
+        let mut events_to_process = vec![event];
+
+        while let Some(event) = events_to_process.pop() {
+            // Process one transition step
+            let (new_state, result_events) = self
+                .memory_store
+                .process_event_step(pr_id, current_state, event, ctx)
+                .await;
+            current_state = new_state;
+
+            // Persist AFTER each transition, BEFORE processing result events.
+            // This ensures that if we crash during effect execution, we've
+            // already saved the state that resulted from processing the event.
+            //
+            // Critical case: after `BatchSubmitted` transitions us to `BatchPending`,
+            // we persist immediately. If we crash during the UI update effects,
+            // on restart we'll have the `BatchPending` state with the batch_id.
+            self.memory_store
+                .set(pr_id.clone(), current_state.clone())
+                .await;
+            self.persist(pr_id, &current_state).await;
+
+            // Add result events to be processed (in reverse order so they're processed in order)
+            for result_event in result_events.into_iter().rev() {
+                events_to_process.push(result_event);
+            }
+        }
+
+        info!(
+            "Final state for PR #{}: {:?}",
+            pr_id.pr_number, current_state
+        );
+
+        current_state
     }
 }
 
