@@ -65,6 +65,7 @@ async fn create_and_process_event(
     let ctx = InterpreterContext {
         github_client: state.github_client.clone(),
         openai_client: state.openai_client.clone(),
+        db: state.state_store.db(),
         installation_id,
         repo_owner: pr_id.repo_owner.clone(),
         repo_name: pr_id.repo_name.clone(),

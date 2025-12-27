@@ -574,6 +574,7 @@ async fn process_cancel_reviews(
     let ctx = InterpreterContext {
         github_client: state.github_client.clone(),
         openai_client: state.openai_client.clone(),
+        db: state.state_store.db(),
         installation_id,
         repo_owner: repo_owner.clone(),
         repo_name: repo_name.clone(),
@@ -649,6 +650,7 @@ async fn process_enable_reviews(
     let ctx = InterpreterContext {
         github_client: state.github_client.clone(),
         openai_client: state.openai_client.clone(),
+        db: state.state_store.db(),
         installation_id,
         repo_owner: repo_owner.clone(),
         repo_name: repo_name.clone(),
@@ -699,6 +701,7 @@ async fn process_disable_reviews(
     let ctx = InterpreterContext {
         github_client: state.github_client.clone(),
         openai_client: state.openai_client.clone(),
+        db: state.state_store.db(),
         installation_id,
         repo_owner: repo_owner.clone(),
         repo_name: repo_name.clone(),
@@ -902,6 +905,7 @@ async fn process_code_review(
     let ctx = InterpreterContext {
         github_client: state.github_client.clone(),
         openai_client: state.openai_client.clone(),
+        db: state.state_store.db(),
         installation_id,
         repo_owner: repo_owner.clone(),
         repo_name: repo_name.clone(),

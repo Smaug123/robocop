@@ -317,6 +317,7 @@ impl StateStore {
 pub struct StateMachineContext {
     pub github_client: Arc<GitHubClient>,
     pub openai_client: Arc<OpenAIClient>,
+    pub db: Arc<crate::db::SqliteDb>,
     pub installation_id: u64,
     pub repo_owner: String,
     pub repo_name: String,
@@ -332,6 +333,7 @@ impl StateMachineContext {
         InterpreterContext {
             github_client: self.github_client.clone(),
             openai_client: self.openai_client.clone(),
+            db: self.db.clone(),
             installation_id: self.installation_id,
             repo_owner: self.repo_owner.clone(),
             repo_name: self.repo_name.clone(),

@@ -13,6 +13,7 @@ use super::effect::{
 };
 use super::event::{DataFetchFailure, Event, FileContent};
 use super::state::{BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, ReviewOptions};
+use crate::db::SqliteDb;
 use crate::github::{
     CheckRunOutput, CheckRunStatus, CreateCheckRunRequest, FileContentRequest, FileSizeLimits,
     GitHubClient, PullRequestInfo, UpdateCheckRunRequest,
@@ -24,6 +25,8 @@ use crate::{get_bot_version, CHECK_RUN_NAME};
 pub struct InterpreterContext {
     pub github_client: Arc<GitHubClient>,
     pub openai_client: Arc<OpenAIClient>,
+    /// Database for batch submission idempotency.
+    pub db: Arc<SqliteDb>,
     pub installation_id: u64,
     pub repo_owner: String,
     pub repo_name: String,
@@ -673,7 +676,16 @@ async fn execute_update_check_run(
     }
 }
 
-/// Submit a batch to OpenAI.
+/// Submit a batch to OpenAI with idempotency protection.
+///
+/// Uses a two-phase commit pattern to prevent duplicate batch submissions:
+/// 1. Reserve: Insert row with status='submitting' before OpenAI call
+/// 2. Submit: POST to OpenAI
+/// 3. Confirm: Update row with status='submitted' and batch_id
+///
+/// If we crash after step 2 but before step 3, on restart the reservation
+/// will be deleted and we'll re-submit (creating a duplicate batch in OpenAI,
+/// but the old one will expire after 24h).
 async fn execute_submit_batch(
     ctx: &InterpreterContext,
     diff: &str,
@@ -682,6 +694,7 @@ async fn execute_submit_batch(
     base_sha: &CommitSha,
     options: &ReviewOptions,
 ) -> EffectResult {
+    use crate::db::BatchSubmissionKey;
     use robocop_core::ReviewMetadata;
 
     let correlation_id = ctx.correlation_id.as_deref();
@@ -696,6 +709,51 @@ async fn execute_submit_batch(
         .clone()
         .unwrap_or_else(|| "xhigh".to_string());
 
+    // Build idempotency key
+    let key = BatchSubmissionKey {
+        repo_owner: ctx.repo_owner.clone(),
+        repo_name: ctx.repo_name.clone(),
+        pr_number: ctx.pr_number,
+        head_sha: head_sha.0.clone(),
+    };
+
+    // Phase 1: Reserve slot (or get cached batch_id if already submitted)
+    let existing_batch_id = {
+        let db = ctx.db.clone();
+        let key = key.clone();
+        match tokio::task::spawn_blocking(move || db.reserve_batch_submission(&key)).await {
+            Ok(Ok(batch_id)) => batch_id,
+            Ok(Err(e)) => {
+                error!("Failed to reserve batch submission: {}", e);
+                // Continue without idempotency protection
+                None
+            }
+            Err(e) => {
+                error!("spawn_blocking panicked during reserve: {}", e);
+                None
+            }
+        }
+    };
+
+    // If already submitted, return cached result
+    if let Some(batch_id) = existing_batch_id {
+        info!(
+            "Returning cached batch {} for PR #{} commit {}",
+            batch_id,
+            ctx.pr_number,
+            head_sha.short()
+        );
+        return EffectResult::single(Event::BatchSubmitted {
+            batch_id: BatchId(batch_id),
+            comment_id: None, // UI was already created on prior submission
+            check_run_id: None,
+            model,
+            reasoning_effort,
+        });
+    }
+
+    // Not yet submitted - proceed with full submission flow
+
     let metadata = ReviewMetadata {
         head_hash: head_sha.0.clone(),
         merge_base: base_sha.0.clone(),
@@ -705,7 +763,7 @@ async fn execute_submit_batch(
         pull_request_url: ctx.pr_url.clone(),
     };
 
-    // First, create the comment
+    // Create the comment
     let comment_body = format!(
         "🤖 **Code review in progress...**\n\n\
         Analyzing commit `{}` using `{}` (reasoning: {}).\n\n\
@@ -783,7 +841,7 @@ async fn execute_submit_batch(
         }
     };
 
-    // Submit batch to OpenAI
+    // Phase 2: Submit batch to OpenAI
     match ctx
         .openai_client
         .process_code_review_batch(
@@ -800,6 +858,18 @@ async fn execute_submit_batch(
     {
         Ok(batch_id) => {
             info!("Submitted batch {} for PR #{}", batch_id, ctx.pr_number);
+
+            // Phase 3: Confirm submission in SQLite
+            let db = ctx.db.clone();
+            let key = key.clone();
+            let bid = batch_id.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || db.confirm_batch_submission(&key, &bid)).await
+            {
+                // Log but don't fail - the batch was submitted successfully
+                error!("Failed to confirm batch submission in db: {}", e);
+            }
+
             EffectResult::single(Event::BatchSubmitted {
                 batch_id: BatchId(batch_id),
                 comment_id,
@@ -808,11 +878,18 @@ async fn execute_submit_batch(
                 reasoning_effort,
             })
         }
-        Err(e) => EffectResult::single(Event::BatchSubmissionFailed {
-            error: e.to_string(),
-            comment_id,
-            check_run_id,
-        }),
+        Err(e) => {
+            // Rollback: delete the 'submitting' reservation
+            let db = ctx.db.clone();
+            let key = key.clone();
+            let _ = tokio::task::spawn_blocking(move || db.delete_batch_submission(&key)).await;
+
+            EffectResult::single(Event::BatchSubmissionFailed {
+                error: e.to_string(),
+                comment_id,
+                check_run_id,
+            })
+        }
     }
 }
 

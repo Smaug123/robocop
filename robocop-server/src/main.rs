@@ -155,6 +155,42 @@ async fn main() -> Result<()> {
         .expect("Failed to initialize persistent state store");
     info!("SQLite database initialized at: {}", config.sqlite_db_path);
 
+    // Clean up any incomplete batch submissions from prior crashes.
+    // These represent submissions that crashed mid-flight. We delete them so
+    // the next event for that PR can re-submit (potentially creating a duplicate
+    // batch in OpenAI, but the old one will expire after 24h).
+    {
+        let db = state_store.db();
+        match tokio::task::spawn_blocking(move || db.find_incomplete_submissions()).await {
+            Ok(Ok(incomplete)) => {
+                for key in &incomplete {
+                    tracing::warn!(
+                        "Found incomplete batch submission for {}/{} PR#{} sha {} - deleting reservation",
+                        key.repo_owner, key.repo_name, key.pr_number, key.head_sha
+                    );
+                }
+                if !incomplete.is_empty() {
+                    let db = state_store.db();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for key in incomplete {
+                            let _ = db.delete_batch_submission(&key);
+                        }
+                    })
+                    .await;
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to check for incomplete submissions: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "spawn_blocking panicked checking incomplete submissions: {}",
+                    e
+                );
+            }
+        }
+    }
+
     let app_state = Arc::new(AppState {
         github_client: Arc::new(github_client),
         openai_client: Arc::new(openai_client),

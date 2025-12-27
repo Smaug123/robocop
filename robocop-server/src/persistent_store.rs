@@ -116,6 +116,13 @@ impl PersistentStateStore {
         })
     }
 
+    /// Get the underlying database handle.
+    ///
+    /// Used by the interpreter for batch submission idempotency.
+    pub fn db(&self) -> Arc<SqliteDb> {
+        self.db.clone()
+    }
+
     /// Get or create a lock for a specific PR.
     ///
     /// This lock serializes memory mutations and DB persistence for a PR,
