@@ -79,6 +79,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             let new_state = ReviewMachineState::Completed {
                 reviews_enabled: *reviews_enabled,
                 head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
                 result: result.clone(),
             };
 
@@ -156,6 +157,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::External,
                     pending_cancel_batch_id: None, // Already done
                 },
@@ -186,6 +188,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             let new_state = ReviewMachineState::Failed {
                 reviews_enabled: *reviews_enabled,
                 head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
                 reason: reason.clone(),
             };
 
@@ -262,6 +265,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::UserRequested,
                     // Track batch for polling in case cancel fails
                     pending_cancel_batch_id: Some(batch_id.clone()),
@@ -310,6 +314,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::ReviewsDisabled,
                     // Track batch for polling in case cancel fails
                     pending_cancel_batch_id: Some(batch_id.clone()),
@@ -454,14 +459,17 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             }],
         ),
 
-        // Same commit while batch pending -> no change (duplicate webhook)
+        // Same head_sha and base_sha while batch pending -> no change (duplicate webhook)
         (
-            ReviewMachineState::BatchPending { head_sha, .. },
+            ReviewMachineState::BatchPending {
+                head_sha, base_sha, ..
+            },
             Event::PrUpdated {
                 head_sha: new_head_sha,
+                base_sha: new_base_sha,
                 ..
             },
-        ) if head_sha == &new_head_sha => TransitionResult::new(
+        ) if head_sha == &new_head_sha && base_sha == &new_base_sha => TransitionResult::new(
             state.clone(),
             vec![Effect::Log {
                 level: LogLevel::Info,
@@ -471,6 +479,72 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ),
             }],
         ),
+
+        // Same head_sha but different base_sha -> base branch moved, restart review
+        // This can happen when main gets new commits while a review is pending.
+        // The diff changes (since it's relative to a new base), so we need a new review.
+        (
+            ReviewMachineState::BatchPending {
+                batch_id,
+                head_sha,
+                base_sha,
+                check_run_id,
+                reviews_enabled,
+                ..
+            },
+            Event::PrUpdated {
+                head_sha: new_head_sha,
+                base_sha: new_base_sha,
+                options,
+                ..
+            },
+        ) if head_sha == &new_head_sha && base_sha != &new_base_sha => {
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: format!(
+                        "Base branch moved from {} to {} for commit {}, restarting review",
+                        base_sha.short(),
+                        new_base_sha.short(),
+                        head_sha.short()
+                    ),
+                },
+                // Clear the old batch submission cache entry so the new review can proceed
+                Effect::ClearBatchSubmission {
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                },
+            ];
+
+            if let Some(cr_id) = check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: *cr_id,
+                    status: EffectCheckRunStatus::Completed,
+                    conclusion: Some(EffectCheckRunConclusion::Stale),
+                    title: format!("Base branch moved to {}", new_base_sha.short()),
+                    summary: "The base branch moved, so a new review is starting.".to_string(),
+                    external_id: None,
+                });
+            }
+
+            effects.push(Effect::FetchData {
+                head_sha: new_head_sha.clone(),
+                base_sha: new_base_sha.clone(),
+            });
+
+            TransitionResult::new(
+                ReviewMachineState::Preparing {
+                    reviews_enabled: *reviews_enabled,
+                    head_sha: new_head_sha,
+                    base_sha: new_base_sha,
+                    options,
+                },
+                effects,
+            )
+        }
 
         // =====================================================================
         // Stale Events in BatchPending State
@@ -636,6 +710,71 @@ mod tests {
         ));
         assert_eq!(result.effects.len(), 1);
         assert!(matches!(&result.effects[0], Effect::CheckAncestry { .. }));
+    }
+
+    #[test]
+    fn test_base_sha_change_restarts_review() {
+        // When head_sha is the same but base_sha changes (base branch moved),
+        // we should restart the review because the diff is now different.
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("old_base"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        let event = Event::PrUpdated {
+            head_sha: CommitSha::from("abc123"),   // Same head_sha
+            base_sha: CommitSha::from("new_base"), // Different base_sha
+            force_review: false,
+            options: ReviewOptions::default(),
+        };
+
+        let result = handle(state, event);
+
+        // Should transition to Preparing for the new base
+        assert!(
+            matches!(result.state, ReviewMachineState::Preparing { .. }),
+            "Expected Preparing state, got {:?}",
+            result.state
+        );
+        if let ReviewMachineState::Preparing {
+            head_sha, base_sha, ..
+        } = &result.state
+        {
+            assert_eq!(head_sha.0, "abc123", "Should keep same head_sha");
+            assert_eq!(base_sha.0, "new_base", "Should use new base_sha");
+        }
+
+        // Should cancel the old batch
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelBatch { .. })),
+            "Should cancel the old batch"
+        );
+
+        // Should clear the batch submission cache
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ClearBatchSubmission { .. })),
+            "Should clear the batch submission cache"
+        );
+
+        // Should fetch data for the new base
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::FetchData { base_sha, .. } if base_sha.0 == "new_base"
+            )),
+            "Should fetch data with new base_sha"
+        );
     }
 
     #[test]

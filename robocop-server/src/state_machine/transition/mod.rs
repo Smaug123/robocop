@@ -323,6 +323,7 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
             result: ReviewResult {
                 reasoning: "".to_string(),
                 substantive_comments: false,
@@ -1388,6 +1389,7 @@ mod tests {
         let state = ReviewMachineState::Cancelled {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
             reason: CancellationReason::UserRequested,
             pending_cancel_batch_id: Some(BatchId::from("batch_123".to_string())),
         };
@@ -2312,37 +2314,53 @@ mod property_tests {
     }
 
     fn arb_completed_state() -> impl Strategy<Value = ReviewMachineState> {
-        (any::<bool>(), arb_commit_sha(), arb_review_result()).prop_map(
-            |(reviews_enabled, head_sha, result)| ReviewMachineState::Completed {
-                reviews_enabled,
-                head_sha,
-                result,
-            },
+        (
+            any::<bool>(),
+            arb_commit_sha(),
+            arb_commit_sha(),
+            arb_review_result(),
         )
+            .prop_map(|(reviews_enabled, head_sha, base_sha, result)| {
+                ReviewMachineState::Completed {
+                    reviews_enabled,
+                    head_sha,
+                    base_sha,
+                    result,
+                }
+            })
     }
 
     fn arb_failed_state() -> impl Strategy<Value = ReviewMachineState> {
-        (any::<bool>(), arb_commit_sha(), arb_failure_reason()).prop_map(
-            |(reviews_enabled, head_sha, reason)| ReviewMachineState::Failed {
-                reviews_enabled,
-                head_sha,
-                reason,
-            },
+        (
+            any::<bool>(),
+            arb_commit_sha(),
+            arb_commit_sha(),
+            arb_failure_reason(),
         )
+            .prop_map(|(reviews_enabled, head_sha, base_sha, reason)| {
+                ReviewMachineState::Failed {
+                    reviews_enabled,
+                    head_sha,
+                    base_sha,
+                    reason,
+                }
+            })
     }
 
     fn arb_cancelled_state() -> impl Strategy<Value = ReviewMachineState> {
         (
             any::<bool>(),
             arb_commit_sha(),
+            arb_commit_sha(),
             arb_cancellation_reason(),
             proptest::option::of(arb_batch_id()),
         )
             .prop_map(
-                |(reviews_enabled, head_sha, reason, pending_cancel_batch_id)| {
+                |(reviews_enabled, head_sha, base_sha, reason, pending_cancel_batch_id)| {
                     ReviewMachineState::Cancelled {
                         reviews_enabled,
                         head_sha,
+                        base_sha,
                         reason,
                         pending_cancel_batch_id,
                     }

@@ -82,6 +82,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
                 head_sha: old_sha,
+                base_sha,
                 check_run_id,
                 new_head_sha,
                 reviews_enabled: false,
@@ -132,6 +133,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::Superseded {
                         new_sha: new_head_sha.clone(),
                     },
@@ -148,6 +150,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
                 head_sha: old_sha,
+                base_sha,
                 check_run_id,
                 new_head_sha,
                 reviews_enabled: false,
@@ -198,6 +201,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::Superseded {
                         new_sha: new_head_sha.clone(),
                     },
@@ -418,6 +422,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 reviews_enabled: false,
                 head_sha: old_sha,
+                base_sha,
                 check_run_id,
                 new_head_sha,
                 ..
@@ -463,6 +468,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::Superseded {
                         new_sha: new_head_sha.clone(),
                     },
@@ -543,6 +549,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 reviews_enabled: false,
                 head_sha: old_sha,
+                base_sha,
                 check_run_id,
                 new_head_sha,
                 ..
@@ -588,6 +595,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: old_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::Superseded {
                         new_sha: new_head_sha.clone(),
                     },
@@ -688,6 +696,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
                 head_sha,
+                base_sha,
                 check_run_id,
                 ..
             },
@@ -717,6 +726,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::ReviewsDisabled,
                     // Track batch for polling in case cancel fails
                     pending_cancel_batch_id: Some(batch_id.clone()),
@@ -768,6 +778,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
                 head_sha,
+                base_sha,
                 check_run_id,
                 reviews_enabled,
                 ..
@@ -801,6 +812,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Cancelled {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: CancellationReason::UserRequested,
                     // Track batch for polling in case cancel fails
                     pending_cancel_batch_id: Some(batch_id.clone()),

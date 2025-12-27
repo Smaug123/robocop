@@ -47,6 +47,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
         (
             ReviewMachineState::Preparing {
                 head_sha,
+                base_sha,
                 reviews_enabled,
                 ..
             },
@@ -57,6 +58,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ReviewMachineState::Cancelled {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
+                        base_sha: base_sha.clone(),
                         reason: CancellationReason::NoChanges,
                         pending_cancel_batch_id: None,
                     },
@@ -72,6 +74,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ReviewMachineState::Cancelled {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
+                        base_sha: base_sha.clone(),
                         reason: CancellationReason::DiffTooLarge,
                         pending_cancel_batch_id: None,
                     },
@@ -87,6 +90,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ReviewMachineState::Failed {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
+                        base_sha: base_sha.clone(),
                         reason: FailureReason::DataFetchFailed { reason: error },
                     },
                     vec![],
@@ -95,6 +99,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                     ReviewMachineState::Cancelled {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
+                        base_sha: base_sha.clone(),
                         reason: CancellationReason::NoFiles,
                         pending_cancel_batch_id: None,
                     },
@@ -168,6 +173,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
         (
             ReviewMachineState::Preparing {
                 head_sha,
+                base_sha,
                 reviews_enabled,
                 ..
             },
@@ -207,6 +213,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Failed {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: FailureReason::SubmissionFailed { error },
                 },
                 effects,

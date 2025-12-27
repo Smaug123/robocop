@@ -160,20 +160,28 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
 
         // Disable reviews on terminal state -> update flag
         (
-            terminal @ (ReviewMachineState::Completed { head_sha, .. }
-            | ReviewMachineState::Failed { head_sha, .. }
-            | ReviewMachineState::Cancelled { head_sha, .. }),
+            terminal @ (ReviewMachineState::Completed {
+                head_sha, base_sha, ..
+            }
+            | ReviewMachineState::Failed {
+                head_sha, base_sha, ..
+            }
+            | ReviewMachineState::Cancelled {
+                head_sha, base_sha, ..
+            }),
             Event::DisableReviewsRequested,
         ) => {
             let new_state = match terminal {
                 ReviewMachineState::Completed { result, .. } => ReviewMachineState::Completed {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     result: result.clone(),
                 },
                 ReviewMachineState::Failed { reason, .. } => ReviewMachineState::Failed {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: reason.clone(),
                 },
                 ReviewMachineState::Cancelled {
@@ -183,6 +191,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 } => ReviewMachineState::Cancelled {
                     reviews_enabled: false,
                     head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
                     reason: reason.clone(),
                     pending_cancel_batch_id: pending_cancel_batch_id.clone(),
                 },
@@ -215,6 +224,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::Cancelled {
                 reviews_enabled,
                 head_sha,
+                base_sha,
                 reason,
                 pending_cancel_batch_id: Some(_),
             },
@@ -223,6 +233,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::Cancelled {
                 reviews_enabled: *reviews_enabled,
                 head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
                 reason: reason.clone(),
                 // Clear the tracking - batch is done
                 pending_cancel_batch_id: None,
@@ -283,6 +294,7 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
             result: ReviewResult {
                 reasoning: "".to_string(),
                 substantive_comments: false,
@@ -306,6 +318,7 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
             result: ReviewResult {
                 reasoning: "".to_string(),
                 substantive_comments: false,
@@ -339,6 +352,7 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: false,
             head_sha: CommitSha::from("old_sha"),
+            base_sha: CommitSha::from("old_base"),
             result: ReviewResult {
                 reasoning: "".to_string(),
                 substantive_comments: false,
@@ -369,6 +383,7 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: false,
             head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("old_base"),
             result: ReviewResult {
                 reasoning: "".to_string(),
                 substantive_comments: false,

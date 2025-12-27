@@ -698,7 +698,7 @@ async fn execute_submit_batch(
     base_sha: &CommitSha,
     options: &ReviewOptions,
 ) -> EffectResult {
-    use crate::db::{BatchSubmissionData, BatchSubmissionKey};
+    use crate::db::{BatchSubmissionData, BatchSubmissionKey, ReservationResult};
     use robocop_core::ReviewMetadata;
 
     let correlation_id = ctx.correlation_id.as_deref();
@@ -723,7 +723,7 @@ async fn execute_submit_batch(
     };
 
     // Phase 1: Reserve slot (or get cached batch data if already submitted)
-    let cached_submission = {
+    let reservation_result = {
         let db = ctx.db.clone();
         let key = key.clone();
         let model_for_check = model.clone();
@@ -733,7 +733,7 @@ async fn execute_submit_batch(
         })
         .await
         {
-            Ok(Ok(cached)) => cached,
+            Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 error!("Failed to reserve batch submission: {}", e);
                 return EffectResult::single(Event::BatchSubmissionFailed {
@@ -753,22 +753,41 @@ async fn execute_submit_batch(
         }
     };
 
-    // If already submitted, return cached result with preserved UI IDs and options
-    if let Some(cached) = cached_submission {
-        info!(
-            "Returning cached batch {} for PR #{} commit {}",
-            cached.batch_id,
-            ctx.pr_number,
-            head_sha.short()
-        );
-        return EffectResult::single(Event::BatchSubmitted {
-            batch_id: BatchId(cached.batch_id),
-            comment_id: cached.comment_id.map(CommentId),
-            check_run_id: cached.check_run_id.map(CheckRunId),
-            // Use cached model/reasoning_effort if available, otherwise fall back to current options
-            model: cached.model.unwrap_or(model),
-            reasoning_effort: cached.reasoning_effort.unwrap_or(reasoning_effort),
-        });
+    // Handle reservation result
+    match reservation_result {
+        ReservationResult::AlreadySubmitted(cached) => {
+            // Already submitted - return cached result with preserved UI IDs and options
+            info!(
+                "Returning cached batch {} for PR #{} commit {}",
+                cached.batch_id,
+                ctx.pr_number,
+                head_sha.short()
+            );
+            return EffectResult::single(Event::BatchSubmitted {
+                batch_id: BatchId(cached.batch_id),
+                comment_id: cached.comment_id.map(CommentId),
+                check_run_id: cached.check_run_id.map(CheckRunId),
+                // Use cached model/reasoning_effort if available, otherwise fall back to current options
+                model: cached.model.unwrap_or(model),
+                reasoning_effort: cached.reasoning_effort.unwrap_or(reasoning_effort),
+            });
+        }
+        ReservationResult::InProgressByOtherInstance => {
+            // Another instance is actively submitting - don't interfere
+            info!(
+                "Skipping batch submission for PR #{} commit {} - another instance is submitting",
+                ctx.pr_number,
+                head_sha.short()
+            );
+            return EffectResult::single(Event::BatchSubmissionFailed {
+                error: "Another server instance is already submitting this batch".to_string(),
+                comment_id: None,
+                check_run_id: None,
+            });
+        }
+        ReservationResult::Reserved => {
+            // Slot reserved - proceed with full submission flow below
+        }
     }
 
     // Not yet submitted - proceed with full submission flow

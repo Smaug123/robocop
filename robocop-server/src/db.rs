@@ -45,6 +45,18 @@ pub struct BatchSubmissionKey {
     pub base_sha: String,
 }
 
+/// Result of attempting to reserve a batch submission slot.
+#[derive(Debug, Clone)]
+pub enum ReservationResult {
+    /// Slot was reserved - caller should proceed with submission.
+    Reserved,
+    /// Batch was already submitted - use cached data.
+    AlreadySubmitted(CachedBatchSubmission),
+    /// Another instance is currently submitting - caller should skip.
+    /// This prevents duplicate submissions when multiple instances share a DB.
+    InProgressByOtherInstance,
+}
+
 /// Cached batch submission data returned when a batch was already submitted.
 ///
 /// Contains all the data needed to reconstruct the `BatchSubmitted` event
@@ -638,29 +650,35 @@ impl SqliteDb {
     /// Reserve a batch submission slot for idempotency.
     ///
     /// Returns:
-    /// - `Ok(None)` if slot was reserved (caller should submit to OpenAI)
-    /// - `Ok(Some(CachedBatchSubmission))` if already submitted (caller should skip OpenAI)
+    /// - `Ok(ReservationResult::Reserved)` if slot was reserved (caller should submit to OpenAI)
+    /// - `Ok(ReservationResult::AlreadySubmitted(..))` if already submitted (caller should skip)
+    /// - `Ok(ReservationResult::InProgressByOtherInstance)` if another instance is submitting
     ///
     /// The `requested_model` and `requested_reasoning_effort` parameters are used to
     /// validate that the cached batch (if any) matches the requested options. If the
     /// cached batch used different options, the cache is invalidated and a new
     /// submission is allowed.
     ///
-    /// If a row exists with `status = 'submitting'` (prior crash mid-submission),
-    /// this returns `Ok(None)` and the caller will re-submit, potentially creating
-    /// a duplicate batch in OpenAI. The old batch will expire after 24h.
-    ///
     /// # Multi-instance safety
     ///
     /// This method uses `INSERT ... ON CONFLICT DO NOTHING` to avoid races when
     /// multiple server instances share the same database.
+    ///
+    /// If a row exists with `status = 'submitting'`:
+    /// - If it's older than the staleness threshold (10 minutes), we assume it's from
+    ///   a crashed instance and delete it, then reserve fresh.
+    /// - If it's fresh, we return `InProgressByOtherInstance` to avoid creating
+    ///   duplicate batches.
     pub fn reserve_batch_submission(
         &self,
         key: &BatchSubmissionKey,
         requested_model: &str,
         requested_reasoning_effort: &str,
-    ) -> Result<Option<CachedBatchSubmission>> {
+    ) -> Result<ReservationResult> {
         let conn = self.conn.lock().expect("mutex poisoned");
+
+        // Staleness threshold: 10 minutes
+        const STALENESS_THRESHOLD_SECONDS: i64 = 600;
 
         // Intermediate struct for query result
         struct BatchRow {
@@ -670,12 +688,13 @@ impl SqliteDb {
             check_run_id: Option<u64>,
             model: Option<String>,
             reasoning_effort: Option<String>,
+            created_at: String,
         }
 
         // Helper to fetch existing row
         let fetch_existing = |conn: &Connection| -> Result<Option<BatchRow>> {
             conn.query_row(
-                "SELECT status, batch_id, comment_id, check_run_id, model, reasoning_effort \
+                "SELECT status, batch_id, comment_id, check_run_id, model, reasoning_effort, created_at \
                  FROM batch_submissions \
                  WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
                 rusqlite::params![
@@ -693,11 +712,24 @@ impl SqliteDb {
                         check_run_id: row.get(3)?,
                         model: row.get(4)?,
                         reasoning_effort: row.get(5)?,
+                        created_at: row.get(6)?,
                     })
                 },
             )
             .optional()
             .context("Failed to query batch_submissions")
+        };
+
+        // Helper to check if a timestamp is stale
+        let is_stale = |created_at: &str| -> bool {
+            // Parse the SQLite datetime format and compare to now
+            // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
+            conn.query_row(
+                "SELECT (julianday('now') - julianday(?1)) * 86400 > ?2",
+                rusqlite::params![created_at, STALENESS_THRESHOLD_SECONDS],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(true) // If parsing fails, assume stale to allow retry
         };
 
         // Helper to delete existing row
@@ -737,7 +769,7 @@ impl SqliteDb {
 
         if rows_affected > 0 {
             // Successfully inserted - no existing row, proceed with submission
-            return Ok(None);
+            return Ok(ReservationResult::Reserved);
         }
 
         // Row already exists - fetch it to check status and options
@@ -765,7 +797,7 @@ impl SqliteDb {
                             ],
                         )
                         .context("Failed to reserve batch submission after corruption")?;
-                        return Ok(None);
+                        return Ok(ReservationResult::Reserved);
                     }
                 };
 
@@ -792,11 +824,11 @@ impl SqliteDb {
                         ],
                     )
                     .context("Failed to reserve batch submission after options mismatch")?;
-                    return Ok(None);
+                    return Ok(ReservationResult::Reserved);
                 }
 
                 // Options match - return cached data
-                Ok(Some(CachedBatchSubmission {
+                Ok(ReservationResult::AlreadySubmitted(CachedBatchSubmission {
                     batch_id,
                     comment_id: existing.comment_id,
                     check_run_id: existing.check_run_id,
@@ -805,21 +837,31 @@ impl SqliteDb {
                 }))
             }
             "submitting" => {
-                // Prior crash mid-submission. Delete stale row and reserve fresh.
-                delete_existing(&conn)?;
-                conn.execute(
-                    "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
-                    rusqlite::params![
-                        &key.repo_owner,
-                        &key.repo_name,
-                        key.pr_number,
-                        &key.head_sha,
-                        &key.base_sha
-                    ],
-                )
-                .context("Failed to reserve batch submission after stale cleanup")?;
-                Ok(None)
+                // Check if this is a stale reservation from a crashed instance
+                if is_stale(&existing.created_at) {
+                    // Stale reservation - delete and reserve fresh.
+                    // This may create a duplicate batch in OpenAI if the original instance
+                    // is actually still running (unlikely after 10 minutes), but the old
+                    // batch will expire after 24h.
+                    delete_existing(&conn)?;
+                    conn.execute(
+                        "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
+                        rusqlite::params![
+                            &key.repo_owner,
+                            &key.repo_name,
+                            key.pr_number,
+                            &key.head_sha,
+                            &key.base_sha
+                        ],
+                    )
+                    .context("Failed to reserve batch submission after stale cleanup")?;
+                    Ok(ReservationResult::Reserved)
+                } else {
+                    // Fresh reservation - another instance is actively submitting.
+                    // Don't interfere to avoid duplicate batches.
+                    Ok(ReservationResult::InProgressByOtherInstance)
+                }
             }
             other => {
                 // Unknown status - treat as corrupted
@@ -932,6 +974,58 @@ impl SqliteDb {
         }
 
         Ok(results)
+    }
+
+    /// Delete all stale incomplete submissions (status = 'submitting' and older than threshold).
+    ///
+    /// This is safe to call at startup even when multiple instances share a DB,
+    /// because it only deletes rows that are older than the staleness threshold
+    /// (10 minutes). Fresh submissions from other instances are left alone.
+    ///
+    /// Returns the keys of deleted rows.
+    pub fn delete_stale_incomplete_submissions(&self) -> Result<Vec<BatchSubmissionKey>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        // Staleness threshold: 10 minutes (must match reserve_batch_submission)
+        const STALENESS_THRESHOLD_SECONDS: i64 = 600;
+
+        // First, find all stale incomplete submissions
+        let mut stmt = conn
+            .prepare(
+                "SELECT repo_owner, repo_name, pr_number, head_sha, base_sha \
+                 FROM batch_submissions \
+                 WHERE status = 'submitting' \
+                 AND (julianday('now') - julianday(created_at)) * 86400 > ?1",
+            )
+            .context("Failed to prepare find stale submissions")?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![STALENESS_THRESHOLD_SECONDS], |row| {
+                Ok(BatchSubmissionKey {
+                    repo_owner: row.get(0)?,
+                    repo_name: row.get(1)?,
+                    pr_number: row.get(2)?,
+                    head_sha: row.get(3)?,
+                    base_sha: row.get(4)?,
+                })
+            })
+            .context("Failed to query stale incomplete submissions")?;
+
+        let mut stale_keys = Vec::new();
+        for row in rows {
+            stale_keys.push(row.context("Failed to read row")?);
+        }
+
+        // Delete them
+        conn.execute(
+            "DELETE FROM batch_submissions \
+             WHERE status = 'submitting' \
+             AND (julianday('now') - julianday(created_at)) * 86400 > ?1",
+            rusqlite::params![STALENESS_THRESHOLD_SECONDS],
+        )
+        .context("Failed to delete stale incomplete submissions")?;
+
+        Ok(stale_keys)
     }
 }
 
@@ -1078,6 +1172,10 @@ fn row_to_state(row: StateRow) -> Result<ReviewMachineState> {
                 row.head_sha
                     .ok_or_else(|| anyhow!("Completed state missing head_sha"))?,
             );
+            let base_sha = CommitSha(
+                row.base_sha
+                    .ok_or_else(|| anyhow!("Completed state missing base_sha"))?,
+            );
             let result = ReviewResult {
                 reasoning: row
                     .result_reasoning
@@ -1093,6 +1191,7 @@ fn row_to_state(row: StateRow) -> Result<ReviewMachineState> {
             Ok(ReviewMachineState::Completed {
                 reviews_enabled,
                 head_sha,
+                base_sha,
                 result,
             })
         }
@@ -1101,6 +1200,10 @@ fn row_to_state(row: StateRow) -> Result<ReviewMachineState> {
             let head_sha = CommitSha(
                 row.head_sha
                     .ok_or_else(|| anyhow!("Failed state missing head_sha"))?,
+            );
+            let base_sha = CommitSha(
+                row.base_sha
+                    .ok_or_else(|| anyhow!("Failed state missing base_sha"))?,
             );
             let failure_type = row
                 .failure_type
@@ -1138,6 +1241,7 @@ fn row_to_state(row: StateRow) -> Result<ReviewMachineState> {
             Ok(ReviewMachineState::Failed {
                 reviews_enabled,
                 head_sha,
+                base_sha,
                 reason,
             })
         }
@@ -1146,6 +1250,10 @@ fn row_to_state(row: StateRow) -> Result<ReviewMachineState> {
             let head_sha = CommitSha(
                 row.head_sha
                     .ok_or_else(|| anyhow!("Cancelled state missing head_sha"))?,
+            );
+            let base_sha = CommitSha(
+                row.base_sha
+                    .ok_or_else(|| anyhow!("Cancelled state missing base_sha"))?,
             );
             let cancellation_type = row
                 .cancellation_type
@@ -1169,6 +1277,7 @@ fn row_to_state(row: StateRow) -> Result<ReviewMachineState> {
             Ok(ReviewMachineState::Cancelled {
                 reviews_enabled,
                 head_sha,
+                base_sha,
                 reason,
                 pending_cancel_batch_id: row.pending_cancel_batch_id.map(BatchId),
             })
@@ -1245,6 +1354,7 @@ mod tests {
         let state = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
             result: ReviewResult {
                 reasoning: "This is the reasoning".to_string(),
                 substantive_comments: true,
@@ -1267,6 +1377,7 @@ mod tests {
         let state = ReviewMachineState::Failed {
             reviews_enabled: false,
             head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
             reason: FailureReason::BatchFailed {
                 error: Some("timeout error".to_string()),
             },
@@ -1287,6 +1398,7 @@ mod tests {
         let state = ReviewMachineState::Cancelled {
             reviews_enabled: true,
             head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
             reason: CancellationReason::Superseded {
                 new_sha: CommitSha::from("new456"),
             },
@@ -1408,6 +1520,7 @@ mod tests {
             ReviewMachineState::Completed {
                 reviews_enabled: true,
                 head_sha: CommitSha::from("abc123"),
+                base_sha: CommitSha::from("def456"),
                 result: ReviewResult {
                     reasoning: "Analysis complete".to_string(),
                     substantive_comments: true,
@@ -1417,11 +1530,13 @@ mod tests {
             ReviewMachineState::Failed {
                 reviews_enabled: false,
                 head_sha: CommitSha::from("abc123"),
+                base_sha: CommitSha::from("def456"),
                 reason: FailureReason::BatchExpired,
             },
             ReviewMachineState::Cancelled {
                 reviews_enabled: true,
                 head_sha: CommitSha::from("abc123"),
+                base_sha: CommitSha::from("def456"),
                 reason: CancellationReason::UserRequested,
                 pending_cancel_batch_id: None,
             },
@@ -1518,11 +1633,14 @@ mod tests {
             base_sha: "def456".to_string(),
         };
 
-        // First reservation should succeed and return None (no existing batch)
+        // First reservation should succeed and return Reserved
         let result = db
             .reserve_batch_submission(&key, "gpt-4", "medium")
             .expect("should reserve");
-        assert!(result.is_none(), "should return None for new reservation");
+        assert!(
+            matches!(result, ReservationResult::Reserved),
+            "should return Reserved for new reservation"
+        );
     }
 
     #[test]
@@ -1553,20 +1671,23 @@ mod tests {
         // Second reservation with same options should return the cached data
         let result = db
             .reserve_batch_submission(&key, "gpt-4", "high")
-            .expect("should reserve")
-            .expect("should have cached data");
+            .expect("should reserve");
+        let cached = match result {
+            ReservationResult::AlreadySubmitted(c) => c,
+            other => panic!("expected AlreadySubmitted, got {:?}", other),
+        };
         assert_eq!(
-            result.batch_id, "batch_123",
+            cached.batch_id, "batch_123",
             "should return cached batch_id"
         );
-        assert_eq!(result.comment_id, Some(100));
-        assert_eq!(result.check_run_id, Some(200));
-        assert_eq!(result.model, Some("gpt-4".to_string()));
-        assert_eq!(result.reasoning_effort, Some("high".to_string()));
+        assert_eq!(cached.comment_id, Some(100));
+        assert_eq!(cached.check_run_id, Some(200));
+        assert_eq!(cached.model, Some("gpt-4".to_string()));
+        assert_eq!(cached.reasoning_effort, Some("high".to_string()));
     }
 
     #[test]
-    fn test_reserve_batch_submission_stale_submitting() {
+    fn test_reserve_batch_submission_fresh_submitting_returns_in_progress() {
         let db = SqliteDb::new_in_memory().expect("should create in-memory db");
 
         let key = BatchSubmissionKey {
@@ -1577,17 +1698,54 @@ mod tests {
             base_sha: "def456".to_string(),
         };
 
-        // Reserve but don't confirm (simulating crash)
+        // Reserve but don't confirm (simulating concurrent instance)
         db.reserve_batch_submission(&key, "gpt-4", "medium")
             .expect("should reserve");
 
-        // Second reservation should delete stale row and reserve fresh
+        // Second reservation should see fresh "submitting" and return InProgressByOtherInstance
         let result = db
             .reserve_batch_submission(&key, "gpt-4", "medium")
             .expect("should reserve");
         assert!(
-            result.is_none(),
-            "should return None after deleting stale row"
+            matches!(result, ReservationResult::InProgressByOtherInstance),
+            "should return InProgressByOtherInstance for fresh submitting row"
+        );
+    }
+
+    #[test]
+    fn test_reserve_batch_submission_stale_submitting_allows_retry() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let key = BatchSubmissionKey {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            head_sha: "abc123".to_string(),
+            base_sha: "def456".to_string(),
+        };
+
+        // Reserve but don't confirm
+        db.reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
+
+        // Manually make the row stale by updating created_at to 20 minutes ago
+        {
+            let conn = db.conn.lock().expect("mutex poisoned");
+            conn.execute(
+                "UPDATE batch_submissions SET created_at = datetime('now', '-20 minutes') \
+                 WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3",
+                rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number],
+            )
+            .expect("should update created_at");
+        }
+
+        // Second reservation should see stale "submitting" and reserve fresh
+        let result = db
+            .reserve_batch_submission(&key, "gpt-4", "medium")
+            .expect("should reserve");
+        assert!(
+            matches!(result, ReservationResult::Reserved),
+            "should return Reserved after deleting stale row"
         );
     }
 
@@ -1619,9 +1777,12 @@ mod tests {
         // Verify it's now 'submitted'
         let result = db
             .reserve_batch_submission(&key, "gpt-4o", "medium")
-            .expect("should reserve")
-            .expect("should have cached data");
-        assert_eq!(result.batch_id, "batch_456");
+            .expect("should reserve");
+        let cached = match result {
+            ReservationResult::AlreadySubmitted(c) => c,
+            other => panic!("expected AlreadySubmitted, got {:?}", other),
+        };
+        assert_eq!(cached.batch_id, "batch_456");
     }
 
     #[test]
@@ -1678,7 +1839,10 @@ mod tests {
         let result = db
             .reserve_batch_submission(&key, "gpt-4", "medium")
             .expect("should reserve");
-        assert!(result.is_none(), "should return None after delete");
+        assert!(
+            matches!(result, ReservationResult::Reserved),
+            "should return Reserved after delete"
+        );
     }
 
     #[test]
@@ -1777,7 +1941,10 @@ mod tests {
         let result = db
             .reserve_batch_submission(&key2, "gpt-4", "medium")
             .expect("should reserve");
-        assert!(result.is_none(), "different head_sha should be independent");
+        assert!(
+            matches!(result, ReservationResult::Reserved),
+            "different head_sha should be independent"
+        );
     }
 
     #[test]
@@ -1817,7 +1984,7 @@ mod tests {
             .reserve_batch_submission(&key2, "gpt-4", "medium")
             .expect("should reserve");
         assert!(
-            result.is_none(),
+            matches!(result, ReservationResult::Reserved),
             "different base_sha should be independent - this tests Issue 2"
         );
     }
@@ -1852,8 +2019,8 @@ mod tests {
             .reserve_batch_submission(&key, "gpt-4o", "high")
             .expect("should reserve");
         assert!(
-            result.is_none(),
-            "different model should invalidate cache and return None"
+            matches!(result, ReservationResult::Reserved),
+            "different model should invalidate cache and return Reserved"
         );
 
         // After invalidation, we should be able to confirm again
@@ -1870,9 +2037,12 @@ mod tests {
         // Verify the new batch is cached
         let result = db
             .reserve_batch_submission(&key, "gpt-4o", "high")
-            .expect("should reserve")
-            .expect("should have cached data");
-        assert_eq!(result.batch_id, "batch_456");
+            .expect("should reserve");
+        let cached = match result {
+            ReservationResult::AlreadySubmitted(c) => c,
+            other => panic!("expected AlreadySubmitted, got {:?}", other),
+        };
+        assert_eq!(cached.batch_id, "batch_456");
     }
 
     #[test]
@@ -1905,8 +2075,8 @@ mod tests {
             .reserve_batch_submission(&key, "gpt-4", "high")
             .expect("should reserve");
         assert!(
-            result.is_none(),
-            "different reasoning_effort should invalidate cache and return None"
+            matches!(result, ReservationResult::Reserved),
+            "different reasoning_effort should invalidate cache and return Reserved"
         );
     }
 }

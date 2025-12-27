@@ -226,6 +226,10 @@ pub enum ReviewMachineState {
     Completed {
         reviews_enabled: bool,
         head_sha: CommitSha,
+        /// Base SHA for batch submission cache cleanup on restart.
+        /// If we crash after persisting but before clearing the cache, we need
+        /// this to clear the cache on restart.
+        base_sha: CommitSha,
         result: ReviewResult,
     },
 
@@ -233,6 +237,8 @@ pub enum ReviewMachineState {
     Failed {
         reviews_enabled: bool,
         head_sha: CommitSha,
+        /// Base SHA for batch submission cache cleanup on restart.
+        base_sha: CommitSha,
         reason: FailureReason,
     },
 
@@ -240,6 +246,8 @@ pub enum ReviewMachineState {
     Cancelled {
         reviews_enabled: bool,
         head_sha: CommitSha,
+        /// Base SHA for batch submission cache cleanup on restart.
+        base_sha: CommitSha,
         reason: CancellationReason,
         /// Batch ID still being cancelled (for polling in case cancel fails).
         /// When a batch is cancelled, the cancel API call might fail. If it does,
@@ -311,9 +319,9 @@ impl ReviewMachineState {
             Self::Preparing { base_sha, .. } => Some(base_sha),
             Self::AwaitingAncestryCheck { base_sha, .. } => Some(base_sha),
             Self::BatchPending { base_sha, .. } => Some(base_sha),
-            Self::Completed { .. } => None,
-            Self::Failed { .. } => None,
-            Self::Cancelled { .. } => None,
+            Self::Completed { base_sha, .. } => Some(base_sha),
+            Self::Failed { base_sha, .. } => Some(base_sha),
+            Self::Cancelled { base_sha, .. } => Some(base_sha),
         }
     }
 
@@ -420,27 +428,37 @@ impl ReviewMachineState {
                 reasoning_effort,
             },
             Self::Completed {
-                head_sha, result, ..
+                head_sha,
+                base_sha,
+                result,
+                ..
             } => Self::Completed {
                 reviews_enabled: enabled,
                 head_sha,
+                base_sha,
                 result,
             },
             Self::Failed {
-                head_sha, reason, ..
+                head_sha,
+                base_sha,
+                reason,
+                ..
             } => Self::Failed {
                 reviews_enabled: enabled,
                 head_sha,
+                base_sha,
                 reason,
             },
             Self::Cancelled {
                 head_sha,
+                base_sha,
                 reason,
                 pending_cancel_batch_id,
                 ..
             } => Self::Cancelled {
                 reviews_enabled: enabled,
                 head_sha,
+                base_sha,
                 reason,
                 pending_cancel_batch_id,
             },
@@ -479,6 +497,7 @@ mod tests {
         let completed = ReviewMachineState::Completed {
             reviews_enabled: true,
             head_sha: CommitSha("abc123".into()),
+            base_sha: CommitSha("def456".into()),
             result: ReviewResult {
                 reasoning: "Code looks good".into(),
                 substantive_comments: false,
@@ -490,6 +509,7 @@ mod tests {
         let failed = ReviewMachineState::Failed {
             reviews_enabled: true,
             head_sha: CommitSha("abc123".into()),
+            base_sha: CommitSha("def456".into()),
             reason: FailureReason::BatchExpired,
         };
         assert!(failed.is_terminal());
@@ -497,6 +517,7 @@ mod tests {
         let cancelled = ReviewMachineState::Cancelled {
             reviews_enabled: true,
             head_sha: CommitSha("abc123".into()),
+            base_sha: CommitSha("def456".into()),
             reason: CancellationReason::UserRequested,
             pending_cancel_batch_id: None,
         };
@@ -594,6 +615,7 @@ mod tests {
             ReviewMachineState::Completed {
                 reviews_enabled: true,
                 head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
                 result: ReviewResult {
                     reasoning: "Analysis complete".into(),
                     substantive_comments: true,
@@ -603,11 +625,13 @@ mod tests {
             ReviewMachineState::Failed {
                 reviews_enabled: false,
                 head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
                 reason: FailureReason::BatchExpired,
             },
             ReviewMachineState::Failed {
                 reviews_enabled: true,
                 head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
                 reason: FailureReason::BatchFailed {
                     error: Some("timeout".into()),
                 },
@@ -615,12 +639,14 @@ mod tests {
             ReviewMachineState::Cancelled {
                 reviews_enabled: true,
                 head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
                 reason: CancellationReason::UserRequested,
                 pending_cancel_batch_id: None,
             },
             ReviewMachineState::Cancelled {
                 reviews_enabled: true,
                 head_sha: CommitSha("abc123".into()),
+                base_sha: CommitSha("def456".into()),
                 reason: CancellationReason::Superseded {
                     new_sha: CommitSha("new123".into()),
                 },

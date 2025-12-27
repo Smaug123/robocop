@@ -155,36 +155,32 @@ async fn main() -> Result<()> {
         .expect("Failed to initialize persistent state store");
     info!("SQLite database initialized at: {}", config.sqlite_db_path);
 
-    // Clean up any incomplete batch submissions from prior crashes.
-    // These represent submissions that crashed mid-flight. We delete them so
-    // the next event for that PR can re-submit (potentially creating a duplicate
-    // batch in OpenAI, but the old one will expire after 24h).
+    // Clean up any STALE incomplete batch submissions from prior crashes.
+    // Only deletes rows older than the staleness threshold (10 minutes) to avoid
+    // interfering with fresh submissions from other instances sharing the same DB.
     {
         let db = state_store.db();
-        match tokio::task::spawn_blocking(move || db.find_incomplete_submissions()).await {
-            Ok(Ok(incomplete)) => {
-                for key in &incomplete {
+        match tokio::task::spawn_blocking(move || db.delete_stale_incomplete_submissions()).await {
+            Ok(Ok(stale_keys)) => {
+                for key in &stale_keys {
                     tracing::warn!(
-                        "Found incomplete batch submission for {}/{} PR#{} sha {} - deleting reservation",
+                        "Deleted stale batch submission for {}/{} PR#{} sha {} (older than 10 minutes)",
                         key.repo_owner, key.repo_name, key.pr_number, key.head_sha
                     );
                 }
-                if !incomplete.is_empty() {
-                    let db = state_store.db();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        for key in incomplete {
-                            let _ = db.delete_batch_submission(&key);
-                        }
-                    })
-                    .await;
+                if !stale_keys.is_empty() {
+                    info!(
+                        "Cleaned up {} stale batch submission reservations",
+                        stale_keys.len()
+                    );
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!("Failed to check for incomplete submissions: {}", e);
+                tracing::warn!("Failed to clean up stale incomplete submissions: {}", e);
             }
             Err(e) => {
                 tracing::warn!(
-                    "spawn_blocking panicked checking incomplete submissions: {}",
+                    "spawn_blocking panicked cleaning up stale submissions: {}",
                     e
                 );
             }
