@@ -56,12 +56,18 @@ pub struct WebhookResponse {
     pub message: String,
 }
 
-/// Verify a Standard Webhooks signature.
+/// Maximum webhook body size (1MB).
+///
+/// Webhook payloads are typically small (under 64KB). This limit prevents
+/// memory exhaustion attacks while being generous enough for any legitimate payload.
+const MAX_WEBHOOK_BODY_SIZE: usize = 1024 * 1024;
+
+/// Verify a Standard Webhooks signature using constant-time comparison.
 ///
 /// Standard Webhooks format:
 /// - Secret: Base64-encoded, may have "whsec_" prefix
 /// - Headers: webhook-id, webhook-timestamp, webhook-signature
-/// - Signature format: "v1,<base64>" (may have multiple comma-separated versions)
+/// - Signature format: "v1,<base64>" (may have multiple space-separated versions)
 /// - Signed payload: "{webhook-id}.{webhook-timestamp}.{body}"
 fn verify_standard_webhook_signature(
     secret: &str,
@@ -86,24 +92,30 @@ fn verify_standard_webhook_signature(
     let body_str = String::from_utf8_lossy(body);
     let signed_payload = format!("{}.{}.{}", webhook_id, timestamp, body_str);
 
-    // Compute HMAC-SHA256
-    let mut mac = match HmacSha256::new_from_slice(&secret_bytes) {
-        Ok(mac) => mac,
-        Err(_) => {
-            error!("Failed to create HMAC from secret");
-            return false;
-        }
-    };
-    mac.update(signed_payload.as_bytes());
-    let expected_signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
-
-    // Parse the signature header - format is "v1,<base64>" or multiple comma-separated
+    // Parse the signature header - format is "v1,<base64>" or multiple space-separated
     // versions like "v1,<sig1> v1a,<sig2>"
-    // We look for any v1 signature that matches
+    // We look for any v1 signature that matches using constant-time comparison
     for part in signature_header.split(' ') {
-        if let Some(sig) = part.strip_prefix("v1,") {
-            // Constant-time comparison
-            if sig == expected_signature {
+        if let Some(sig_b64) = part.strip_prefix("v1,") {
+            // Decode the provided signature from base64
+            let sig_bytes = match BASE64_STANDARD.decode(sig_b64) {
+                Ok(bytes) => bytes,
+                Err(_) => continue, // Skip malformed signatures
+            };
+
+            // Create fresh HMAC for each signature attempt and use verify_slice
+            // for constant-time comparison
+            let mut mac = match HmacSha256::new_from_slice(&secret_bytes) {
+                Ok(mac) => mac,
+                Err(_) => {
+                    error!("Failed to create HMAC from secret");
+                    return false;
+                }
+            };
+            mac.update(signed_payload.as_bytes());
+
+            // verify_slice performs constant-time comparison
+            if mac.verify_slice(&sig_bytes).is_ok() {
                 return true;
             }
         }
@@ -129,11 +141,14 @@ async fn verify_openai_webhook_signature(
 
     let correlation_id = CorrelationId(Uuid::new_v4().to_string());
 
-    // Extract headers and body
+    // Extract headers and body with size limit to prevent DoS
     let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, usize::MAX)
+    let bytes = axum::body::to_bytes(body, MAX_WEBHOOK_BODY_SIZE)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| {
+            error!("Webhook body too large or read error");
+            StatusCode::PAYLOAD_TOO_LARGE
+        })?;
 
     // Extract Standard Webhooks headers
     let webhook_id = parts
@@ -188,9 +203,9 @@ pub async fn openai_webhook_handler(
         .get::<CorrelationId>()
         .map(|id| id.0.clone());
 
-    // Parse body
+    // Parse body (size already validated by middleware, but apply limit for safety)
     let (_parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, usize::MAX)
+    let bytes = axum::body::to_bytes(body, MAX_WEBHOOK_BODY_SIZE)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -276,119 +291,129 @@ pub fn openai_webhook_router(middleware_state: Arc<AppState>) -> Router<Arc<AppS
 mod tests {
     use super::*;
 
+    // Official test vector from Standard Webhooks / Svix documentation:
+    // https://docs.svix.com/receiving/verifying-payloads/how-manual
+    //
+    // These values are hard-coded from the spec to ensure our implementation
+    // matches the standard, rather than computing the signature ourselves.
+    const TEST_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+    const TEST_WEBHOOK_ID: &str = "msg_p5jXN8AQM9LWM0D4loKWxJek";
+    const TEST_TIMESTAMP: &str = "1614265330";
+    const TEST_BODY: &[u8] = br#"{"test": 2432232314}"#;
+    // Expected signature from the Standard Webhooks spec
+    const TEST_EXPECTED_SIGNATURE: &str = "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=";
+
     #[test]
-    fn test_verify_signature_valid() {
-        // Test vector based on Standard Webhooks spec
-        // This uses a known secret and payload to verify our implementation
-        let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
-        let webhook_id = "msg_p5jXN8AQM9LWM0D4loKWxJek";
-        let timestamp = "1614265330";
-        let body = br#"{"test": 2432232314}"#;
-
-        // Compute expected signature for this test
-        let secret_b64 = secret.strip_prefix("whsec_").unwrap();
-        let secret_bytes = BASE64_STANDARD.decode(secret_b64).unwrap();
-        let signed_payload = format!(
-            "{}.{}.{}",
-            webhook_id,
-            timestamp,
-            String::from_utf8_lossy(body)
+    fn test_verify_signature_with_spec_test_vector() {
+        // Verify against the official Standard Webhooks test vector
+        // This ensures our implementation matches the spec exactly
+        assert!(
+            verify_standard_webhook_signature(
+                TEST_SECRET,
+                TEST_WEBHOOK_ID,
+                TEST_TIMESTAMP,
+                TEST_BODY,
+                TEST_EXPECTED_SIGNATURE
+            ),
+            "Failed to verify official Standard Webhooks test vector"
         );
-        let mut mac = HmacSha256::new_from_slice(&secret_bytes).unwrap();
-        mac.update(signed_payload.as_bytes());
-        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
-
-        let signature_header = format!("v1,{}", signature);
-
-        assert!(verify_standard_webhook_signature(
-            secret,
-            webhook_id,
-            timestamp,
-            body,
-            &signature_header
-        ));
     }
 
     #[test]
     fn test_verify_signature_invalid() {
-        let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
-        let webhook_id = "msg_p5jXN8AQM9LWM0D4loKWxJek";
-        let timestamp = "1614265330";
-        let body = br#"{"test": 2432232314}"#;
-
-        // Wrong signature
-        let signature_header = "v1,wrongsignature";
+        // Wrong signature should fail
+        let wrong_signature = "v1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
         assert!(!verify_standard_webhook_signature(
-            secret,
-            webhook_id,
-            timestamp,
-            body,
-            signature_header
+            TEST_SECRET,
+            TEST_WEBHOOK_ID,
+            TEST_TIMESTAMP,
+            TEST_BODY,
+            wrong_signature
+        ));
+    }
+
+    #[test]
+    fn test_verify_signature_malformed_base64() {
+        // Malformed base64 in signature should fail gracefully
+        let malformed_signature = "v1,not-valid-base64!!!";
+
+        assert!(!verify_standard_webhook_signature(
+            TEST_SECRET,
+            TEST_WEBHOOK_ID,
+            TEST_TIMESTAMP,
+            TEST_BODY,
+            malformed_signature
         ));
     }
 
     #[test]
     fn test_verify_signature_wrong_body() {
-        let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
-        let webhook_id = "msg_p5jXN8AQM9LWM0D4loKWxJek";
-        let timestamp = "1614265330";
-        let original_body = br#"{"test": 2432232314}"#;
+        // Valid signature for original body should fail with tampered body
         let tampered_body = br#"{"test": 9999999999}"#;
 
-        // Compute signature for original body
-        let secret_b64 = secret.strip_prefix("whsec_").unwrap();
-        let secret_bytes = BASE64_STANDARD.decode(secret_b64).unwrap();
-        let signed_payload = format!(
-            "{}.{}.{}",
-            webhook_id,
-            timestamp,
-            String::from_utf8_lossy(original_body)
-        );
-        let mut mac = HmacSha256::new_from_slice(&secret_bytes).unwrap();
-        mac.update(signed_payload.as_bytes());
-        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
-        let signature_header = format!("v1,{}", signature);
-
-        // Verify should fail with tampered body
         assert!(!verify_standard_webhook_signature(
-            secret,
-            webhook_id,
-            timestamp,
+            TEST_SECRET,
+            TEST_WEBHOOK_ID,
+            TEST_TIMESTAMP,
             tampered_body,
-            &signature_header
+            TEST_EXPECTED_SIGNATURE
+        ));
+    }
+
+    #[test]
+    fn test_verify_signature_wrong_timestamp() {
+        // Valid signature should fail with different timestamp
+        let wrong_timestamp = "1614265331"; // Off by one second
+
+        assert!(!verify_standard_webhook_signature(
+            TEST_SECRET,
+            TEST_WEBHOOK_ID,
+            wrong_timestamp,
+            TEST_BODY,
+            TEST_EXPECTED_SIGNATURE
+        ));
+    }
+
+    #[test]
+    fn test_verify_signature_wrong_webhook_id() {
+        // Valid signature should fail with different webhook ID
+        let wrong_webhook_id = "msg_different";
+
+        assert!(!verify_standard_webhook_signature(
+            TEST_SECRET,
+            wrong_webhook_id,
+            TEST_TIMESTAMP,
+            TEST_BODY,
+            TEST_EXPECTED_SIGNATURE
         ));
     }
 
     #[test]
     fn test_verify_signature_multiple_versions() {
-        let secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
-        let webhook_id = "msg_p5jXN8AQM9LWM0D4loKWxJek";
-        let timestamp = "1614265330";
-        let body = br#"{"test": 2432232314}"#;
-
-        // Compute expected signature
-        let secret_b64 = secret.strip_prefix("whsec_").unwrap();
-        let secret_bytes = BASE64_STANDARD.decode(secret_b64).unwrap();
-        let signed_payload = format!(
-            "{}.{}.{}",
-            webhook_id,
-            timestamp,
-            String::from_utf8_lossy(body)
-        );
-        let mut mac = HmacSha256::new_from_slice(&secret_bytes).unwrap();
-        mac.update(signed_payload.as_bytes());
-        let signature = BASE64_STANDARD.encode(mac.finalize().into_bytes());
-
-        // Header with multiple versions (v1a is fake, v1 is real)
-        let signature_header = format!("v1a,fakesig v1,{}", signature);
+        // Header with multiple signature versions - v1 should still match
+        let signature_header_with_multiple = format!("v1a,fakesig {}", TEST_EXPECTED_SIGNATURE);
 
         assert!(verify_standard_webhook_signature(
-            secret,
-            webhook_id,
-            timestamp,
-            body,
-            &signature_header
+            TEST_SECRET,
+            TEST_WEBHOOK_ID,
+            TEST_TIMESTAMP,
+            TEST_BODY,
+            &signature_header_with_multiple
+        ));
+    }
+
+    #[test]
+    fn test_verify_signature_secret_without_prefix() {
+        // Secret without whsec_ prefix should also work
+        let secret_without_prefix = "MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+
+        assert!(verify_standard_webhook_signature(
+            secret_without_prefix,
+            TEST_WEBHOOK_ID,
+            TEST_TIMESTAMP,
+            TEST_BODY,
+            TEST_EXPECTED_SIGNATURE
         ));
     }
 
