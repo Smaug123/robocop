@@ -677,8 +677,9 @@ impl SqliteDb {
     /// has this batch_id. This is used by OpenAI webhooks to route batch completion
     /// events to the correct PR.
     ///
-    /// Note: This queries PR states in BatchPending or AwaitingAncestryCheck states,
-    /// as those are the only states that have an active batch_id.
+    /// Note: This queries all PR states that have the given batch_id set,
+    /// regardless of current state. The state machine handles ignoring events
+    /// for PRs that are no longer in a state expecting batch completion.
     pub fn get_pr_by_batch_id(&self, batch_id: &str) -> Result<Option<(StateMachinePrId, u64)>> {
         let conn = self.conn.lock().expect("mutex poisoned");
 

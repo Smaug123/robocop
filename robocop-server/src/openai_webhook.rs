@@ -62,6 +62,20 @@ pub struct WebhookResponse {
 /// memory exhaustion attacks while being generous enough for any legitimate payload.
 const MAX_WEBHOOK_BODY_SIZE: usize = 1024 * 1024;
 
+/// Maximum age of webhook timestamp (5 minutes per Standard Webhooks spec).
+///
+/// Webhooks with timestamps older than this are rejected to prevent replay attacks.
+/// The tolerance also applies to future timestamps to handle clock skew.
+const TIMESTAMP_TOLERANCE_SECONDS: i64 = 300;
+
+/// Check if a webhook timestamp is within the acceptable tolerance window.
+///
+/// Returns true if the timestamp is within `TIMESTAMP_TOLERANCE_SECONDS` of `now`.
+/// Both old timestamps (replay attacks) and future timestamps (clock skew) are checked.
+fn is_timestamp_within_tolerance(timestamp_secs: i64, now_secs: i64) -> bool {
+    (now_secs - timestamp_secs).abs() <= TIMESTAMP_TOLERANCE_SECONDS
+}
+
 /// Verify a Standard Webhooks signature using constant-time comparison.
 ///
 /// Standard Webhooks format:
@@ -168,6 +182,25 @@ async fn verify_openai_webhook_signature(
             error!("Missing webhook-timestamp header");
             StatusCode::UNAUTHORIZED
         })?;
+
+    // Validate timestamp is within tolerance window (replay protection)
+    let timestamp_secs: i64 = timestamp.parse().map_err(|_| {
+        error!("Invalid webhook-timestamp format: {}", timestamp);
+        StatusCode::UNAUTHORIZED
+    })?;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .as_secs() as i64;
+
+    if !is_timestamp_within_tolerance(timestamp_secs, now_secs) {
+        error!(
+            "Webhook timestamp {} outside tolerance (current: {}, tolerance: {}s)",
+            timestamp_secs, now_secs, TIMESTAMP_TOLERANCE_SECONDS
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
     let signature = parts
         .headers
@@ -433,5 +466,57 @@ mod tests {
         assert_eq!(payload.id, "evt_123");
         assert_eq!(payload.event_type, "batch.completed");
         assert_eq!(payload.data.id, "batch_abc123");
+    }
+
+    #[test]
+    fn test_timestamp_within_tolerance_current() {
+        let now = 1700000000i64;
+        // Timestamp at exactly now should be valid
+        assert!(is_timestamp_within_tolerance(now, now));
+    }
+
+    #[test]
+    fn test_timestamp_within_tolerance_slightly_old() {
+        let now = 1700000000i64;
+        // Timestamp 60 seconds ago should be valid
+        assert!(is_timestamp_within_tolerance(now - 60, now));
+    }
+
+    #[test]
+    fn test_timestamp_within_tolerance_at_boundary() {
+        let now = 1700000000i64;
+        // Timestamp exactly at tolerance boundary should be valid
+        assert!(is_timestamp_within_tolerance(
+            now - TIMESTAMP_TOLERANCE_SECONDS,
+            now
+        ));
+        assert!(is_timestamp_within_tolerance(
+            now + TIMESTAMP_TOLERANCE_SECONDS,
+            now
+        ));
+    }
+
+    #[test]
+    fn test_timestamp_outside_tolerance_too_old() {
+        let now = 1700000000i64;
+        // Timestamp just past tolerance should be rejected
+        assert!(!is_timestamp_within_tolerance(
+            now - TIMESTAMP_TOLERANCE_SECONDS - 1,
+            now
+        ));
+        // Timestamp way in the past should be rejected
+        assert!(!is_timestamp_within_tolerance(now - 3600, now));
+    }
+
+    #[test]
+    fn test_timestamp_outside_tolerance_future() {
+        let now = 1700000000i64;
+        // Timestamp just past tolerance in future should be rejected
+        assert!(!is_timestamp_within_tolerance(
+            now + TIMESTAMP_TOLERANCE_SECONDS + 1,
+            now
+        ));
+        // Timestamp way in the future should be rejected
+        assert!(!is_timestamp_within_tolerance(now + 3600, now));
     }
 }
