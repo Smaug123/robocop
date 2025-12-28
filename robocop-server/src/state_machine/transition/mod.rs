@@ -3178,5 +3178,60 @@ mod property_tests {
                 }
             }
         }
+
+        /// Property: When a batch is abandoned (new state has different head_sha/base_sha
+        /// or no pending batch), ClearBatchSubmission must be emitted for the old pair.
+        ///
+        /// This generalizes terminal_transitions_clear_batch_submission to also cover
+        /// transitions to non-terminal states like Preparing.
+        #[test]
+        fn batch_abandonment_clears_submission_cache(
+            (state, event) in arb_state_and_contextual_event()
+        ) {
+            // Only test states with pending batches
+            if state.pending_batch_id().is_none() {
+                return Ok(());
+            }
+
+            let (old_head, old_base) = match &state {
+                ReviewMachineState::BatchPending { head_sha, base_sha, .. } |
+                ReviewMachineState::AwaitingAncestryCheck { head_sha, base_sha, .. } |
+                ReviewMachineState::Cancelled { head_sha, base_sha, pending_cancel_batch_id: Some(_), .. } =>
+                    (head_sha.clone(), base_sha.clone()),
+                _ => return Ok(()),
+            };
+
+            let result = transition(state.clone(), event.clone());
+
+            // Does new state continue with SAME (head_sha, base_sha) for the SAME batch?
+            // Include Cancelled states with pending_cancel_batch_id since those still have
+            // the batch pending (awaiting cancellation confirmation).
+            let continues_same_batch = match &result.state {
+                ReviewMachineState::BatchPending { head_sha, base_sha, .. } |
+                ReviewMachineState::AwaitingAncestryCheck { head_sha, base_sha, .. }
+                    if head_sha == &old_head && base_sha == &old_base => true,
+                ReviewMachineState::Cancelled { head_sha, base_sha, pending_cancel_batch_id: Some(_), .. }
+                    if head_sha == &old_head && base_sha == &old_base => true,
+                _ => false,
+            };
+
+            if !continues_same_batch {
+                // Batch was abandoned - MUST have ClearBatchSubmission for old pair
+                let has_clear = result.effects.iter().any(|e| matches!(e,
+                    Effect::ClearBatchSubmission { head_sha, base_sha }
+                    if head_sha == &old_head && base_sha == &old_base
+                ));
+
+                prop_assert!(
+                    has_clear,
+                    "Batch abandoned without ClearBatchSubmission! \
+                     State: {:?}, Event: {:?}, New state: {:?}, Effects: {:?}",
+                    std::mem::discriminant(&state),
+                    event.log_summary(),
+                    std::mem::discriminant(&result.state),
+                    result.effects.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 }

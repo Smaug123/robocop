@@ -13,7 +13,38 @@ use crate::state_machine::state::ReviewMachineState;
 /// explicit review requests can trigger new reviews.
 pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
     match (&state, event) {
-        // New commit on terminal state -> start new review if enabled
+        // New commit on Cancelled state (enabled, pending batch) -> clear batch, start new review
+        (
+            ReviewMachineState::Cancelled {
+                reviews_enabled: true,
+                head_sha: old_head_sha,
+                base_sha: old_base_sha,
+                pending_cancel_batch_id: Some(_),
+                ..
+            },
+            Event::PrUpdated {
+                head_sha,
+                base_sha,
+                options,
+                ..
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: true,
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![
+                Effect::ClearBatchSubmission {
+                    head_sha: old_head_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
+                Effect::FetchData { head_sha, base_sha },
+            ],
+        ),
+
+        // New commit on terminal state (no pending batch) -> start new review if enabled
         (
             ReviewMachineState::Completed {
                 reviews_enabled: true,
@@ -25,6 +56,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             }
             | ReviewMachineState::Cancelled {
                 reviews_enabled: true,
+                pending_cancel_batch_id: None,
                 ..
             },
             Event::PrUpdated {
@@ -80,7 +112,38 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ],
         ),
 
-        // Force review on terminal state with reviews disabled -> start one-off review
+        // Force review on Cancelled state (disabled, pending batch) -> clear batch, start one-off review
+        (
+            ReviewMachineState::Cancelled {
+                reviews_enabled: false,
+                head_sha: old_head_sha,
+                base_sha: old_base_sha,
+                pending_cancel_batch_id: Some(_),
+                ..
+            },
+            Event::PrUpdated {
+                head_sha,
+                base_sha,
+                force_review: true,
+                options,
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: false, // Keep reviews disabled
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![
+                Effect::ClearBatchSubmission {
+                    head_sha: old_head_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
+                Effect::FetchData { head_sha, base_sha },
+            ],
+        ),
+
+        // Force review on terminal state with reviews disabled (no pending batch) -> start one-off review
         // (force_review=true overrides reviews_enabled=false)
         (
             ReviewMachineState::Completed {
@@ -93,6 +156,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             }
             | ReviewMachineState::Cancelled {
                 reviews_enabled: false,
+                pending_cancel_batch_id: None,
                 ..
             },
             Event::PrUpdated {
@@ -112,10 +176,44 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
         ),
 
         // Force review on terminal state -> start new review
+        // ReviewRequested on Cancelled state with pending batch -> clear batch, start review
+        (
+            ReviewMachineState::Cancelled {
+                reviews_enabled,
+                head_sha: old_head_sha,
+                base_sha: old_base_sha,
+                pending_cancel_batch_id: Some(_),
+                ..
+            },
+            Event::ReviewRequested {
+                head_sha,
+                base_sha,
+                options,
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: *reviews_enabled,
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![
+                Effect::ClearBatchSubmission {
+                    head_sha: old_head_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
+                Effect::FetchData { head_sha, base_sha },
+            ],
+        ),
+
+        // ReviewRequested on terminal state (no pending batch) -> start new review
         (
             terminal_state @ (ReviewMachineState::Completed { .. }
             | ReviewMachineState::Failed { .. }
-            | ReviewMachineState::Cancelled { .. }),
+            | ReviewMachineState::Cancelled {
+                pending_cancel_batch_id: None,
+                ..
+            }),
             Event::ReviewRequested {
                 head_sha,
                 base_sha,
@@ -131,11 +229,48 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             vec![Effect::FetchData { head_sha, base_sha }],
         ),
 
-        // Enable reviews on terminal state -> mark enabled and start review
+        // Enable reviews on Cancelled state with pending batch -> clear batch, start review
+        (
+            ReviewMachineState::Cancelled {
+                head_sha: old_head_sha,
+                base_sha: old_base_sha,
+                pending_cancel_batch_id: Some(_),
+                ..
+            },
+            Event::EnableReviewsRequested {
+                head_sha,
+                base_sha,
+                options,
+            },
+        ) => TransitionResult::new(
+            ReviewMachineState::Preparing {
+                reviews_enabled: true,
+                head_sha: head_sha.clone(),
+                base_sha: base_sha.clone(),
+                options,
+            },
+            vec![
+                Effect::ClearBatchSubmission {
+                    head_sha: old_head_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::ReviewsEnabled {
+                        head_sha: head_sha.clone(),
+                    },
+                },
+                Effect::FetchData { head_sha, base_sha },
+            ],
+        ),
+
+        // Enable reviews on terminal state (no pending batch) -> mark enabled and start review
         (
             ReviewMachineState::Completed { .. }
             | ReviewMachineState::Failed { .. }
-            | ReviewMachineState::Cancelled { .. },
+            | ReviewMachineState::Cancelled {
+                pending_cancel_batch_id: None,
+                ..
+            },
             Event::EnableReviewsRequested {
                 head_sha,
                 base_sha,

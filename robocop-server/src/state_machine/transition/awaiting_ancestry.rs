@@ -19,6 +19,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
                 head_sha: old_sha,
+                base_sha: old_base_sha,
                 check_run_id,
                 new_head_sha,
                 new_base_sha,
@@ -34,6 +35,10 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             let mut effects = vec![
                 Effect::CancelBatch {
                     batch_id: batch_id.clone(),
+                },
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: old_base_sha.clone(),
                 },
                 Effect::UpdateComment {
                     content: CommentContent::ReviewCancelled {
@@ -228,6 +233,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
                 head_sha: old_sha,
+                base_sha: old_base_sha,
                 check_run_id,
                 new_head_sha,
                 new_base_sha,
@@ -243,6 +249,10 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             let mut effects = vec![
                 Effect::CancelBatch {
                     batch_id: batch_id.clone(),
+                },
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: old_base_sha.clone(),
                 },
                 Effect::Log {
                     level: LogLevel::Info,
@@ -292,6 +302,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 reviews_enabled,
                 batch_id,
                 head_sha: old_sha,
+                base_sha: old_base_sha,
                 check_run_id,
                 new_head_sha,
                 new_base_sha,
@@ -303,6 +314,10 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             let mut effects = vec![
                 Effect::CancelBatch {
                     batch_id: batch_id.clone(),
+                },
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: old_base_sha.clone(),
                 },
                 Effect::Log {
                     level: LogLevel::Warn,
@@ -361,6 +376,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 reviews_enabled: true,
                 head_sha: old_sha,
+                base_sha: old_base_sha,
                 check_run_id,
                 new_head_sha,
                 new_base_sha,
@@ -370,6 +386,10 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             Event::BatchCompleted { result, .. },
         ) => {
             let mut effects = vec![
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
                 Effect::Log {
                     level: LogLevel::Info,
                     message: format!(
@@ -500,6 +520,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             ReviewMachineState::AwaitingAncestryCheck {
                 reviews_enabled: true,
                 head_sha: old_sha,
+                base_sha: old_base_sha,
                 check_run_id,
                 new_head_sha,
                 new_base_sha,
@@ -509,6 +530,10 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             Event::BatchTerminated { reason, .. },
         ) => {
             let mut effects = vec![
+                Effect::ClearBatchSubmission {
+                    head_sha: old_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
                 Effect::Log {
                     level: LogLevel::Info,
                     message: format!(
@@ -629,6 +654,8 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
         (
             ReviewMachineState::AwaitingAncestryCheck {
                 batch_id,
+                head_sha: old_head_sha,
+                base_sha: old_base_sha,
                 check_run_id,
                 reviews_enabled,
                 ..
@@ -639,9 +666,15 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 options,
             },
         ) => {
-            let mut effects = vec![Effect::CancelBatch {
-                batch_id: batch_id.clone(),
-            }];
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::ClearBatchSubmission {
+                    head_sha: old_head_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
+            ];
 
             if let Some(cr_id) = check_run_id {
                 effects.push(Effect::UpdateCheckRun {

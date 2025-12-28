@@ -584,7 +584,7 @@ async fn process_cancel_reviews(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await?;
 
     info!(
         "Cancel reviews completed for PR #{}, final state: {:?}",
@@ -660,7 +660,7 @@ async fn process_enable_reviews(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await?;
 
     info!(
         "Enable reviews completed for PR #{}, final state: {:?}",
@@ -711,7 +711,7 @@ async fn process_disable_reviews(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await?;
 
     info!(
         "Disable reviews completed for PR #{}, final state: {:?}",
@@ -865,7 +865,7 @@ async fn process_code_review(
     let _current_state = state
         .state_store
         .get_or_init(&sm_pr_id, reviews_enabled)
-        .await;
+        .await?;
 
     // Create the appropriate event
     let event = if trigger.force_review {
@@ -898,7 +898,7 @@ async fn process_code_review(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await?;
 
     info!(
         "Code review completed for PR #{}, final state: {:?}",

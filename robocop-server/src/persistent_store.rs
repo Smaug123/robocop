@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info};
+use tracing::info;
 
 use crate::db::SqliteDb;
 use crate::state_machine::event::Event;
@@ -166,7 +166,11 @@ impl PersistentStateStore {
     }
 
     /// Persist a state to the database.
-    async fn persist(&self, pr_id: &StateMachinePrId, state: &ReviewMachineState) {
+    ///
+    /// Returns an error if the database operation fails. The caller MUST handle
+    /// this error appropriately - in particular, `process_event` must NOT execute
+    /// effects if persistence fails, to maintain restart safety.
+    async fn persist(&self, pr_id: &StateMachinePrId, state: &ReviewMachineState) -> Result<()> {
         // Get the installation_id from memory
         let installation_id = self
             .memory_store
@@ -176,46 +180,29 @@ impl PersistentStateStore {
 
         let db = self.db.clone();
         let pr_id_for_closure = pr_id.clone();
-        let pr_id_for_error = pr_id.clone();
         let state = state.clone();
 
         // Spawn blocking task for SQLite operation
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             db.upsert_state(&pr_id_for_closure, &state, installation_id)
         })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                error!(
-                    "Failed to persist state for PR {:?}: {}",
-                    pr_id_for_error, e
-                );
-            }
-            Err(e) => {
-                error!("spawn_blocking panicked while persisting state: {}", e);
-            }
-        }
+        .await
+        .context("spawn_blocking panicked while persisting state")?
+        .context("Failed to persist state to database")
     }
 
     /// Delete a state from the database.
-    async fn delete_from_db(&self, pr_id: &StateMachinePrId) {
+    ///
+    /// Returns an error if the database operation fails.
+    async fn delete_from_db(&self, pr_id: &StateMachinePrId) -> Result<()> {
         let db = self.db.clone();
         let pr_id_for_closure = pr_id.clone();
-        let pr_id_for_error = pr_id.clone();
 
-        let result = tokio::task::spawn_blocking(move || db.delete_state(&pr_id_for_closure)).await;
-
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                error!("Failed to delete state for PR {:?}: {}", pr_id_for_error, e);
-            }
-            Err(e) => {
-                error!("spawn_blocking panicked while deleting state: {}", e);
-            }
-        }
+        tokio::task::spawn_blocking(move || db.delete_state(&pr_id_for_closure))
+            .await
+            .context("spawn_blocking panicked while deleting state")?
+            .map(|_| ()) // Discard the bool return value
+            .context("Failed to delete state from database")
     }
 
     // =========================================================================
@@ -233,17 +220,19 @@ impl PersistentStateStore {
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic.
+    ///
+    /// Returns an error if the database operation fails.
     pub async fn get_or_init(
         &self,
         pr_id: &StateMachinePrId,
         reviews_enabled: bool,
-    ) -> ReviewMachineState {
+    ) -> Result<ReviewMachineState> {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
         let state = self.memory_store.get_or_init(pr_id, reviews_enabled).await;
-        self.persist(pr_id, &state).await;
-        state
+        self.persist(pr_id, &state).await?;
+        Ok(state)
     }
 
     /// Get the current state for a PR.
@@ -255,12 +244,14 @@ impl PersistentStateStore {
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic.
-    pub async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) {
+    ///
+    /// Returns an error if the database operation fails.
+    pub async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) -> Result<()> {
         let pr_lock = self.get_or_create_pr_lock(&pr_id).await;
         let _guard = pr_lock.lock().await;
 
         self.memory_store.set(pr_id.clone(), state.clone()).await;
-        self.persist(&pr_id, &state).await;
+        self.persist(&pr_id, &state).await
     }
 
     /// Remove the state for a PR and delete from database.
@@ -274,14 +265,16 @@ impl PersistentStateStore {
     /// the lock entry, a third task could create a NEW lock, allowing concurrent operations
     /// on the same PR. The memory overhead of keeping lock entries is negligible (one
     /// Arc<Mutex<()>> per PR ever seen).
-    pub async fn remove(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
+    ///
+    /// Returns an error if the database operation fails.
+    pub async fn remove(&self, pr_id: &StateMachinePrId) -> Result<Option<ReviewMachineState>> {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
         let result = self.memory_store.remove(pr_id).await;
-        self.delete_from_db(pr_id).await;
+        self.delete_from_db(pr_id).await?;
 
-        result
+        Ok(result)
     }
 
     /// Set the installation ID for a PR.
@@ -335,12 +328,16 @@ impl PersistentStateStore {
     /// persistence are atomic. This prevents concurrent events for the same PR
     /// from interleaving their DB writes, which could leave the database with
     /// stale state after a restart.
+    ///
+    /// Returns an error if state persistence fails. If an error is returned,
+    /// effects were NOT executed, maintaining restart safety: the database
+    /// state is unchanged and no external side effects occurred.
     pub async fn process_event(
         &self,
         pr_id: &StateMachinePrId,
         event: Event,
         ctx: &InterpreterContext,
-    ) -> ReviewMachineState {
+    ) -> Result<ReviewMachineState> {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
@@ -365,10 +362,14 @@ impl PersistentStateStore {
             // This ensures that if we crash during effect execution, the new
             // state is already saved. Effects are idempotent, so re-executing
             // them on restart is safe.
+            //
+            // CRITICAL: If persist fails, we must NOT execute effects. This
+            // maintains restart safety - on restart, we'll be back to the old
+            // state with no side effects having occurred.
             self.memory_store
                 .set(pr_id.clone(), current_state.clone())
                 .await;
-            self.persist(pr_id, &current_state).await;
+            self.persist(pr_id, &current_state).await?;
 
             // Step 3: Execute effects (may call external APIs like OpenAI)
             let result_events = self.memory_store.execute_effects(pr_id, effects, ctx).await;
@@ -385,7 +386,7 @@ impl PersistentStateStore {
             pr_id.pr_number, current_state
         );
 
-        current_state
+        Ok(current_state)
     }
 }
 
@@ -412,7 +413,10 @@ mod tests {
             reviews_enabled: true,
         };
 
-        store.set(pr_id.clone(), state.clone()).await;
+        store
+            .set(pr_id.clone(), state.clone())
+            .await
+            .expect("should persist state");
 
         let retrieved = store.get(&pr_id).await;
         assert_eq!(retrieved, Some(state));
@@ -445,7 +449,10 @@ mod tests {
                 .await
                 .expect("should create store");
             store.set_installation_id(&pr_id, 12345).await;
-            store.set(pr_id.clone(), state.clone()).await;
+            store
+                .set(pr_id.clone(), state.clone())
+                .await
+                .expect("should persist state");
 
             // Verify it's in memory
             let retrieved = store.get(&pr_id).await;
@@ -485,8 +492,11 @@ mod tests {
             let store = PersistentStateStore::new(&db_path)
                 .await
                 .expect("should create store");
-            store.set(pr_id.clone(), state.clone()).await;
-            store.remove(&pr_id).await;
+            store
+                .set(pr_id.clone(), state.clone())
+                .await
+                .expect("should persist state");
+            store.remove(&pr_id).await.expect("should remove state");
         }
 
         // Reload - should be empty
@@ -525,7 +535,10 @@ mod tests {
                 .await
                 .expect("should create store");
             store.set_installation_id(&pr_id, 12345).await;
-            store.set(pr_id.clone(), state.clone()).await;
+            store
+                .set(pr_id.clone(), state.clone())
+                .await
+                .expect("should persist state");
         }
 
         // Reload and check pending batches

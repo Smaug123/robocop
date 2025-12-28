@@ -387,6 +387,8 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
         (
             ReviewMachineState::BatchPending {
                 batch_id,
+                head_sha: old_head_sha,
+                base_sha: old_base_sha,
                 check_run_id,
                 reviews_enabled,
                 ..
@@ -397,9 +399,15 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 options,
             },
         ) => {
-            let mut effects = vec![Effect::CancelBatch {
-                batch_id: batch_id.clone(),
-            }];
+            let mut effects = vec![
+                Effect::CancelBatch {
+                    batch_id: batch_id.clone(),
+                },
+                Effect::ClearBatchSubmission {
+                    head_sha: old_head_sha.clone(),
+                    base_sha: old_base_sha.clone(),
+                },
+            ];
 
             if let Some(cr_id) = check_run_id {
                 effects.push(Effect::UpdateCheckRun {
