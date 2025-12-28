@@ -950,10 +950,40 @@ async fn execute_submit_batch(
             })
         }
         Err(e) => {
-            // Rollback: delete the 'submitting' reservation
+            // Rollback: delete the 'submitting' reservation so retries aren't blocked.
+            // Log failures since a lingering row will block retries until stale cleanup.
             let db = ctx.db.clone();
-            let key = key.clone();
-            let _ = tokio::task::spawn_blocking(move || db.delete_batch_submission(&key)).await;
+            let key_for_rollback = key.clone();
+            match tokio::task::spawn_blocking(move || db.delete_batch_submission(&key_for_rollback))
+                .await
+            {
+                Ok(Ok(())) => {
+                    info!(
+                        "Rolled back batch submission reservation for PR #{} commit {}",
+                        ctx.pr_number,
+                        head_sha.short()
+                    );
+                }
+                Ok(Err(db_err)) => {
+                    // Log as warning - the stale cleanup will eventually remove this row,
+                    // but retries will be blocked for up to 10 minutes.
+                    warn!(
+                        "Failed to rollback batch submission reservation for PR #{} commit {}: {}. \
+                         Retries may be blocked until stale cleanup (10 min).",
+                        ctx.pr_number,
+                        head_sha.short(),
+                        db_err
+                    );
+                }
+                Err(join_err) => {
+                    warn!(
+                        "Task panicked while rolling back batch submission for PR #{} commit {}: {}",
+                        ctx.pr_number,
+                        head_sha.short(),
+                        join_err
+                    );
+                }
+            }
 
             EffectResult::single(Event::BatchSubmissionFailed {
                 error: e.to_string(),

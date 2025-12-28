@@ -737,23 +737,6 @@ impl SqliteDb {
             .unwrap_or(true) // If parsing fails, assume stale to allow retry
         };
 
-        // Helper to delete existing row
-        let delete_existing = |conn: &Connection| -> Result<()> {
-            conn.execute(
-                "DELETE FROM batch_submissions \
-                 WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
-                rusqlite::params![
-                    &key.repo_owner,
-                    &key.repo_name,
-                    key.pr_number,
-                    &key.head_sha,
-                    &key.base_sha
-                ],
-            )
-            .context("Failed to delete batch submission")?;
-            Ok(())
-        };
-
         // Try to atomically insert a reservation. This handles the race condition:
         // if two instances try to reserve simultaneously, one will succeed and the
         // other will see rows_affected=0 and fetch the existing row.
@@ -789,9 +772,9 @@ impl SqliteDb {
                     Some(bid) => bid,
                     None => {
                         // Corrupted state: submitted without batch_id. Invalidate.
-                        delete_existing(&conn)?;
+                        // Use INSERT OR REPLACE for atomicity in multi-instance scenarios.
                         conn.execute(
-                            "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                            "INSERT OR REPLACE INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
                              VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
                             rusqlite::params![
                                 &key.repo_owner,
@@ -816,9 +799,9 @@ impl SqliteDb {
                     // Options mismatch: invalidate cache and allow new submission.
                     // Note: this creates an orphaned batch in OpenAI (the old one),
                     // but it will expire after 24h.
-                    delete_existing(&conn)?;
+                    // Use INSERT OR REPLACE for atomicity in multi-instance scenarios.
                     conn.execute(
-                        "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                        "INSERT OR REPLACE INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
                          VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
                         rusqlite::params![
                             &key.repo_owner,
@@ -844,13 +827,13 @@ impl SqliteDb {
             "submitting" => {
                 // Check if this is a stale reservation from a crashed instance
                 if is_stale(&existing.created_at) {
-                    // Stale reservation - delete and reserve fresh.
+                    // Stale reservation - replace with fresh reservation.
                     // This may create a duplicate batch in OpenAI if the original instance
                     // is actually still running (unlikely after 10 minutes), but the old
                     // batch will expire after 24h.
-                    delete_existing(&conn)?;
+                    // Use INSERT OR REPLACE for atomicity in multi-instance scenarios.
                     conn.execute(
-                        "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                        "INSERT OR REPLACE INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
                          VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
                         rusqlite::params![
                             &key.repo_owner,
