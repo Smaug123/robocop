@@ -7,6 +7,7 @@ pub struct Config {
     pub github_private_key: String,
     pub github_webhook_secret: String,
     pub openai_api_key: String,
+    pub openai_webhook_secret: Option<String>,
     pub target_user_id: u64,
     pub port: u16,
     pub recording_enabled: bool,
@@ -30,6 +31,8 @@ impl Config {
 
         let openai_api_key = env::var("OPENAI_API_KEY")
             .context("OPENAI_API_KEY environment variable is required")?;
+
+        let openai_webhook_secret = env::var("OPENAI_WEBHOOK_SECRET").ok();
 
         let target_user_id = env::var("TARGET_GITHUB_USER_ID")
             .context("TARGET_GITHUB_USER_ID environment variable is required")?
@@ -57,6 +60,7 @@ impl Config {
             github_private_key,
             github_webhook_secret,
             openai_api_key,
+            openai_webhook_secret,
             target_user_id,
             port,
             recording_enabled,

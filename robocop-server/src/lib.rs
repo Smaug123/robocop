@@ -5,6 +5,7 @@ pub mod db;
 pub mod git;
 pub mod github;
 pub mod openai;
+pub mod openai_webhook;
 pub mod persistent_store;
 pub mod review_state;
 pub mod state_machine;
@@ -37,6 +38,7 @@ pub struct AppState {
     pub github_client: Arc<GitHubClient>,
     pub openai_client: Arc<OpenAIClient>,
     pub webhook_secret: String,
+    pub openai_webhook_secret: Option<String>,
     pub target_user_id: u64,
     pub state_store: Arc<PersistentStateStore>,
     pub recording_logger: Option<RecordingLogger>,

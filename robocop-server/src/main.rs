@@ -17,6 +17,7 @@ use robocop_server::batch_processor::{batch_polling_loop, recover_preparing_stat
 use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
+use robocop_server::openai_webhook::openai_webhook_router;
 use robocop_server::webhook::webhook_router;
 use robocop_server::{AppState, PersistentStateStore, RecordingLogger};
 
@@ -67,6 +68,13 @@ async fn help_handler(headers: HeaderMap) -> Response {
                 "description": "API documentation and service information",
                 "authentication": "None",
                 "response_format": "Supports content negotiation (JSON/HTML)"
+            },
+            {
+                "path": "/openai-webhook",
+                "method": "POST",
+                "description": "OpenAI webhook receiver for batch completion events",
+                "authentication": "Standard Webhooks signature (webhook-id, webhook-timestamp, webhook-signature)",
+                "response_format": "application/json"
             }
         ],
         "features": [
@@ -91,7 +99,8 @@ async fn help_handler(headers: HeaderMap) -> Response {
                 "PORT (default: 3000)",
                 "RECORDING_ENABLED (default: false)",
                 "RECORDING_LOG_PATH (default: recordings.jsonl)",
-                "SQLITE_DB_PATH (default: robocop.db)"
+                "SQLITE_DB_PATH (default: robocop.db)",
+                "OPENAI_WEBHOOK_SECRET (for OpenAI webhook signature verification)"
             ]
         },
         "documentation": "https://github.com/Smaug123/robocop"
@@ -191,6 +200,7 @@ async fn main() -> Result<()> {
         github_client: Arc::new(github_client),
         openai_client: Arc::new(openai_client),
         webhook_secret: config.github_webhook_secret,
+        openai_webhook_secret: config.openai_webhook_secret,
         target_user_id: config.target_user_id,
         state_store: Arc::new(state_store),
         recording_logger,
@@ -204,6 +214,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health_check))
         .route("/help", get(help_handler))
         .merge(webhook_router(app_state.clone()))
+        .merge(openai_webhook_router(app_state.clone()))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(app_state.clone());
 

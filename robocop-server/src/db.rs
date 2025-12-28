@@ -28,7 +28,7 @@ use crate::state_machine::store::StateMachinePrId;
 /// 1. Increment this constant
 /// 2. Add a migration function `migrate_v{N}_to_v{N+1}`
 /// 3. Call it from `run_migrations`
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Key for batch submission idempotency.
 ///
@@ -154,6 +154,11 @@ impl SqliteDb {
             Self::migrate_v0_to_v1(conn)?;
         }
 
+        // Migration v1 -> v2: Add index for batch_id reverse lookup (OpenAI webhook support)
+        if from_version < 2 {
+            Self::migrate_v1_to_v2(conn)?;
+        }
+
         Ok(())
     }
 
@@ -251,6 +256,24 @@ impl SqliteDb {
             "#,
         )
         .context("Failed to create initial schema (v0 -> v1)")?;
+
+        Ok(())
+    }
+
+    /// Migration v1 -> v2: Add index for batch_id reverse lookup.
+    ///
+    /// This enables efficient lookup of which PR owns a given batch_id,
+    /// needed for OpenAI webhook support where we receive batch_id and
+    /// need to find the corresponding PR.
+    fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_batch_id_lookup
+            ON pr_states(batch_id)
+            WHERE batch_id IS NOT NULL;
+            "#,
+        )
+        .context("Failed to create batch_id index (v1 -> v2)")?;
 
         Ok(())
     }
@@ -645,6 +668,41 @@ impl SqliteDb {
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e).context("Failed to get PR state"),
+        }
+    }
+
+    /// Look up which PR owns a given batch_id.
+    ///
+    /// Returns the PR identifier and installation_id if found, or None if no PR
+    /// has this batch_id. This is used by OpenAI webhooks to route batch completion
+    /// events to the correct PR.
+    ///
+    /// Note: This queries PR states in BatchPending or AwaitingAncestryCheck states,
+    /// as those are the only states that have an active batch_id.
+    pub fn get_pr_by_batch_id(&self, batch_id: &str) -> Result<Option<(StateMachinePrId, u64)>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        let result = conn.query_row(
+            "SELECT repo_owner, repo_name, pr_number, installation_id \
+             FROM pr_states \
+             WHERE batch_id = ?1",
+            rusqlite::params![batch_id],
+            |row| {
+                Ok((
+                    StateMachinePrId::new(
+                        row.get::<_, String>(0)?.as_str(),
+                        row.get::<_, String>(1)?.as_str(),
+                        row.get::<_, u64>(2)?,
+                    ),
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        );
+
+        match result {
+            Ok((pr_id, installation_id)) => Ok(Some((pr_id, installation_id))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("Failed to look up PR by batch_id"),
         }
     }
 
