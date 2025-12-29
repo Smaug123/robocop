@@ -154,7 +154,7 @@ impl SqliteDb {
             Self::migrate_v0_to_v1(conn)?;
         }
 
-        // Migration v1 -> v2: Add index for batch_id reverse lookup (OpenAI webhook support)
+        // Migration v1 -> v2: Add indexes for batch_id reverse lookup (OpenAI webhook support)
         if from_version < 2 {
             Self::migrate_v1_to_v2(conn)?;
         }
@@ -260,20 +260,26 @@ impl SqliteDb {
         Ok(())
     }
 
-    /// Migration v1 -> v2: Add index for batch_id reverse lookup.
+    /// Migration v1 -> v2: Add indexes for batch_id reverse lookup.
     ///
     /// This enables efficient lookup of which PR owns a given batch_id,
     /// needed for OpenAI webhook support where we receive batch_id and
-    /// need to find the corresponding PR.
+    /// need to find the corresponding PR. We index both `batch_id` (for
+    /// BatchPending/AwaitingAncestryCheck states) and `pending_cancel_batch_id`
+    /// (for Cancelled states where cancel failed).
     fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_batch_id_lookup
             ON pr_states(batch_id)
             WHERE batch_id IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_pending_cancel_batch_id_lookup
+            ON pr_states(pending_cancel_batch_id)
+            WHERE pending_cancel_batch_id IS NOT NULL;
             "#,
         )
-        .context("Failed to create batch_id index (v1 -> v2)")?;
+        .context("Failed to create batch_id indexes (v1 -> v2)")?;
 
         Ok(())
     }
@@ -677,16 +683,17 @@ impl SqliteDb {
     /// has this batch_id. This is used by OpenAI webhooks to route batch completion
     /// events to the correct PR.
     ///
-    /// Note: This queries all PR states that have the given batch_id set,
-    /// regardless of current state. The state machine handles ignoring events
-    /// for PRs that are no longer in a state expecting batch completion.
+    /// This queries both `batch_id` (set for BatchPending and AwaitingAncestryCheck
+    /// states) and `pending_cancel_batch_id` (set for Cancelled states where the
+    /// cancel API call failed and we're still tracking the batch). The state machine
+    /// handles processing completion events appropriately for each state.
     pub fn get_pr_by_batch_id(&self, batch_id: &str) -> Result<Option<(StateMachinePrId, u64)>> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
         let result = conn.query_row(
             "SELECT repo_owner, repo_name, pr_number, installation_id \
              FROM pr_states \
-             WHERE batch_id = ?1",
+             WHERE batch_id = ?1 OR pending_cancel_batch_id = ?1",
             rusqlite::params![batch_id],
             |row| {
                 Ok((
@@ -1680,6 +1687,69 @@ mod tests {
             Some("batch_pending_cancel"),
             "Loaded state should preserve pending_cancel_batch_id"
         );
+    }
+
+    /// Test that get_pr_by_batch_id finds PRs via pending_cancel_batch_id.
+    ///
+    /// When a PR is in Cancelled state with pending_cancel_batch_id (because the
+    /// cancel API call failed), OpenAI webhooks for that batch should still find
+    /// the PR so we can process the completion event.
+    #[test]
+    fn test_get_pr_by_batch_id_finds_pending_cancel_batch() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let pr_id = StateMachinePrId::new("owner", "repo", 42);
+        let state = ReviewMachineState::Cancelled {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            reason: CancellationReason::Superseded {
+                new_sha: CommitSha::from("new789"),
+            },
+            pending_cancel_batch_id: Some(BatchId::from("batch_cancel_pending".to_string())),
+        };
+        db.upsert_state(&pr_id, &state, 100).expect("should upsert");
+
+        // Should find PR via pending_cancel_batch_id
+        let result = db
+            .get_pr_by_batch_id("batch_cancel_pending")
+            .expect("should query");
+        assert!(
+            result.is_some(),
+            "should find PR via pending_cancel_batch_id"
+        );
+        let (found_pr_id, found_installation_id) = result.unwrap();
+        assert_eq!(found_pr_id, pr_id);
+        assert_eq!(found_installation_id, 100);
+
+        // Should NOT find PR with a different batch_id
+        let result = db.get_pr_by_batch_id("nonexistent").expect("should query");
+        assert!(result.is_none(), "should not find PR with wrong batch_id");
+    }
+
+    /// Test that get_pr_by_batch_id finds PRs via batch_id (existing behavior).
+    #[test]
+    fn test_get_pr_by_batch_id_finds_batch_pending() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let pr_id = StateMachinePrId::new("owner", "repo", 42);
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId::from(100)),
+            check_run_id: Some(CheckRunId::from(200)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        db.upsert_state(&pr_id, &state, 100).expect("should upsert");
+
+        // Should find PR via batch_id
+        let result = db.get_pr_by_batch_id("batch_123").expect("should query");
+        assert!(result.is_some(), "should find PR via batch_id");
+        let (found_pr_id, _) = result.unwrap();
+        assert_eq!(found_pr_id, pr_id);
     }
 
     #[test]
