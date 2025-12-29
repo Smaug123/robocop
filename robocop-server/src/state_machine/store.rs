@@ -195,7 +195,14 @@ impl StateStore {
         installation_ids.get(pr_id).copied()
     }
 
-    /// Get all PR IDs with pending batches.
+    /// Get all PR IDs with *active* pending batches.
+    ///
+    /// Returns PR IDs in `BatchPending` or `AwaitingAncestryCheck` states.
+    /// Does NOT include `Cancelled` states with `pending_cancel_batch_id`, even
+    /// though those batches may still need polling.
+    ///
+    /// For batch polling, use `get_pending_batches()` instead, which includes
+    /// all batches that need polling (via `pending_batch_id()`).
     pub async fn get_pending_pr_ids(&self) -> Vec<StateMachinePrId> {
         let states = self.states.read().await;
         states

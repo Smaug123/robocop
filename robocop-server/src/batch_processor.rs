@@ -387,7 +387,46 @@ pub async fn recover_preparing_states(state: &Arc<AppState>) {
                 );
             }
         } else {
-            // No confirmed batch found - re-drive FetchData as before
+            // No confirmed batch found - check if another instance is actively submitting
+            let has_fresh_reservation = match tokio::task::spawn_blocking({
+                let db = db.clone();
+                let key = key.clone();
+                move || db.has_fresh_submitting_reservation(&key)
+            })
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    warn!(
+                        "Failed to check fresh reservation for PR #{}: {}",
+                        pr_info.pr_id.pr_number, e
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        "spawn_blocking panicked checking fresh reservation for PR #{}: {}",
+                        pr_info.pr_id.pr_number, e
+                    );
+                    false
+                }
+            };
+
+            if has_fresh_reservation {
+                // Another instance is actively submitting - wait for it to complete
+                // rather than re-driving FetchData which would cause duplicate work
+                info!(
+                    "PR #{} ({}/{}) at commit {} has a fresh 'submitting' reservation - \
+                     waiting for other instance to complete",
+                    pr_info.pr_id.pr_number,
+                    pr_info.pr_id.repo_owner,
+                    pr_info.pr_id.repo_name,
+                    pr_info.head_sha.short()
+                );
+                continue;
+            }
+
+            // No confirmed batch and no fresh reservation - re-drive FetchData
             info!(
                 "Recovering PR #{} ({}/{}) at commit {} - no confirmed batch, re-driving FetchData",
                 pr_info.pr_id.pr_number,

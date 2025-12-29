@@ -218,11 +218,16 @@ impl PersistentStateStore {
             .context("Failed to delete state from database")
     }
 
-    /// Atomically persist state and effects to the database in a single transaction.
+    /// Atomically persist state and replace pending effects in a single transaction.
     ///
     /// This ensures crash safety: either both state and effects are persisted,
     /// or neither is. Memory is NOT updated here - the caller must update memory
     /// only after this method returns successfully.
+    ///
+    /// **Important**: This method DELETES any existing pending effects for the PR
+    /// before inserting the new ones. This ensures that only effects from the
+    /// current transition exist. Old effects from previous transitions are cleared
+    /// because they represent stale state.
     async fn persist_state_and_effects(
         &self,
         pr_id: &StateMachinePrId,
@@ -440,7 +445,12 @@ impl PersistentStateStore {
         self.memory_store.get_installation_id(pr_id).await
     }
 
-    /// Get all PR IDs with pending batches.
+    /// Get all PR IDs with *active* pending batches.
+    ///
+    /// Returns PR IDs in `BatchPending` or `AwaitingAncestryCheck` states.
+    /// Does NOT include `Cancelled` states with `pending_cancel_batch_id`.
+    ///
+    /// For batch polling, use `get_pending_batches()` instead.
     pub async fn get_pending_pr_ids(&self) -> Vec<StateMachinePrId> {
         self.memory_store.get_pending_pr_ids().await
     }
@@ -465,7 +475,8 @@ impl PersistentStateStore {
     /// providing crash safety. The sequence for each event is:
     /// 1. Compute transition (pure) → get new state and effects
     /// 2. Partition effects: persistable (UI effects) vs non-persistable
-    /// 3. Atomically persist new state AND persistable effects to SQLite (single transaction)
+    /// 3. Atomically persist new state, CLEAR old pending effects, and INSERT new
+    ///    persistable effects to SQLite (single transaction)
     /// 4. Update in-memory state (only after DB commit succeeds)
     /// 5. Execute non-persistable effects (they don't need tracking)
     /// 6. Execute persistable effects, deleting each from DB after success
@@ -474,6 +485,12 @@ impl PersistentStateStore {
     /// If we crash during step 6, on restart we'll have the new state already
     /// persisted AND the pending effects in the database. The `recover_pending_effects`
     /// function replays any effects that weren't completed.
+    ///
+    /// **Note on stale effects**: Step 3 clears any old pending effects before
+    /// inserting new ones. This ensures only effects from the current transition
+    /// exist. Old effects from previous transitions (e.g., failed UI updates) are
+    /// cleared rather than retried, because they represent stale state that would
+    /// be confusing to replay after the state has moved forward.
     ///
     /// # Memory/DB Consistency
     ///

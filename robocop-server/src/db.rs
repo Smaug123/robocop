@@ -538,12 +538,18 @@ impl SqliteDb {
         Ok(())
     }
 
-    /// Atomically upsert state and insert pending effects in a single transaction.
+    /// Atomically upsert state and replace pending effects in a single transaction.
     ///
     /// This ensures crash safety: either both state and effects are persisted,
     /// or neither is. If the process crashes after state is persisted but before
     /// effects, on restart the database will be in a consistent state (no state
     /// change without corresponding effects).
+    ///
+    /// **Important**: This method DELETES any existing pending effects for the PR
+    /// before inserting the new ones. This ensures that only effects from the
+    /// current transition exist. Old effects (e.g., from failed UI updates in
+    /// previous transitions) are cleared because they represent stale state and
+    /// would be confusing to replay after the state has moved forward.
     pub fn upsert_state_and_effects(
         &self,
         pr_id: &StateMachinePrId,
@@ -556,10 +562,24 @@ impl SqliteDb {
         let tx = conn.transaction().context("Failed to begin transaction")?;
 
         Self::upsert_state_impl(&tx, pr_id, state, installation_id)?;
+        // Delete any existing pending effects before inserting new ones.
+        // This ensures only effects from the current transition exist.
+        Self::delete_pending_effects_impl(&tx, pr_id)?;
         Self::insert_pending_effects_impl(&tx, pr_id, effects)?;
 
         tx.commit().context("Failed to commit transaction")?;
 
+        Ok(())
+    }
+
+    /// Internal implementation of delete_pending_effects_for_pr that takes an existing connection.
+    fn delete_pending_effects_impl(conn: &Connection, pr_id: &StateMachinePrId) -> Result<()> {
+        conn.execute(
+            "DELETE FROM pending_effects \
+             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3",
+            rusqlite::params![&pr_id.repo_owner, &pr_id.repo_name, pr_id.pr_number],
+        )
+        .context("Failed to delete pending effects")?;
         Ok(())
     }
 
@@ -1123,6 +1143,46 @@ impl SqliteDb {
         )
         .optional()
         .context("Failed to query confirmed batch submission")
+    }
+
+    /// Check if there's a fresh 'submitting' reservation for a given key.
+    ///
+    /// Returns `true` if another instance is actively submitting a batch for this
+    /// (repo_owner, repo_name, pr_number, head_sha, base_sha) combination.
+    /// Returns `false` if no reservation exists, or if the reservation is stale
+    /// (older than 10 minutes).
+    ///
+    /// This is used by `recover_preparing_states` to avoid re-driving FetchData
+    /// when another instance is actively working on the submission.
+    pub fn has_fresh_submitting_reservation(&self, key: &BatchSubmissionKey) -> Result<bool> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        // Staleness threshold: 10 minutes (must match reserve_batch_submission)
+        const STALENESS_THRESHOLD_SECONDS: i64 = 600;
+
+        // Check for a 'submitting' row that's not stale
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM batch_submissions
+                     WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3
+                       AND head_sha = ?4 AND base_sha = ?5
+                       AND status = 'submitting'
+                       AND (julianday('now') - julianday(created_at)) * 86400 <= ?6
+                 )",
+                rusqlite::params![
+                    &key.repo_owner,
+                    &key.repo_name,
+                    key.pr_number,
+                    &key.head_sha,
+                    &key.base_sha,
+                    STALENESS_THRESHOLD_SECONDS
+                ],
+                |row| row.get(0),
+            )
+            .context("Failed to check for fresh submitting reservation")?;
+
+        Ok(exists)
     }
 
     // =========================================================================
