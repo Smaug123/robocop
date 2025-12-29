@@ -11,13 +11,25 @@
 //!
 //! The sequence for each event is:
 //! 1. Compute transition (pure) → get new state and effects
-//! 2. Persist new state to SQLite
-//! 3. Execute effects (may call external APIs)
-//! 4. Process result events from effects
+//! 2. Atomically persist new state AND pending effects to SQLite (single transaction)
+//! 3. Update in-memory state (only after DB transaction commits)
+//! 4. Execute effects (may call external APIs)
+//! 5. Process result events from effects
 //!
-//! If we crash during step 3, on restart we'll have the new state already
+//! If we crash during step 4, on restart we'll have the new state already
 //! persisted. Effects are designed to be idempotent (via the two-phase commit
 //! in `execute_submit_batch`), so re-executing them is safe.
+//!
+//! # Memory/DB Consistency
+//!
+//! All mutation operations (set, remove, process_event) follow a "DB-first" pattern:
+//! - Persist to SQLite FIRST
+//! - Only update in-memory state AFTER the DB operation succeeds
+//!
+//! This ensures that memory and DB never diverge. If a DB operation fails,
+//! memory remains unchanged and an error is returned. This is critical for
+//! restart safety: on restart, the DB state is loaded into memory, so they
+//! must always be consistent.
 //!
 //! ## Preparing State Recovery
 //!
@@ -206,23 +218,29 @@ impl PersistentStateStore {
             .context("Failed to delete state from database")
     }
 
-    /// Persist effects to the database for crash recovery.
+    /// Atomically persist state and effects to the database in a single transaction.
     ///
-    /// Effects are persisted alongside state so they can be replayed if the
-    /// server crashes between persisting state and executing effects.
-    async fn persist_effects(&self, pr_id: &StateMachinePrId, effects: &[Effect]) -> Result<()> {
-        if effects.is_empty() {
-            return Ok(());
-        }
-
+    /// This ensures crash safety: either both state and effects are persisted,
+    /// or neither is. Memory is NOT updated here - the caller must update memory
+    /// only after this method returns successfully.
+    async fn persist_state_and_effects(
+        &self,
+        pr_id: &StateMachinePrId,
+        state: &ReviewMachineState,
+        installation_id: u64,
+        effects: &[Effect],
+    ) -> Result<()> {
         let db = self.db.clone();
         let pr_id = pr_id.clone();
+        let state = state.clone();
         let effects = effects.to_vec();
 
-        tokio::task::spawn_blocking(move || db.insert_pending_effects(&pr_id, &effects))
-            .await
-            .context("spawn_blocking panicked while persisting effects")?
-            .context("Failed to persist effects to database")
+        tokio::task::spawn_blocking(move || {
+            db.upsert_state_and_effects(&pr_id, &state, installation_id, &effects)
+        })
+        .await
+        .context("spawn_blocking panicked while persisting state and effects")?
+        .context("Failed to persist state and effects to database")
     }
 
     /// Delete a pending effect from the database after successful execution.
@@ -306,6 +324,11 @@ impl PersistentStateStore {
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic.
     ///
+    /// # DB-First Consistency
+    ///
+    /// This method persists to DB BEFORE updating memory. If the DB operation fails,
+    /// memory remains unchanged, ensuring consistency.
+    ///
     /// Returns an error if the database operation fails.
     pub async fn get_or_init(
         &self,
@@ -315,8 +338,30 @@ impl PersistentStateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        let state = self.memory_store.get_or_init(pr_id, reviews_enabled).await;
+        // Check current state (read-only)
+        let current_state = self.memory_store.get(pr_id).await;
+
+        let state = match current_state {
+            Some(existing) if existing.reviews_enabled() == reviews_enabled => {
+                // State exists and reviews_enabled matches - no update needed
+                return Ok(existing);
+            }
+            Some(existing) => {
+                // State exists but reviews_enabled changed - update needed
+                existing.with_reviews_enabled(reviews_enabled)
+            }
+            None => {
+                // No state exists - create new one
+                ReviewMachineState::Idle { reviews_enabled }
+            }
+        };
+
+        // Persist to DB FIRST
         self.persist(pr_id, &state).await?;
+
+        // Only update memory AFTER DB succeeds
+        self.memory_store.set(pr_id.clone(), state.clone()).await;
+
         Ok(state)
     }
 
@@ -330,19 +375,34 @@ impl PersistentStateStore {
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic.
     ///
+    /// # DB-First Consistency
+    ///
+    /// This method persists to DB BEFORE updating memory. If the DB operation fails,
+    /// memory remains unchanged, ensuring consistency.
+    ///
     /// Returns an error if the database operation fails.
     pub async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) -> Result<()> {
         let pr_lock = self.get_or_create_pr_lock(&pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        self.memory_store.set(pr_id.clone(), state.clone()).await;
-        self.persist(&pr_id, &state).await
+        // Persist to DB FIRST
+        self.persist(&pr_id, &state).await?;
+
+        // Only update memory AFTER DB succeeds
+        self.memory_store.set(pr_id, state).await;
+
+        Ok(())
     }
 
     /// Remove the state for a PR and delete from database.
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// deletion are atomic.
+    ///
+    /// # DB-First Consistency
+    ///
+    /// This method deletes from DB BEFORE updating memory. If the DB operation fails,
+    /// memory remains unchanged, ensuring consistency.
     ///
     /// Note: We intentionally do NOT remove the lock entry from `pr_locks` after deletion.
     /// Removing the lock creates a race condition: if another task already cloned the Arc
@@ -356,8 +416,11 @@ impl PersistentStateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        let result = self.memory_store.remove(pr_id).await;
+        // Delete from DB FIRST
         self.delete_from_db(pr_id).await?;
+
+        // Only update memory AFTER DB succeeds
+        let result = self.memory_store.remove(pr_id).await;
 
         Ok(result)
     }
@@ -402,14 +465,22 @@ impl PersistentStateStore {
     /// providing crash safety. The sequence for each event is:
     /// 1. Compute transition (pure) → get new state and effects
     /// 2. Partition effects: persistable (UI effects) vs non-persistable
-    /// 3. Persist new state AND persistable effects to SQLite
-    /// 4. Execute non-persistable effects (they don't need tracking)
-    /// 5. Execute persistable effects, deleting each from DB after success
-    /// 6. Process result events from effects
+    /// 3. Atomically persist new state AND persistable effects to SQLite (single transaction)
+    /// 4. Update in-memory state (only after DB commit succeeds)
+    /// 5. Execute non-persistable effects (they don't need tracking)
+    /// 6. Execute persistable effects, deleting each from DB after success
+    /// 7. Process result events from effects
     ///
-    /// If we crash during step 5, on restart we'll have the new state already
+    /// If we crash during step 6, on restart we'll have the new state already
     /// persisted AND the pending effects in the database. The `recover_pending_effects`
     /// function replays any effects that weren't completed.
+    ///
+    /// # Memory/DB Consistency
+    ///
+    /// State and effects are persisted atomically in a single SQLite transaction
+    /// (step 3). Memory is only updated AFTER this transaction commits (step 4).
+    /// This ensures memory and DB never diverge: if the transaction fails, we
+    /// return an error and memory remains unchanged.
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic. This prevents concurrent events for the same PR
@@ -442,26 +513,35 @@ impl PersistentStateStore {
             // Step 1: Compute transition (pure, no I/O)
             let (new_state, effects) =
                 self.memory_store
-                    .compute_transition(pr_id, current_state, event);
-            current_state = new_state;
+                    .compute_transition(pr_id, current_state.clone(), event);
 
             // Step 2: Partition effects into persistable (UI) and non-persistable
             let (persistable_effects, non_persistable_effects): (Vec<_>, Vec<_>) =
                 effects.into_iter().partition(|e| e.should_persist());
 
-            // Step 3: Persist state AND persistable effects BEFORE executing.
-            // This ensures crash safety for UI effects (UpdateComment, UpdateCheckRun).
+            // Step 3: Atomically persist state AND persistable effects BEFORE executing.
+            // This ensures crash safety: either both are persisted, or neither is.
             //
-            // CRITICAL: If persist fails, we must NOT execute effects. This
-            // maintains restart safety - on restart, we'll be back to the old
-            // state with no side effects having occurred.
+            // CRITICAL: We persist to DB BEFORE updating memory. If the DB operation
+            // fails, we return early with an error and memory remains unchanged.
+            // This ensures memory and DB never diverge.
+            self.persist_state_and_effects(
+                pr_id,
+                &new_state,
+                ctx.installation_id,
+                &persistable_effects,
+            )
+            .await?;
+
+            // Step 4: Only update memory AFTER DB persistence succeeds.
+            // This ensures memory/DB consistency: if we crash after this point,
+            // both memory and DB have the new state.
+            current_state = new_state;
             self.memory_store
                 .set(pr_id.clone(), current_state.clone())
                 .await;
-            self.persist(pr_id, &current_state).await?;
-            self.persist_effects(pr_id, &persistable_effects).await?;
 
-            // Step 4: Execute non-persistable effects (FetchData, SubmitBatch, etc.)
+            // Step 5: Execute non-persistable effects (FetchData, SubmitBatch, etc.)
             // These don't need DB tracking - they're recovered via state-specific
             // mechanisms (e.g., recover_preparing_states for Preparing state).
             let non_persistable_result_events = self
@@ -469,7 +549,7 @@ impl PersistentStateStore {
                 .execute_effects(pr_id, non_persistable_effects, ctx)
                 .await;
 
-            // Step 5: Execute persistable effects with cleanup
+            // Step 6: Execute persistable effects with cleanup
             // Load the effect IDs we just inserted so we can delete them after execution
             let mut persistable_result_events = Vec::new();
             if !persistable_effects.is_empty() {
@@ -499,7 +579,7 @@ impl PersistentStateStore {
                 }
             }
 
-            // Step 6: Add result events to be processed
+            // Step 7: Add result events to be processed
             // (in reverse order so they're processed in order)
             for result_event in non_persistable_result_events.into_iter().rev() {
                 events_to_process.push(result_event);

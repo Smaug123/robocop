@@ -295,7 +295,18 @@ impl SqliteDb {
         installation_id: u64,
     ) -> Result<()> {
         let conn = self.conn.lock().expect("mutex poisoned");
+        Self::upsert_state_impl(&conn, pr_id, state, installation_id)
+    }
 
+    /// Internal implementation of upsert_state that takes an existing connection.
+    ///
+    /// This allows the function to be called within a transaction.
+    fn upsert_state_impl(
+        conn: &Connection,
+        pr_id: &StateMachinePrId,
+        state: &ReviewMachineState,
+        installation_id: u64,
+    ) -> Result<()> {
         // Extract fields from state
         let (state_type, reviews_enabled) = match state {
             ReviewMachineState::Idle { reviews_enabled } => ("Idle", *reviews_enabled),
@@ -523,6 +534,31 @@ impl SqliteDb {
             ],
         )
         .context("Failed to upsert PR state")?;
+
+        Ok(())
+    }
+
+    /// Atomically upsert state and insert pending effects in a single transaction.
+    ///
+    /// This ensures crash safety: either both state and effects are persisted,
+    /// or neither is. If the process crashes after state is persisted but before
+    /// effects, on restart the database will be in a consistent state (no state
+    /// change without corresponding effects).
+    pub fn upsert_state_and_effects(
+        &self,
+        pr_id: &StateMachinePrId,
+        state: &ReviewMachineState,
+        installation_id: u64,
+        effects: &[Effect],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+
+        let tx = conn.transaction().context("Failed to begin transaction")?;
+
+        Self::upsert_state_impl(&tx, pr_id, state, installation_id)?;
+        Self::insert_pending_effects_impl(&tx, pr_id, effects)?;
+
+        tx.commit().context("Failed to commit transaction")?;
 
         Ok(())
     }
@@ -1103,7 +1139,17 @@ impl SqliteDb {
         effects: &[Effect],
     ) -> Result<()> {
         let conn = self.conn.lock().expect("mutex poisoned");
+        Self::insert_pending_effects_impl(&conn, pr_id, effects)
+    }
 
+    /// Internal implementation of insert_pending_effects that takes an existing connection.
+    ///
+    /// This allows the function to be called within a transaction.
+    fn insert_pending_effects_impl(
+        conn: &Connection,
+        pr_id: &StateMachinePrId,
+        effects: &[Effect],
+    ) -> Result<()> {
         for effect in effects {
             let effect_json =
                 serde_json::to_string(effect).context("Failed to serialize effect")?;
