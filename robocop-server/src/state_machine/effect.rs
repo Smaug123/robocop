@@ -86,8 +86,15 @@ pub enum Effect {
 impl Effect {
     /// Returns true if this effect should be persisted for crash recovery.
     ///
-    /// Only UI effects (UpdateComment, UpdateCheckRun, CreateCheckRun) are persisted
-    /// because they are idempotent and critical for user experience.
+    /// Only idempotent UI effects are persisted:
+    /// - `UpdateComment`: Uses find-or-create semantics (idempotent)
+    /// - `UpdateCheckRun`: Updates existing check run by ID (idempotent)
+    ///
+    /// `CreateCheckRun` is NOT persisted because it calls GitHub's create API,
+    /// which is NOT idempotent - replaying it creates duplicate check runs.
+    /// If we crash after creating a check run but before the state transitions
+    /// to include the check_run_id, the orphaned check run is preferable to
+    /// duplicates (and can be cleaned up via GitHub's UI or future recovery logic).
     ///
     /// Event-producing effects (FetchData, SubmitBatch, CheckAncestry) are NOT
     /// persisted because replaying them after state transition could cause
@@ -99,9 +106,7 @@ impl Effect {
     pub fn should_persist(&self) -> bool {
         matches!(
             self,
-            Effect::UpdateComment { .. }
-                | Effect::UpdateCheckRun { .. }
-                | Effect::CreateCheckRun { .. }
+            Effect::UpdateComment { .. } | Effect::UpdateCheckRun { .. }
         )
     }
 }

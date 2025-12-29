@@ -516,11 +516,6 @@ impl PersistentStateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        // Store the installation_id for later use by batch polling
-        self.memory_store
-            .set_installation_id(pr_id, ctx.installation_id)
-            .await;
-
         let mut current_state = self.memory_store.get_or_default(pr_id).await;
 
         // Event loop: process initial event and any result events from effects
@@ -532,9 +527,13 @@ impl PersistentStateStore {
                 self.memory_store
                     .compute_transition(pr_id, current_state.clone(), event);
 
-            // Step 2: Partition effects into persistable (UI) and non-persistable
-            let (persistable_effects, non_persistable_effects): (Vec<_>, Vec<_>) =
-                effects.into_iter().partition(|e| e.should_persist());
+            // Step 2: Collect persistable effects (preserving original indices)
+            // We need these for DB persistence, but we'll execute ALL effects in original order.
+            let persistable_effects: Vec<Effect> = effects
+                .iter()
+                .filter(|e| e.should_persist())
+                .cloned()
+                .collect();
 
             // Step 3: Atomically persist state AND persistable effects BEFORE executing.
             // This ensures crash safety: either both are persisted, or neither is.
@@ -557,51 +556,67 @@ impl PersistentStateStore {
             self.memory_store
                 .set(pr_id.clone(), current_state.clone())
                 .await;
-
-            // Step 5: Execute non-persistable effects (FetchData, SubmitBatch, etc.)
-            // These don't need DB tracking - they're recovered via state-specific
-            // mechanisms (e.g., recover_preparing_states for Preparing state).
-            let non_persistable_result_events = self
-                .memory_store
-                .execute_effects(pr_id, non_persistable_effects, ctx)
+            // Also cache installation_id for later use by batch polling.
+            // This is set here (after persist) to maintain DB-first consistency.
+            self.memory_store
+                .set_installation_id(pr_id, ctx.installation_id)
                 .await;
 
-            // Step 6: Execute persistable effects with cleanup
-            // Load the effect IDs we just inserted so we can delete them after execution
-            let mut persistable_result_events = Vec::new();
-            if !persistable_effects.is_empty() {
+            // Step 5: Load effect IDs for persistable effects (for cleanup after execution)
+            // We'll use these IDs to clean up from DB after successful execution.
+            // The DB returns them in insertion order, matching our persistable_effects order.
+            let effect_ids: Vec<i64> = if !persistable_effects.is_empty() {
                 match self.load_pending_effects(pr_id).await {
-                    Ok(effect_records) => {
-                        // Execute each effect and delete from DB on success
-                        for (effect_id, effect) in effect_records {
-                            let events = self
-                                .execute_effect_with_cleanup(effect_id, effect, ctx)
-                                .await;
-                            persistable_result_events.extend(events);
-                        }
-                    }
+                    Ok(effect_records) => effect_records.into_iter().map(|(id, _)| id).collect(),
                     Err(e) => {
                         tracing::error!(
                             "Failed to load pending effects for PR #{}: {}",
                             pr_id.pr_number,
                             e
                         );
-                        // Fall back to executing without cleanup tracking
-                        let events = self
-                            .memory_store
-                            .execute_effects(pr_id, persistable_effects, ctx)
-                            .await;
-                        persistable_result_events.extend(events);
+                        // Continue without cleanup tracking
+                        Vec::new()
                     }
                 }
+            } else {
+                Vec::new()
+            };
+
+            // Step 6: Execute ALL effects in their original order.
+            // This preserves the transition's declared effect ordering, which may matter
+            // if effects have dependencies (e.g., create check run before submitting batch).
+            //
+            // For persistable effects, we track their position in persistable_effects
+            // to look up the corresponding DB ID for cleanup.
+            let mut result_events = Vec::new();
+            let mut persistable_idx = 0usize;
+            for effect in effects {
+                let is_persistable = effect.should_persist();
+                let events = if is_persistable && persistable_idx < effect_ids.len() {
+                    // Persistable effect: execute with cleanup (delete from DB on success)
+                    let effect_id = effect_ids[persistable_idx];
+                    persistable_idx += 1;
+                    self.execute_effect_with_cleanup(effect_id, effect, ctx)
+                        .await
+                } else {
+                    // Non-persistable effect (or cleanup tracking unavailable): just execute
+                    if is_persistable {
+                        persistable_idx += 1; // Still increment to keep index in sync
+                    }
+                    match execute_effect(ctx, effect).await {
+                        EffectResult::Ok(events) => events,
+                        EffectResult::Err(err) => {
+                            tracing::error!("Effect execution failed: {}", err);
+                            Vec::new()
+                        }
+                    }
+                };
+                result_events.extend(events);
             }
 
             // Step 7: Add result events to be processed
             // (in reverse order so they're processed in order)
-            for result_event in non_persistable_result_events.into_iter().rev() {
-                events_to_process.push(result_event);
-            }
-            for result_event in persistable_result_events.into_iter().rev() {
+            for result_event in result_events.into_iter().rev() {
                 events_to_process.push(result_event);
             }
         }
