@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::state_machine::effect::Effect;
 use crate::state_machine::state::{
     BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, FailureReason,
     ReviewMachineState, ReviewOptions, ReviewResult,
@@ -28,7 +29,7 @@ use crate::state_machine::store::StateMachinePrId;
 /// 1. Increment this constant
 /// 2. Add a migration function `migrate_v{N}_to_v{N+1}`
 /// 3. Call it from `run_migrations`
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Key for batch submission idempotency.
 ///
@@ -154,6 +155,11 @@ impl SqliteDb {
             Self::migrate_v0_to_v1(conn)?;
         }
 
+        // Migration v1 -> v2: Add pending_effects table for crash recovery
+        if from_version < 2 {
+            Self::migrate_v1_to_v2(conn)?;
+        }
+
         Ok(())
     }
 
@@ -251,6 +257,32 @@ impl SqliteDb {
             "#,
         )
         .context("Failed to create initial schema (v0 -> v1)")?;
+
+        Ok(())
+    }
+
+    /// Migration v1 -> v2: Add pending_effects table for crash recovery.
+    ///
+    /// This table stores UI effects (UpdateComment, UpdateCheckRun, CreateCheckRun)
+    /// that need to be replayed if the server crashes between persisting state
+    /// and executing effects.
+    fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_effects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_owner TEXT NOT NULL,
+                repo_name TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                effect_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pending_effects_pr
+            ON pending_effects(repo_owner, repo_name, pr_number);
+            "#,
+        )
+        .context("Failed to create pending_effects table (v1 -> v2)")?;
 
         Ok(())
     }
@@ -1014,6 +1046,162 @@ impl SqliteDb {
         .context("Failed to delete stale incomplete submissions")?;
 
         Ok(stale_keys)
+    }
+
+    /// Get a confirmed batch submission for a given key.
+    ///
+    /// Returns `Some(CachedBatchSubmission)` if a confirmed (status='submitted')
+    /// entry exists for this (repo_owner, repo_name, pr_number, head_sha, base_sha),
+    /// `None` otherwise.
+    ///
+    /// This is used for recovery: when a PR is stuck in `Preparing` state, we can
+    /// check if another instance already confirmed a batch submission.
+    pub fn get_confirmed_batch_submission(
+        &self,
+        key: &BatchSubmissionKey,
+    ) -> Result<Option<CachedBatchSubmission>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        conn.query_row(
+            "SELECT batch_id, comment_id, check_run_id, model, reasoning_effort \
+             FROM batch_submissions \
+             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 \
+               AND head_sha = ?4 AND base_sha = ?5 \
+               AND status = 'submitted'",
+            rusqlite::params![
+                &key.repo_owner,
+                &key.repo_name,
+                key.pr_number,
+                &key.head_sha,
+                &key.base_sha
+            ],
+            |row| {
+                Ok(CachedBatchSubmission {
+                    batch_id: row.get(0)?,
+                    comment_id: row.get(1)?,
+                    check_run_id: row.get(2)?,
+                    model: row.get(3)?,
+                    reasoning_effort: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query confirmed batch submission")
+    }
+
+    // =========================================================================
+    // Pending effects methods (for crash recovery)
+    // =========================================================================
+
+    /// Insert pending effects for a PR.
+    ///
+    /// These effects will be replayed on startup if the server crashes between
+    /// persisting state and executing effects.
+    pub fn insert_pending_effects(
+        &self,
+        pr_id: &StateMachinePrId,
+        effects: &[Effect],
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        for effect in effects {
+            let effect_json =
+                serde_json::to_string(effect).context("Failed to serialize effect")?;
+
+            conn.execute(
+                "INSERT INTO pending_effects (repo_owner, repo_name, pr_number, effect_json) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    &pr_id.repo_owner,
+                    &pr_id.repo_name,
+                    pr_id.pr_number,
+                    &effect_json,
+                ],
+            )
+            .context("Failed to insert pending effect")?;
+        }
+
+        Ok(())
+    }
+
+    /// Load pending effects for a PR.
+    ///
+    /// Returns a vector of (effect_id, Effect) tuples. The effect_id can be used
+    /// to delete individual effects after successful execution.
+    pub fn load_pending_effects(&self, pr_id: &StateMachinePrId) -> Result<Vec<(i64, Effect)>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        let mut stmt = conn.prepare(
+            "SELECT id, effect_json FROM pending_effects \
+             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 \
+             ORDER BY id ASC",
+        )?;
+
+        let rows = stmt.query_map(
+            rusqlite::params![&pr_id.repo_owner, &pr_id.repo_name, pr_id.pr_number],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((id, json))
+            },
+        )?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let (id, json) = row.context("Failed to read row")?;
+            let effect: Effect = serde_json::from_str(&json)
+                .with_context(|| format!("Failed to deserialize effect: {}", json))?;
+            results.push((id, effect));
+        }
+
+        Ok(results)
+    }
+
+    /// Delete a pending effect by ID.
+    ///
+    /// Called after an effect has been successfully executed.
+    pub fn delete_pending_effect(&self, effect_id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute("DELETE FROM pending_effects WHERE id = ?1", [effect_id])?;
+        Ok(())
+    }
+
+    /// Delete all pending effects for a PR.
+    ///
+    /// Can be used for bulk cleanup if needed.
+    pub fn delete_pending_effects_for_pr(&self, pr_id: &StateMachinePrId) -> Result<()> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute(
+            "DELETE FROM pending_effects \
+             WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3",
+            rusqlite::params![&pr_id.repo_owner, &pr_id.repo_name, pr_id.pr_number],
+        )?;
+        Ok(())
+    }
+
+    /// Load all PRs with pending effects.
+    ///
+    /// Used at startup to find PRs that need effect replay.
+    pub fn load_prs_with_pending_effects(&self) -> Result<Vec<StateMachinePrId>> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT repo_owner, repo_name, pr_number FROM pending_effects")?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(StateMachinePrId::new(
+                row.get::<_, String>(0)?.as_str(),
+                row.get::<_, String>(1)?.as_str(),
+                row.get(2)?,
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.context("Failed to read row")?);
+        }
+
+        Ok(results)
     }
 }
 

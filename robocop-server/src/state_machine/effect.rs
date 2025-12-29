@@ -7,9 +7,10 @@
 use super::state::{
     BatchId, CancellationReason, CheckRunId, CommitSha, FailureReason, ReviewOptions, ReviewResult,
 };
+use serde::{Deserialize, Serialize};
 
 /// All effects that can be produced by state transitions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
     // =========================================================================
     // GitHub Effects
@@ -82,8 +83,31 @@ pub enum Effect {
     Log { level: LogLevel, message: String },
 }
 
+impl Effect {
+    /// Returns true if this effect should be persisted for crash recovery.
+    ///
+    /// Only UI effects (UpdateComment, UpdateCheckRun, CreateCheckRun) are persisted
+    /// because they are idempotent and critical for user experience.
+    ///
+    /// Event-producing effects (FetchData, SubmitBatch, CheckAncestry) are NOT
+    /// persisted because replaying them after state transition could cause
+    /// incorrect behavior. Instead, they are recovered via state-specific
+    /// mechanisms (e.g., `recover_preparing_states` for Preparing state).
+    ///
+    /// Cleanup effects (CancelBatch, ClearBatchSubmission, Log) are best-effort
+    /// and don't need persistence.
+    pub fn should_persist(&self) -> bool {
+        matches!(
+            self,
+            Effect::UpdateComment { .. }
+                | Effect::UpdateCheckRun { .. }
+                | Effect::CreateCheckRun { .. }
+        )
+    }
+}
+
 /// Content for the robocop comment on a PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommentContent {
     /// Review is in progress.
     InProgress {
@@ -138,7 +162,7 @@ pub enum CommentContent {
 
 /// Check run status for effects.
 /// Mirrors the GitHub API but is our own type for independence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectCheckRunStatus {
     Queued,
     InProgress,
@@ -158,7 +182,7 @@ impl EffectCheckRunStatus {
 
 /// Check run conclusion for effects.
 /// Mirrors the GitHub API but is our own type for independence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectCheckRunConclusion {
     Success,
     Failure,
@@ -183,7 +207,7 @@ impl EffectCheckRunConclusion {
 }
 
 /// Log level for logging effects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
     Debug,
     Info,

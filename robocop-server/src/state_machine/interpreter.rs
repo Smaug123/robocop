@@ -84,7 +84,10 @@ pub async fn execute_effects(ctx: &InterpreterContext, effects: Vec<Effect>) -> 
 }
 
 /// Execute a single effect.
-async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResult {
+///
+/// This function is public to allow `PersistentStateStore::execute_effect_with_cleanup`
+/// to execute individual effects and clean up from the pending_effects table after success.
+pub async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResult {
     match effect {
         Effect::FetchData { head_sha, base_sha } => {
             execute_fetch_data(ctx, &head_sha, &base_sha).await
@@ -782,10 +785,13 @@ async fn execute_submit_batch(
             // transition to Failed state or post failure UI.
             //
             // By returning no events, the state machine stays in its current
-            // state (Preparing). The other instance will complete the submission,
-            // and the batch will be picked up by:
-            // - The next webhook for this PR (which will see AlreadySubmitted), or
-            // - Polling once the batch enters BatchPending state.
+            // state (Preparing). Recovery happens via:
+            // - `recover_preparing_states()` runs every 30 seconds, checks if a
+            //   batch was confirmed by another instance, and emits BatchSubmitted
+            // - A new webhook for this PR (which will see AlreadySubmitted)
+            //
+            // Note: Polling does NOT help this instance because `Preparing` state
+            // has no `pending_batch_id()`, so it's not included in pending batches.
             //
             // If the other instance crashes before confirming, the staleness
             // threshold (10 minutes) will eventually allow re-submission.

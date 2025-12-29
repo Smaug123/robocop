@@ -60,8 +60,9 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
 use crate::db::SqliteDb;
+use crate::state_machine::effect::Effect;
 use crate::state_machine::event::Event;
-use crate::state_machine::interpreter::InterpreterContext;
+use crate::state_machine::interpreter::{execute_effect, EffectResult, InterpreterContext};
 use crate::state_machine::state::{BatchId, ReviewMachineState};
 use crate::state_machine::store::{PreparingPrInfo, StateMachinePrId, StateStore};
 
@@ -205,6 +206,90 @@ impl PersistentStateStore {
             .context("Failed to delete state from database")
     }
 
+    /// Persist effects to the database for crash recovery.
+    ///
+    /// Effects are persisted alongside state so they can be replayed if the
+    /// server crashes between persisting state and executing effects.
+    async fn persist_effects(&self, pr_id: &StateMachinePrId, effects: &[Effect]) -> Result<()> {
+        if effects.is_empty() {
+            return Ok(());
+        }
+
+        let db = self.db.clone();
+        let pr_id = pr_id.clone();
+        let effects = effects.to_vec();
+
+        tokio::task::spawn_blocking(move || db.insert_pending_effects(&pr_id, &effects))
+            .await
+            .context("spawn_blocking panicked while persisting effects")?
+            .context("Failed to persist effects to database")
+    }
+
+    /// Delete a pending effect from the database after successful execution.
+    async fn delete_pending_effect(&self, effect_id: i64) -> Result<()> {
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || db.delete_pending_effect(effect_id))
+            .await
+            .context("spawn_blocking panicked while deleting effect")?
+            .context("Failed to delete pending effect from database")
+    }
+
+    /// Load pending effects for a PR from the database.
+    ///
+    /// Returns (effect_id, effect) tuples that can be used for cleanup after execution.
+    pub async fn load_pending_effects(
+        &self,
+        pr_id: &StateMachinePrId,
+    ) -> Result<Vec<(i64, Effect)>> {
+        let db = self.db.clone();
+        let pr_id = pr_id.clone();
+
+        tokio::task::spawn_blocking(move || db.load_pending_effects(&pr_id))
+            .await
+            .context("spawn_blocking panicked while loading effects")?
+            .context("Failed to load pending effects from database")
+    }
+
+    /// Load all PRs with pending effects.
+    ///
+    /// Used at startup to find PRs that need effect replay.
+    pub async fn load_prs_with_pending_effects(&self) -> Result<Vec<StateMachinePrId>> {
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || db.load_prs_with_pending_effects())
+            .await
+            .context("spawn_blocking panicked while loading PRs with effects")?
+            .context("Failed to load PRs with pending effects")
+    }
+
+    /// Execute a single effect and clean up from DB on success.
+    ///
+    /// Returns any result events from the effect.
+    async fn execute_effect_with_cleanup(
+        &self,
+        effect_id: i64,
+        effect: Effect,
+        ctx: &InterpreterContext,
+    ) -> Vec<Event> {
+        let result = execute_effect(ctx, effect).await;
+
+        match result {
+            EffectResult::Ok(events) => {
+                // Delete the effect from DB after successful execution
+                if let Err(e) = self.delete_pending_effect(effect_id).await {
+                    tracing::error!("Failed to delete executed effect {}: {}", effect_id, e);
+                }
+                events
+            }
+            EffectResult::Err(err) => {
+                // Don't delete - will be retried on restart
+                tracing::error!("Effect execution failed: {}", err);
+                Vec::new()
+            }
+        }
+    }
+
     // =========================================================================
     // Delegated methods from StateStore
     // =========================================================================
@@ -316,13 +401,15 @@ impl PersistentStateStore {
     /// This method persists state to the database BEFORE executing effects,
     /// providing crash safety. The sequence for each event is:
     /// 1. Compute transition (pure) → get new state and effects
-    /// 2. Persist new state to memory and SQLite
-    /// 3. Execute effects (may call external APIs)
-    /// 4. Process result events from effects
+    /// 2. Partition effects: persistable (UI effects) vs non-persistable
+    /// 3. Persist new state AND persistable effects to SQLite
+    /// 4. Execute non-persistable effects (they don't need tracking)
+    /// 5. Execute persistable effects, deleting each from DB after success
+    /// 6. Process result events from effects
     ///
-    /// If we crash during step 3, on restart we'll have the new state already
-    /// persisted. Effects are designed to be idempotent (via the two-phase
-    /// commit in `execute_submit_batch`), so re-executing them is safe.
+    /// If we crash during step 5, on restart we'll have the new state already
+    /// persisted AND the pending effects in the database. The `recover_pending_effects`
+    /// function replays any effects that weren't completed.
     ///
     /// This method holds a per-PR lock to ensure the memory mutation and DB
     /// persistence are atomic. This prevents concurrent events for the same PR
@@ -358,10 +445,12 @@ impl PersistentStateStore {
                     .compute_transition(pr_id, current_state, event);
             current_state = new_state;
 
-            // Step 2: Persist BEFORE executing effects.
-            // This ensures that if we crash during effect execution, the new
-            // state is already saved. Effects are idempotent, so re-executing
-            // them on restart is safe.
+            // Step 2: Partition effects into persistable (UI) and non-persistable
+            let (persistable_effects, non_persistable_effects): (Vec<_>, Vec<_>) =
+                effects.into_iter().partition(|e| e.should_persist());
+
+            // Step 3: Persist state AND persistable effects BEFORE executing.
+            // This ensures crash safety for UI effects (UpdateComment, UpdateCheckRun).
             //
             // CRITICAL: If persist fails, we must NOT execute effects. This
             // maintains restart safety - on restart, we'll be back to the old
@@ -370,13 +459,52 @@ impl PersistentStateStore {
                 .set(pr_id.clone(), current_state.clone())
                 .await;
             self.persist(pr_id, &current_state).await?;
+            self.persist_effects(pr_id, &persistable_effects).await?;
 
-            // Step 3: Execute effects (may call external APIs like OpenAI)
-            let result_events = self.memory_store.execute_effects(pr_id, effects, ctx).await;
+            // Step 4: Execute non-persistable effects (FetchData, SubmitBatch, etc.)
+            // These don't need DB tracking - they're recovered via state-specific
+            // mechanisms (e.g., recover_preparing_states for Preparing state).
+            let non_persistable_result_events = self
+                .memory_store
+                .execute_effects(pr_id, non_persistable_effects, ctx)
+                .await;
 
-            // Step 4: Add result events to be processed
+            // Step 5: Execute persistable effects with cleanup
+            // Load the effect IDs we just inserted so we can delete them after execution
+            let mut persistable_result_events = Vec::new();
+            if !persistable_effects.is_empty() {
+                match self.load_pending_effects(pr_id).await {
+                    Ok(effect_records) => {
+                        // Execute each effect and delete from DB on success
+                        for (effect_id, effect) in effect_records {
+                            let events = self
+                                .execute_effect_with_cleanup(effect_id, effect, ctx)
+                                .await;
+                            persistable_result_events.extend(events);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to load pending effects for PR #{}: {}",
+                            pr_id.pr_number,
+                            e
+                        );
+                        // Fall back to executing without cleanup tracking
+                        let events = self
+                            .memory_store
+                            .execute_effects(pr_id, persistable_effects, ctx)
+                            .await;
+                        persistable_result_events.extend(events);
+                    }
+                }
+            }
+
+            // Step 6: Add result events to be processed
             // (in reverse order so they're processed in order)
-            for result_event in result_events.into_iter().rev() {
+            for result_event in non_persistable_result_events.into_iter().rev() {
+                events_to_process.push(result_event);
+            }
+            for result_event in persistable_result_events.into_iter().rev() {
                 events_to_process.push(result_event);
             }
         }

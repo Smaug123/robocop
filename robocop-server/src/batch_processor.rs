@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use crate::db::BatchSubmissionKey;
+use crate::state_machine::interpreter::execute_effect;
 use crate::state_machine::{
-    batch_completed_event, batch_status_update_event, batch_terminated_event, BatchStatus,
-    FailureReason, InterpreterContext, ReviewResult,
+    batch_completed_event, batch_status_update_event, batch_terminated_event, BatchId, BatchStatus,
+    CheckRunId, CommentId, FailureReason, InterpreterContext, ReviewResult,
 };
 use crate::AppState;
 
@@ -16,9 +18,12 @@ use crate::AppState;
 ///    events when batch status changes
 /// 2. Cleans up stale batch submission reservations to prevent stuck PRs
 ///    when another instance crashes mid-submission
+/// 3. Recovers PRs stuck in Preparing state (checks for confirmed batches
+///    or re-drives FetchData)
 pub async fn batch_polling_loop(state: Arc<AppState>) {
     let mut batch_poll_interval = interval(Duration::from_secs(60)); // Poll every minute
     let mut cleanup_interval = interval(Duration::from_secs(300)); // Cleanup every 5 minutes
+    let mut recovery_interval = interval(Duration::from_secs(30)); // Recover preparing every 30s
 
     loop {
         tokio::select! {
@@ -29,6 +34,11 @@ pub async fn batch_polling_loop(state: Arc<AppState>) {
             }
             _ = cleanup_interval.tick() => {
                 cleanup_stale_submissions(&state).await;
+            }
+            _ = recovery_interval.tick() => {
+                // Periodically check for PRs stuck in Preparing that may have
+                // confirmed batches from another instance
+                recover_preparing_states(&state).await;
             }
         }
     }
@@ -287,14 +297,19 @@ struct ResponsesApiContent {
 
 /// Recover PRs stuck in `Preparing` state.
 ///
-/// Called during startup to re-drive `FetchData` for any PRs that were in the
-/// `Preparing` state when the server crashed. Without this, these PRs would
+/// Called during startup and periodically to recover any PRs that were in the
+/// `Preparing` state when the server crashed, or that are stuck due to
+/// `InProgressByOtherInstance` handling. Without this, these PRs would
 /// remain stuck indefinitely because:
 /// - The webhook was already acknowledged before background processing started
 /// - The polling loop only handles pending batches, not `Preparing` states
+/// - When `InProgressByOtherInstance` is returned, no state transition occurs
 ///
-/// This function sends a `ReviewRequested` event for each stuck PR, which
-/// triggers the state machine to re-run `FetchData`.
+/// For each stuck PR, this function:
+/// 1. First checks if a batch was already confirmed by another instance
+///    - If so, emits a `BatchSubmitted` event to transition to `BatchPending`
+/// 2. If no confirmed batch exists, sends a `ReviewRequested` event to
+///    re-trigger `FetchData`
 pub async fn recover_preparing_states(state: &Arc<AppState>) {
     let preparing_prs = state.state_store.get_preparing_pr_ids().await;
 
@@ -308,27 +323,205 @@ pub async fn recover_preparing_states(state: &Arc<AppState>) {
     );
 
     for pr_info in preparing_prs {
-        info!(
-            "Recovering PR #{} ({}/{}) at commit {}",
-            pr_info.pr_id.pr_number,
-            pr_info.pr_id.repo_owner,
-            pr_info.pr_id.repo_name,
-            pr_info.head_sha.short()
-        );
-
-        // Send a ReviewRequested event to re-trigger FetchData
-        let event = crate::state_machine::Event::ReviewRequested {
-            head_sha: pr_info.head_sha.clone(),
-            base_sha: pr_info.base_sha.clone(),
-            options: pr_info.options.clone(),
+        // First, check if a batch was already confirmed by another instance
+        let key = BatchSubmissionKey {
+            repo_owner: pr_info.pr_id.repo_owner.clone(),
+            repo_name: pr_info.pr_id.repo_name.clone(),
+            pr_number: pr_info.pr_id.pr_number,
+            head_sha: pr_info.head_sha.0.clone(),
+            base_sha: pr_info.base_sha.0.clone(),
         };
 
-        if let Err(e) =
-            create_and_process_event(state, &pr_info.pr_id, event, pr_info.installation_id).await
+        let db = state.state_store.db();
+        let confirmed = match tokio::task::spawn_blocking({
+            let db = db.clone();
+            let key = key.clone();
+            move || db.get_confirmed_batch_submission(&key)
+        })
+        .await
         {
-            error!("Failed to recover PR #{}: {}", pr_info.pr_id.pr_number, e);
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                warn!(
+                    "Failed to check confirmed batch for PR #{}: {}",
+                    pr_info.pr_id.pr_number, e
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "spawn_blocking panicked checking confirmed batch for PR #{}: {}",
+                    pr_info.pr_id.pr_number, e
+                );
+                None
+            }
+        };
+
+        if let Some(cached) = confirmed {
+            // Batch was already confirmed by another instance!
+            // Emit BatchSubmitted event to transition to BatchPending
+            info!(
+                "Found confirmed batch {} for PR #{} at commit {} - emitting BatchSubmitted event",
+                cached.batch_id,
+                pr_info.pr_id.pr_number,
+                pr_info.head_sha.short()
+            );
+
+            let event = crate::state_machine::Event::BatchSubmitted {
+                batch_id: BatchId(cached.batch_id),
+                comment_id: cached.comment_id.map(CommentId),
+                check_run_id: cached.check_run_id.map(CheckRunId),
+                model: cached.model.unwrap_or_else(|| "o3".to_string()),
+                reasoning_effort: cached
+                    .reasoning_effort
+                    .unwrap_or_else(|| "high".to_string()),
+            };
+
+            if let Err(e) =
+                create_and_process_event(state, &pr_info.pr_id, event, pr_info.installation_id)
+                    .await
+            {
+                error!(
+                    "Failed to emit BatchSubmitted for PR #{}: {}",
+                    pr_info.pr_id.pr_number, e
+                );
+            }
+        } else {
+            // No confirmed batch found - re-drive FetchData as before
+            info!(
+                "Recovering PR #{} ({}/{}) at commit {} - no confirmed batch, re-driving FetchData",
+                pr_info.pr_id.pr_number,
+                pr_info.pr_id.repo_owner,
+                pr_info.pr_id.repo_name,
+                pr_info.head_sha.short()
+            );
+
+            // Send a ReviewRequested event to re-trigger FetchData
+            let event = crate::state_machine::Event::ReviewRequested {
+                head_sha: pr_info.head_sha.clone(),
+                base_sha: pr_info.base_sha.clone(),
+                options: pr_info.options.clone(),
+            };
+
+            if let Err(e) =
+                create_and_process_event(state, &pr_info.pr_id, event, pr_info.installation_id)
+                    .await
+            {
+                error!("Failed to recover PR #{}: {}", pr_info.pr_id.pr_number, e);
+            }
         }
     }
+}
+
+/// Replay any pending effects from crash recovery.
+///
+/// Called during startup to execute effects that were persisted but not
+/// completed before a crash. These are typically UI effects (UpdateComment,
+/// UpdateCheckRun, CreateCheckRun) that need to be replayed so the user sees
+/// the correct state in GitHub.
+///
+/// This function:
+/// 1. Loads all PRs with pending effects
+/// 2. For each PR, loads and executes the pending effects
+/// 3. Deletes each effect from the DB after successful execution
+pub async fn recover_pending_effects(state: &Arc<AppState>) {
+    // Load all PRs with pending effects
+    let prs_with_effects = match state.state_store.load_prs_with_pending_effects().await {
+        Ok(prs) => prs,
+        Err(e) => {
+            error!("Failed to load PRs with pending effects: {}", e);
+            return;
+        }
+    };
+
+    if prs_with_effects.is_empty() {
+        return;
+    }
+
+    info!(
+        "Recovering pending effects for {} PRs",
+        prs_with_effects.len()
+    );
+
+    for pr_id in prs_with_effects {
+        if let Err(e) = recover_effects_for_pr(state, &pr_id).await {
+            error!(
+                "Failed to recover effects for PR #{}: {}",
+                pr_id.pr_number, e
+            );
+        }
+    }
+}
+
+/// Helper to recover pending effects for a single PR.
+async fn recover_effects_for_pr(
+    state: &Arc<AppState>,
+    pr_id: &crate::state_machine::StateMachinePrId,
+) -> Result<()> {
+    let pending_effects = state.state_store.load_pending_effects(pr_id).await?;
+
+    if pending_effects.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "Replaying {} pending effects for PR #{}",
+        pending_effects.len(),
+        pr_id.pr_number
+    );
+
+    // Get installation_id from state store
+    let installation_id = state
+        .state_store
+        .get_installation_id(pr_id)
+        .await
+        .unwrap_or(0);
+
+    let pr_url = format!(
+        "https://github.com/{}/{}/pull/{}",
+        pr_id.repo_owner, pr_id.repo_name, pr_id.pr_number
+    );
+
+    let ctx = InterpreterContext {
+        github_client: state.github_client.clone(),
+        openai_client: state.openai_client.clone(),
+        db: state.state_store.db(),
+        installation_id,
+        repo_owner: pr_id.repo_owner.clone(),
+        repo_name: pr_id.repo_name.clone(),
+        pr_number: pr_id.pr_number,
+        pr_url: Some(pr_url),
+        branch_name: None,
+        correlation_id: None,
+    };
+
+    let db = state.state_store.db();
+
+    for (effect_id, effect) in pending_effects {
+        info!("Replaying effect {:?} for PR #{}", effect, pr_id.pr_number);
+
+        let result = execute_effect(&ctx, effect).await;
+
+        match result {
+            crate::state_machine::interpreter::EffectResult::Ok(_) => {
+                // Delete after successful execution
+                let db = db.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || db.delete_pending_effect(effect_id))
+                        .await
+                        .context("spawn_blocking panicked")?
+                {
+                    error!("Failed to delete effect {}: {}", effect_id, e);
+                }
+            }
+            crate::state_machine::interpreter::EffectResult::Err(err) => {
+                // Log but continue with other effects
+                error!("Failed to replay effect: {}", err);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
