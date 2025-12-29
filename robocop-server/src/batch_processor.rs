@@ -46,14 +46,14 @@ pub async fn batch_polling_loop(state: Arc<AppState>) {
 
 /// Clean up stale batch submission reservations and re-trigger stuck PRs.
 ///
-/// This handles the case where another instance reserved a slot (status='submitting')
-/// but crashed before confirming. Without cleanup, PRs deferred via
-/// `InProgressByOtherInstance` would be stuck.
+/// This handles the case where the server crashed mid-submission, leaving a
+/// 'submitting' row in the database. While `reserve_batch_submission` will
+/// replace such rows on the next attempt, this periodic cleanup provides:
+/// - Logging/monitoring of crashed submissions
+/// - Explicit cleanup of stale reservations
 ///
 /// After cleaning up stale reservations, we call `recover_preparing_states` to
-/// re-trigger any PRs that are stuck in `Preparing` state. This ensures the
-/// state machine gets another chance to submit the batch now that the stale
-/// reservation is gone.
+/// re-trigger any PRs that are stuck in `Preparing` state.
 async fn cleanup_stale_submissions(state: &Arc<AppState>) {
     let db = state.state_store.db();
     let had_stale_submissions = match tokio::task::spawn_blocking(move || {
@@ -298,15 +298,14 @@ struct ResponsesApiContent {
 /// Recover PRs stuck in `Preparing` state.
 ///
 /// Called during startup and periodically to recover any PRs that were in the
-/// `Preparing` state when the server crashed, or that are stuck due to
-/// `InProgressByOtherInstance` handling. Without this, these PRs would
+/// `Preparing` state when the server crashed. Without this, these PRs would
 /// remain stuck indefinitely because:
 /// - The webhook was already acknowledged before background processing started
 /// - The polling loop only handles pending batches, not `Preparing` states
-/// - When `InProgressByOtherInstance` is returned, no state transition occurs
 ///
 /// For each stuck PR, this function:
-/// 1. First checks if a batch was already confirmed by another instance
+/// 1. First checks if a batch was already confirmed (crash after OpenAI call
+///    but before state transition)
 ///    - If so, emits a `BatchSubmitted` event to transition to `BatchPending`
 /// 2. If no confirmed batch exists, sends a `ReviewRequested` event to
 ///    re-trigger `FetchData`

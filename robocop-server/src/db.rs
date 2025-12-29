@@ -53,9 +53,6 @@ pub enum ReservationResult {
     Reserved,
     /// Batch was already submitted - use cached data.
     AlreadySubmitted(CachedBatchSubmission),
-    /// Another instance is currently submitting - caller should skip.
-    /// This prevents duplicate submissions when multiple instances share a DB.
-    InProgressByOtherInstance,
 }
 
 /// Cached batch submission data returned when a batch was already submitted.
@@ -548,17 +545,19 @@ impl SqliteDb {
     ///
     /// **Pending effects behavior**:
     /// - If `effects` is non-empty: clears existing pending effects and inserts the new ones.
-    ///   This ensures only effects from the current transition exist. Old effects are
-    ///   considered stale because the state has moved forward.
-    /// - If `effects` is empty: leaves existing pending effects untouched. This preserves
-    ///   failed effects for retry when a no-op event (e.g., BatchStatusUpdate with no
-    ///   state change) triggers this method.
+    ///   This ensures only effects from the current transition exist.
+    /// - If `effects` is empty AND `state_changed` is true: clears existing pending effects.
+    ///   Old effects are stale because the state has moved forward.
+    /// - If `effects` is empty AND `state_changed` is false: leaves existing pending effects
+    ///   untouched. This preserves failed effects for retry when a no-op event (e.g.,
+    ///   BatchStatusUpdate with no state change) triggers this method.
     pub fn upsert_state_and_effects(
         &self,
         pr_id: &StateMachinePrId,
         state: &ReviewMachineState,
         installation_id: u64,
         effects: &[Effect],
+        state_changed: bool,
     ) -> Result<()> {
         let mut conn = self.conn.lock().expect("mutex poisoned");
 
@@ -566,14 +565,21 @@ impl SqliteDb {
 
         Self::upsert_state_impl(&tx, pr_id, state, installation_id)?;
 
-        // Only clear and replace pending effects when new effects are provided.
-        // If effects is empty, preserve existing pending effects for retry.
-        // This prevents no-op events from wiping out failed effects that should
-        // be retried on restart.
+        // Clear and replace pending effects when:
+        // 1. New effects are provided (they replace old effects), OR
+        // 2. State changed but no new effects (old effects are stale)
+        //
+        // Preserve existing pending effects ONLY when this is a true no-op
+        // (state unchanged and no new effects), e.g., for BatchStatusUpdate
+        // polling events that don't change state.
         if !effects.is_empty() {
             Self::delete_pending_effects_impl(&tx, pr_id)?;
             Self::insert_pending_effects_impl(&tx, pr_id, effects)?;
+        } else if state_changed {
+            // State changed but no new persistable effects - clear stale effects
+            Self::delete_pending_effects_impl(&tx, pr_id)?;
         }
+        // else: true no-op, preserve existing effects for retry
 
         tx.commit().context("Failed to commit transaction")?;
 
@@ -753,23 +759,17 @@ impl SqliteDb {
     /// Returns:
     /// - `Ok(ReservationResult::Reserved)` if slot was reserved (caller should submit to OpenAI)
     /// - `Ok(ReservationResult::AlreadySubmitted(..))` if already submitted (caller should skip)
-    /// - `Ok(ReservationResult::InProgressByOtherInstance)` if another instance is submitting
     ///
     /// The `requested_model` and `requested_reasoning_effort` parameters are used to
     /// validate that the cached batch (if any) matches the requested options. If the
     /// cached batch used different options, the cache is invalidated and a new
     /// submission is allowed.
     ///
-    /// # Multi-instance safety
+    /// # Single-instance design
     ///
-    /// This method uses `INSERT ... ON CONFLICT DO NOTHING` to avoid races when
-    /// multiple server instances share the same database.
-    ///
-    /// If a row exists with `status = 'submitting'`:
-    /// - If it's older than the staleness threshold (10 minutes), we assume it's from
-    ///   a crashed instance and delete it, then reserve fresh.
-    /// - If it's fresh, we return `InProgressByOtherInstance` to avoid creating
-    ///   duplicate batches.
+    /// This function assumes single-instance operation. If a row exists with
+    /// `status = 'submitting'`, it's treated as stale from a crashed previous attempt
+    /// and replaced with a fresh reservation.
     pub fn reserve_batch_submission(
         &self,
         key: &BatchSubmissionKey,
@@ -777,9 +777,6 @@ impl SqliteDb {
         requested_reasoning_effort: &str,
     ) -> Result<ReservationResult> {
         let conn = self.conn.lock().expect("mutex poisoned");
-
-        // Staleness threshold: 10 minutes
-        const STALENESS_THRESHOLD_SECONDS: i64 = 600;
 
         // Intermediate struct for query result
         struct BatchRow {
@@ -789,13 +786,12 @@ impl SqliteDb {
             check_run_id: Option<u64>,
             model: Option<String>,
             reasoning_effort: Option<String>,
-            created_at: String,
         }
 
         // Helper to fetch existing row
         let fetch_existing = |conn: &Connection| -> Result<Option<BatchRow>> {
             conn.query_row(
-                "SELECT status, batch_id, comment_id, check_run_id, model, reasoning_effort, created_at \
+                "SELECT status, batch_id, comment_id, check_run_id, model, reasoning_effort \
                  FROM batch_submissions \
                  WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3 AND head_sha = ?4 AND base_sha = ?5",
                 rusqlite::params![
@@ -813,7 +809,6 @@ impl SqliteDb {
                         check_run_id: row.get(3)?,
                         model: row.get(4)?,
                         reasoning_effort: row.get(5)?,
-                        created_at: row.get(6)?,
                     })
                 },
             )
@@ -821,26 +816,11 @@ impl SqliteDb {
             .context("Failed to query batch_submissions")
         };
 
-        // Helper to check if a timestamp is stale
-        let is_stale = |created_at: &str| -> bool {
-            // Parse the SQLite datetime format and compare to now
-            // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
-            conn.query_row(
-                "SELECT (julianday('now') - julianday(?1)) * 86400 > ?2",
-                rusqlite::params![created_at, STALENESS_THRESHOLD_SECONDS],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap_or(true) // If parsing fails, assume stale to allow retry
-        };
-
-        // Try to atomically insert a reservation. This handles the race condition:
-        // if two instances try to reserve simultaneously, one will succeed and the
-        // other will see rows_affected=0 and fetch the existing row.
-        let rows_affected = conn
-            .execute(
-                "INSERT INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'submitting') \
-                 ON CONFLICT (repo_owner, repo_name, pr_number, head_sha, base_sha) DO NOTHING",
+        // Helper to insert or replace a reservation
+        let insert_reservation = |conn: &Connection| -> Result<()> {
+            conn.execute(
+                "INSERT OR REPLACE INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
                 rusqlite::params![
                     &key.repo_owner,
                     &key.repo_name,
@@ -850,107 +830,64 @@ impl SqliteDb {
                 ],
             )
             .context("Failed to reserve batch submission")?;
+            Ok(())
+        };
 
-        if rows_affected > 0 {
-            // Successfully inserted - no existing row, proceed with submission
-            return Ok(ReservationResult::Reserved);
-        }
+        // Check for existing row
+        let existing = fetch_existing(&conn)?;
 
-        // Row already exists - fetch it to check status and options
-        let existing = fetch_existing(&conn)?.ok_or_else(|| {
-            anyhow!("Row disappeared after conflict - possible concurrent delete")
-        })?;
+        match existing {
+            None => {
+                // No existing row - insert reservation
+                insert_reservation(&conn)?;
+                Ok(ReservationResult::Reserved)
+            }
+            Some(row) => match row.status.as_str() {
+                "submitted" => {
+                    // Check if batch_id is present (should always be for 'submitted')
+                    let batch_id = match row.batch_id {
+                        Some(bid) => bid,
+                        None => {
+                            // Corrupted state: submitted without batch_id. Invalidate.
+                            insert_reservation(&conn)?;
+                            return Ok(ReservationResult::Reserved);
+                        }
+                    };
 
-        match existing.status.as_str() {
-            "submitted" => {
-                // Check if batch_id is present (should always be for 'submitted')
-                let batch_id = match existing.batch_id {
-                    Some(bid) => bid,
-                    None => {
-                        // Corrupted state: submitted without batch_id. Invalidate.
-                        // Use INSERT OR REPLACE for atomicity in multi-instance scenarios.
-                        conn.execute(
-                            "INSERT OR REPLACE INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
-                            rusqlite::params![
-                                &key.repo_owner,
-                                &key.repo_name,
-                                key.pr_number,
-                                &key.head_sha,
-                                &key.base_sha
-                            ],
-                        )
-                        .context("Failed to reserve batch submission after corruption")?;
+                    // Check if the cached batch used the same options as requested.
+                    // If options differ, the user is requesting a re-review with different
+                    // settings, so we should invalidate the cache and allow a new submission.
+                    let options_match = row.model.as_deref() == Some(requested_model)
+                        && row.reasoning_effort.as_deref() == Some(requested_reasoning_effort);
+
+                    if !options_match {
+                        // Options mismatch: invalidate cache and allow new submission.
+                        // Note: this creates an orphaned batch in OpenAI (the old one),
+                        // but it will expire after 24h.
+                        insert_reservation(&conn)?;
                         return Ok(ReservationResult::Reserved);
                     }
-                };
 
-                // Check if the cached batch used the same options as requested.
-                // If options differ, the user is requesting a re-review with different
-                // settings, so we should invalidate the cache and allow a new submission.
-                let options_match = existing.model.as_deref() == Some(requested_model)
-                    && existing.reasoning_effort.as_deref() == Some(requested_reasoning_effort);
-
-                if !options_match {
-                    // Options mismatch: invalidate cache and allow new submission.
-                    // Note: this creates an orphaned batch in OpenAI (the old one),
-                    // but it will expire after 24h.
-                    // Use INSERT OR REPLACE for atomicity in multi-instance scenarios.
-                    conn.execute(
-                        "INSERT OR REPLACE INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
-                        rusqlite::params![
-                            &key.repo_owner,
-                            &key.repo_name,
-                            key.pr_number,
-                            &key.head_sha,
-                            &key.base_sha
-                        ],
-                    )
-                    .context("Failed to reserve batch submission after options mismatch")?;
-                    return Ok(ReservationResult::Reserved);
+                    // Options match - return cached data
+                    Ok(ReservationResult::AlreadySubmitted(CachedBatchSubmission {
+                        batch_id,
+                        comment_id: row.comment_id,
+                        check_run_id: row.check_run_id,
+                        model: row.model,
+                        reasoning_effort: row.reasoning_effort,
+                    }))
                 }
-
-                // Options match - return cached data
-                Ok(ReservationResult::AlreadySubmitted(CachedBatchSubmission {
-                    batch_id,
-                    comment_id: existing.comment_id,
-                    check_run_id: existing.check_run_id,
-                    model: existing.model,
-                    reasoning_effort: existing.reasoning_effort,
-                }))
-            }
-            "submitting" => {
-                // Check if this is a stale reservation from a crashed instance
-                if is_stale(&existing.created_at) {
-                    // Stale reservation - replace with fresh reservation.
-                    // This may create a duplicate batch in OpenAI if the original instance
-                    // is actually still running (unlikely after 10 minutes), but the old
-                    // batch will expire after 24h.
-                    // Use INSERT OR REPLACE for atomicity in multi-instance scenarios.
-                    conn.execute(
-                        "INSERT OR REPLACE INTO batch_submissions (repo_owner, repo_name, pr_number, head_sha, base_sha, status) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'submitting')",
-                        rusqlite::params![
-                            &key.repo_owner,
-                            &key.repo_name,
-                            key.pr_number,
-                            &key.head_sha,
-                            &key.base_sha
-                        ],
-                    )
-                    .context("Failed to reserve batch submission after stale cleanup")?;
+                "submitting" => {
+                    // Stale reservation from a crashed previous attempt. Replace it.
+                    // Single-instance design means this is always safe.
+                    insert_reservation(&conn)?;
                     Ok(ReservationResult::Reserved)
-                } else {
-                    // Fresh reservation - another instance is actively submitting.
-                    // Don't interfere to avoid duplicate batches.
-                    Ok(ReservationResult::InProgressByOtherInstance)
                 }
-            }
-            other => {
-                // Unknown status - treat as corrupted
-                Err(anyhow!("Unknown batch submission status: {}", other))
-            }
+                other => {
+                    // Unknown status - treat as corrupted
+                    Err(anyhow!("Unknown batch submission status: {}", other))
+                }
+            },
         }
     }
 
@@ -2013,8 +1950,12 @@ mod tests {
         assert_eq!(cached.reasoning_effort, Some("high".to_string()));
     }
 
+    /// Test that a 'submitting' row is treated as stale and replaced.
+    ///
+    /// In single-instance design, a 'submitting' row indicates a crashed previous
+    /// attempt. The next reservation should replace it and proceed.
     #[test]
-    fn test_reserve_batch_submission_fresh_submitting_returns_in_progress() {
+    fn test_submitting_row_is_replaced() {
         let db = SqliteDb::new_in_memory().expect("should create in-memory db");
 
         let key = BatchSubmissionKey {
@@ -2025,66 +1966,26 @@ mod tests {
             base_sha: "def456".to_string(),
         };
 
-        // Reserve but don't confirm (simulating concurrent instance)
-        db.reserve_batch_submission(&key, "gpt-4", "medium")
-            .expect("should reserve");
-
-        // Second reservation should see fresh "submitting" and return InProgressByOtherInstance
-        let result = db
-            .reserve_batch_submission(&key, "gpt-4", "medium")
-            .expect("should reserve");
-        assert!(
-            matches!(result, ReservationResult::InProgressByOtherInstance),
-            "should return InProgressByOtherInstance for fresh submitting row"
-        );
-    }
-
-    /// Test that `InProgressByOtherInstance` is returned (not an error) when
-    /// another instance holds a fresh reservation.
-    ///
-    /// This tests the DB-level API that enables de-duplication. The semantics:
-    /// - `InProgressByOtherInstance` signals that a concurrent instance is actively
-    ///   submitting a batch for this (PR, head_sha, base_sha) tuple.
-    /// - The caller should NOT treat this as a failure - it's a de-duplication outcome.
-    /// - The first instance can still confirm successfully after the second sees
-    ///   `InProgressByOtherInstance`.
-    ///
-    /// Note: This test covers the DB reservation behavior, not the interpreter's
-    /// handling of this result. For interpreter behavior, see the interpreter tests.
-    #[test]
-    fn test_in_progress_by_other_instance_is_not_a_failure() {
-        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
-
-        let key = BatchSubmissionKey {
-            repo_owner: "owner".to_string(),
-            repo_name: "repo".to_string(),
-            pr_number: 42,
-            head_sha: "abc123".to_string(),
-            base_sha: "def456".to_string(),
-        };
-
-        // First instance reserves
+        // First attempt reserves (simulating a crash before confirm)
         let result1 = db
             .reserve_batch_submission(&key, "gpt-4", "medium")
             .expect("should reserve");
         assert!(
             matches!(result1, ReservationResult::Reserved),
-            "first instance should get Reserved"
+            "first attempt should get Reserved"
         );
 
-        // Second instance tries to reserve while first is still submitting
+        // Second attempt (after crash/restart) should also get Reserved
+        // because the 'submitting' row is treated as stale
         let result2 = db
             .reserve_batch_submission(&key, "gpt-4", "medium")
             .expect("should reserve");
-
-        // This is NOT a failure - it's de-duplication.
-        // The second instance should silently defer to the first instance.
         assert!(
-            matches!(result2, ReservationResult::InProgressByOtherInstance),
-            "second instance should get InProgressByOtherInstance, not fail"
+            matches!(result2, ReservationResult::Reserved),
+            "second attempt should replace stale 'submitting' row"
         );
 
-        // Verify the first instance can still confirm (proving it's not broken)
+        // Confirm the second reservation
         let data = BatchSubmissionData {
             batch_id: "batch_123".to_string(),
             comment_id: None,
@@ -2093,52 +1994,15 @@ mod tests {
             reasoning_effort: "medium".to_string(),
         };
         db.confirm_batch_submission(&key, &data)
-            .expect("first instance should be able to confirm");
+            .expect("should be able to confirm");
 
-        // Now the second instance's next attempt would see AlreadySubmitted
+        // Third attempt should see AlreadySubmitted
         let result3 = db
             .reserve_batch_submission(&key, "gpt-4", "medium")
             .expect("should reserve");
         assert!(
             matches!(result3, ReservationResult::AlreadySubmitted(_)),
             "third attempt should see AlreadySubmitted with cached data"
-        );
-    }
-
-    #[test]
-    fn test_reserve_batch_submission_stale_submitting_allows_retry() {
-        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
-
-        let key = BatchSubmissionKey {
-            repo_owner: "owner".to_string(),
-            repo_name: "repo".to_string(),
-            pr_number: 42,
-            head_sha: "abc123".to_string(),
-            base_sha: "def456".to_string(),
-        };
-
-        // Reserve but don't confirm
-        db.reserve_batch_submission(&key, "gpt-4", "medium")
-            .expect("should reserve");
-
-        // Manually make the row stale by updating created_at to 20 minutes ago
-        {
-            let conn = db.conn.lock().expect("mutex poisoned");
-            conn.execute(
-                "UPDATE batch_submissions SET created_at = datetime('now', '-20 minutes') \
-                 WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3",
-                rusqlite::params![&key.repo_owner, &key.repo_name, key.pr_number],
-            )
-            .expect("should update created_at");
-        }
-
-        // Second reservation should see stale "submitting" and reserve fresh
-        let result = db
-            .reserve_batch_submission(&key, "gpt-4", "medium")
-            .expect("should reserve");
-        assert!(
-            matches!(result, ReservationResult::Reserved),
-            "should return Reserved after deleting stale row"
         );
     }
 
@@ -2526,7 +2390,8 @@ mod tests {
 
         // Now simulate a no-op event that calls upsert_state_and_effects with
         // an empty effects list (e.g., BatchStatusUpdate with no state change)
-        db.upsert_state_and_effects(&pr_id, &state, installation_id, &[])
+        // state_changed=false means this is a true no-op
+        db.upsert_state_and_effects(&pr_id, &state, installation_id, &[], false)
             .expect("should upsert");
 
         // BUG: The pending effects should be PRESERVED, but currently they're deleted
@@ -2539,6 +2404,69 @@ mod tests {
         assert_eq!(
             effects_after[0].1, pending_effect,
             "the original pending effect should still be there"
+        );
+    }
+
+    /// Test that pending effects ARE cleared when state changes but no new effects.
+    ///
+    /// When a transition changes the state but produces no persistable effects
+    /// (e.g., FetchData-only transitions), old pending effects should be cleared
+    /// because they're stale for the new state.
+    #[test]
+    fn test_pending_effects_cleared_on_state_change_without_effects() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let pr_id = StateMachinePrId::new("owner", "repo", 42);
+        let old_state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId::from(100)),
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        let installation_id = 12345u64;
+
+        // Insert a pending effect in the old state
+        db.upsert_state(&pr_id, &old_state, installation_id)
+            .expect("should upsert");
+
+        let pending_effect = Effect::UpdateComment {
+            content: CommentContent::InProgress {
+                head_sha: CommitSha::from("abc123"),
+                batch_id: BatchId::from("batch_123".to_string()),
+                model: "gpt-4".to_string(),
+                reasoning_effort: "high".to_string(),
+            },
+        };
+        db.insert_pending_effects(&pr_id, &[pending_effect])
+            .expect("should insert pending effects");
+
+        // Verify pending effects exist
+        let effects_before = db.load_pending_effects(&pr_id).expect("should load");
+        assert_eq!(effects_before.len(), 1, "should have 1 pending effect");
+
+        // Transition to a NEW state (different head_sha) with no persistable effects
+        // This simulates a FetchData-only transition
+        let new_state = ReviewMachineState::Preparing {
+            reviews_enabled: true,
+            head_sha: CommitSha::from("xyz789"),
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+        };
+
+        // state_changed=true because we're transitioning to a different state
+        db.upsert_state_and_effects(&pr_id, &new_state, installation_id, &[], true)
+            .expect("should upsert");
+
+        // The pending effects should be CLEARED because the state changed
+        let effects_after = db.load_pending_effects(&pr_id).expect("should load");
+        assert_eq!(
+            effects_after.len(),
+            0,
+            "pending effects should be cleared when state changes even without new effects"
         );
     }
 
@@ -2575,7 +2503,7 @@ mod tests {
         db.insert_pending_effects(&pr_id, &[old_effect])
             .expect("should insert pending effects");
 
-        // Now provide new effects
+        // Now provide new effects (state_changed=true since we're transitioning)
         let new_effect = Effect::UpdateComment {
             content: CommentContent::InProgress {
                 head_sha: CommitSha::from("abc123"),
@@ -2589,6 +2517,7 @@ mod tests {
             &state,
             installation_id,
             std::slice::from_ref(&new_effect),
+            true, // state changed
         )
         .expect("should upsert");
 

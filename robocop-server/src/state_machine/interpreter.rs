@@ -779,29 +779,6 @@ async fn execute_submit_batch(
                 reasoning_effort: cached.reasoning_effort.unwrap_or(reasoning_effort),
             });
         }
-        ReservationResult::InProgressByOtherInstance => {
-            // Another instance is actively submitting - defer to it.
-            // This is NOT a failure - it's de-duplication. We should NOT
-            // transition to Failed state or post failure UI.
-            //
-            // By returning no events, the state machine stays in its current
-            // state (Preparing). Recovery happens via:
-            // - `recover_preparing_states()` runs every 30 seconds, checks if a
-            //   batch was confirmed by another instance, and emits BatchSubmitted
-            // - A new webhook for this PR (which will see AlreadySubmitted)
-            //
-            // Note: Polling does NOT help this instance because `Preparing` state
-            // has no `pending_batch_id()`, so it's not included in pending batches.
-            //
-            // If the other instance crashes before confirming, the staleness
-            // threshold (10 minutes) will eventually allow re-submission.
-            info!(
-                "Deferring batch submission for PR #{} commit {} - another instance is actively submitting",
-                ctx.pr_number,
-                head_sha.short()
-            );
-            return EffectResult::none();
-        }
         ReservationResult::Reserved => {
             // Slot reserved - proceed with full submission flow below
         }

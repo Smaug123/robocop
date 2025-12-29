@@ -91,9 +91,17 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                         reviews_enabled: *reviews_enabled,
                         head_sha: head_sha.clone(),
                         base_sha: base_sha.clone(),
-                        reason: FailureReason::DataFetchFailed { reason: error },
+                        reason: FailureReason::DataFetchFailed {
+                            reason: error.clone(),
+                        },
                     },
-                    vec![],
+                    vec![Effect::UpdateComment {
+                        content: CommentContent::ReviewFailed {
+                            head_sha: head_sha.clone(),
+                            batch_id: BatchId::from("(fetch failed)".to_string()),
+                            reason: FailureReason::DataFetchFailed { reason: error },
+                        },
+                    }],
                 ),
                 DataFetchFailure::NoFiles => (
                     ReviewMachineState::Cancelled {

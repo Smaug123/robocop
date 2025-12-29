@@ -52,11 +52,9 @@
 //! - A second instance can overwrite the first instance's newer state with stale data
 //! - There is no read-through caching, locking, or optimistic concurrency control
 //!
-//! The only multi-instance safety is for batch submissions: the two-phase commit
-//! in `batch_submissions` table prevents duplicate OpenAI batch submissions when
-//! multiple instances race. This is handled via `SqliteDb::reserve_batch_submission`:
-//! - Stale submission reservations (older than 10 min) are cleaned up periodically
-//! - Fresh reservations from other instances return `InProgressByOtherInstance`
+//! The batch submission table provides idempotency for single-instance crash
+//! recovery: the two-phase commit in `batch_submissions` table prevents duplicate
+//! OpenAI batch submissions if the server crashes mid-submission and restarts.
 //!
 //! For true multi-instance support, you would need to either:
 //! 1. Use a shared database with read-through caching and optimistic concurrency
@@ -226,14 +224,17 @@ impl PersistentStateStore {
     ///
     /// **Pending effects behavior**:
     /// - If `effects` is non-empty: clears existing pending effects and inserts the new ones.
-    /// - If `effects` is empty: leaves existing pending effects untouched, preserving
-    ///   failed effects for retry when a no-op event triggers this method.
+    /// - If `effects` is empty AND `state_changed` is true: clears existing pending effects
+    ///   (old effects are stale because the state has moved forward).
+    /// - If `effects` is empty AND `state_changed` is false: leaves existing pending effects
+    ///   untouched, preserving failed effects for retry when a no-op event triggers this method.
     async fn persist_state_and_effects(
         &self,
         pr_id: &StateMachinePrId,
         state: &ReviewMachineState,
         installation_id: u64,
         effects: &[Effect],
+        state_changed: bool,
     ) -> Result<()> {
         let db = self.db.clone();
         let pr_id = pr_id.clone();
@@ -241,7 +242,7 @@ impl PersistentStateStore {
         let effects = effects.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            db.upsert_state_and_effects(&pr_id, &state, installation_id, &effects)
+            db.upsert_state_and_effects(&pr_id, &state, installation_id, &effects, state_changed)
         })
         .await
         .context("spawn_blocking panicked while persisting state and effects")?
@@ -487,10 +488,11 @@ impl PersistentStateStore {
     ///
     /// **Note on pending effects**:
     /// - When a transition produces new persistable effects, old pending effects are
-    ///   cleared and replaced with the new ones (they're stale).
-    /// - When a transition produces no persistable effects (e.g., a no-op event like
-    ///   BatchStatusUpdate with no change), existing pending effects are preserved.
-    ///   This ensures failed effects get retried on restart rather than being lost.
+    ///   cleared and replaced with the new ones.
+    /// - When a transition changes the state but produces no persistable effects,
+    ///   old pending effects are cleared (they're stale for the new state).
+    /// - When a transition is a true no-op (state unchanged, no effects), existing
+    ///   pending effects are preserved for retry on restart.
     ///
     /// # Memory/DB Consistency
     ///
@@ -535,6 +537,9 @@ impl PersistentStateStore {
                 .cloned()
                 .collect();
 
+            // Detect whether the state changed (used for pending effects cleanup)
+            let state_changed = current_state != new_state;
+
             // Step 3: Atomically persist state AND persistable effects BEFORE executing.
             // This ensures crash safety: either both are persisted, or neither is.
             //
@@ -546,6 +551,7 @@ impl PersistentStateStore {
                 &new_state,
                 ctx.installation_id,
                 &persistable_effects,
+                state_changed,
             )
             .await?;
 
