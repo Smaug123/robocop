@@ -455,9 +455,12 @@ pub async fn recover_preparing_states(state: &Arc<AppState>) {
 /// Replay any pending effects from crash recovery.
 ///
 /// Called during startup to execute effects that were persisted but not
-/// completed before a crash. These are typically UI effects (UpdateComment,
-/// UpdateCheckRun, CreateCheckRun) that need to be replayed so the user sees
-/// the correct state in GitHub.
+/// completed before a crash. These are idempotent UI effects (UpdateComment,
+/// UpdateCheckRun) that need to be replayed so the user sees the correct
+/// state in GitHub.
+///
+/// Note: CreateCheckRun is NOT persisted because it's not idempotent - replaying
+/// it would create duplicate check runs. See `Effect::should_persist()` for details.
 ///
 /// This function:
 /// 1. Loads all PRs with pending effects

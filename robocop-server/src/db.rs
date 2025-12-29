@@ -263,9 +263,10 @@ impl SqliteDb {
 
     /// Migration v1 -> v2: Add pending_effects table for crash recovery.
     ///
-    /// This table stores UI effects (UpdateComment, UpdateCheckRun, CreateCheckRun)
+    /// This table stores idempotent UI effects (UpdateComment, UpdateCheckRun)
     /// that need to be replayed if the server crashes between persisting state
-    /// and executing effects.
+    /// and executing effects. Note: CreateCheckRun is NOT stored here because
+    /// it's not idempotent. See `Effect::should_persist()` for details.
     fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             r#"
@@ -538,18 +539,20 @@ impl SqliteDb {
         Ok(())
     }
 
-    /// Atomically upsert state and replace pending effects in a single transaction.
+    /// Atomically upsert state and optionally replace pending effects in a single transaction.
     ///
     /// This ensures crash safety: either both state and effects are persisted,
     /// or neither is. If the process crashes after state is persisted but before
     /// effects, on restart the database will be in a consistent state (no state
     /// change without corresponding effects).
     ///
-    /// **Important**: This method DELETES any existing pending effects for the PR
-    /// before inserting the new ones. This ensures that only effects from the
-    /// current transition exist. Old effects (e.g., from failed UI updates in
-    /// previous transitions) are cleared because they represent stale state and
-    /// would be confusing to replay after the state has moved forward.
+    /// **Pending effects behavior**:
+    /// - If `effects` is non-empty: clears existing pending effects and inserts the new ones.
+    ///   This ensures only effects from the current transition exist. Old effects are
+    ///   considered stale because the state has moved forward.
+    /// - If `effects` is empty: leaves existing pending effects untouched. This preserves
+    ///   failed effects for retry when a no-op event (e.g., BatchStatusUpdate with no
+    ///   state change) triggers this method.
     pub fn upsert_state_and_effects(
         &self,
         pr_id: &StateMachinePrId,
@@ -562,10 +565,15 @@ impl SqliteDb {
         let tx = conn.transaction().context("Failed to begin transaction")?;
 
         Self::upsert_state_impl(&tx, pr_id, state, installation_id)?;
-        // Delete any existing pending effects before inserting new ones.
-        // This ensures only effects from the current transition exist.
-        Self::delete_pending_effects_impl(&tx, pr_id)?;
-        Self::insert_pending_effects_impl(&tx, pr_id, effects)?;
+
+        // Only clear and replace pending effects when new effects are provided.
+        // If effects is empty, preserve existing pending effects for retry.
+        // This prevents no-op events from wiping out failed effects that should
+        // be retried on restart.
+        if !effects.is_empty() {
+            Self::delete_pending_effects_impl(&tx, pr_id)?;
+            Self::insert_pending_effects_impl(&tx, pr_id, effects)?;
+        }
 
         tx.commit().context("Failed to commit transaction")?;
 
@@ -1572,6 +1580,7 @@ fn row_to_state(row: StateRow) -> Result<ReviewMachineState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_machine::effect::CommentContent;
 
     #[test]
     fn test_new_in_memory() {
@@ -2461,6 +2470,138 @@ mod tests {
         assert!(
             matches!(result, ReservationResult::Reserved),
             "different reasoning_effort should invalidate cache and return Reserved"
+        );
+    }
+
+    // =========================================================================
+    // Pending effects tests
+    // =========================================================================
+
+    /// Test that pending effects are preserved when upsert_state_and_effects is called
+    /// with an empty effects list.
+    ///
+    /// This is a regression test for a bug where:
+    /// 1. An event produces a persistable effect (e.g., UpdateComment)
+    /// 2. The effect fails to execute (API error)
+    /// 3. The effect stays in pending_effects for retry on restart
+    /// 4. A later no-op event (e.g., BatchStatusUpdate with no change) calls
+    ///    upsert_state_and_effects with an empty effects list
+    /// 5. BUG: The old pending_effects are deleted, losing the failed effect
+    ///
+    /// The fix is: only clear pending_effects when there are new persistable
+    /// effects to insert. If the transition produces no persistable effects,
+    /// leave existing ones alone for retry.
+    #[test]
+    fn test_pending_effects_preserved_on_empty_effects_list() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let pr_id = StateMachinePrId::new("owner", "repo", 42);
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId::from(100)),
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        let installation_id = 12345u64;
+
+        // Insert some pending effects (simulating a failed UpdateComment)
+        let pending_effect = Effect::UpdateComment {
+            content: CommentContent::InProgress {
+                head_sha: CommitSha::from("abc123"),
+                batch_id: BatchId::from("batch_123".to_string()),
+                model: "gpt-4".to_string(),
+                reasoning_effort: "high".to_string(),
+            },
+        };
+        db.insert_pending_effects(&pr_id, std::slice::from_ref(&pending_effect))
+            .expect("should insert pending effects");
+
+        // Verify pending effects exist
+        let effects_before = db.load_pending_effects(&pr_id).expect("should load");
+        assert_eq!(effects_before.len(), 1, "should have 1 pending effect");
+
+        // Now simulate a no-op event that calls upsert_state_and_effects with
+        // an empty effects list (e.g., BatchStatusUpdate with no state change)
+        db.upsert_state_and_effects(&pr_id, &state, installation_id, &[])
+            .expect("should upsert");
+
+        // BUG: The pending effects should be PRESERVED, but currently they're deleted
+        let effects_after = db.load_pending_effects(&pr_id).expect("should load");
+        assert_eq!(
+            effects_after.len(),
+            1,
+            "pending effects should be preserved when no new effects are provided"
+        );
+        assert_eq!(
+            effects_after[0].1, pending_effect,
+            "the original pending effect should still be there"
+        );
+    }
+
+    /// Test that pending effects ARE replaced when new persistable effects are provided.
+    ///
+    /// When a transition produces new persistable effects, the old ones should be
+    /// cleared (they're stale) and replaced with the new ones.
+    #[test]
+    fn test_pending_effects_replaced_when_new_effects_provided() {
+        let db = SqliteDb::new_in_memory().expect("should create in-memory db");
+
+        let pr_id = StateMachinePrId::new("owner", "repo", 42);
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_123".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId::from(100)),
+            check_run_id: None,
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        let installation_id = 12345u64;
+
+        // Insert an old pending effect
+        let old_effect = Effect::UpdateComment {
+            content: CommentContent::InProgress {
+                head_sha: CommitSha::from("old_sha"),
+                batch_id: BatchId::from("old_batch".to_string()),
+                model: "gpt-4".to_string(),
+                reasoning_effort: "high".to_string(),
+            },
+        };
+        db.insert_pending_effects(&pr_id, &[old_effect])
+            .expect("should insert pending effects");
+
+        // Now provide new effects
+        let new_effect = Effect::UpdateComment {
+            content: CommentContent::InProgress {
+                head_sha: CommitSha::from("abc123"),
+                batch_id: BatchId::from("batch_123".to_string()),
+                model: "gpt-4".to_string(),
+                reasoning_effort: "high".to_string(),
+            },
+        };
+        db.upsert_state_and_effects(
+            &pr_id,
+            &state,
+            installation_id,
+            std::slice::from_ref(&new_effect),
+        )
+        .expect("should upsert");
+
+        // Old effects should be replaced with new ones
+        let effects_after = db.load_pending_effects(&pr_id).expect("should load");
+        assert_eq!(
+            effects_after.len(),
+            1,
+            "should have exactly 1 pending effect"
+        );
+        assert_eq!(
+            effects_after[0].1, new_effect,
+            "the new effect should replace the old one"
         );
     }
 }

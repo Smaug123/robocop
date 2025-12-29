@@ -218,16 +218,16 @@ impl PersistentStateStore {
             .context("Failed to delete state from database")
     }
 
-    /// Atomically persist state and replace pending effects in a single transaction.
+    /// Atomically persist state and optionally replace pending effects in a single transaction.
     ///
     /// This ensures crash safety: either both state and effects are persisted,
     /// or neither is. Memory is NOT updated here - the caller must update memory
     /// only after this method returns successfully.
     ///
-    /// **Important**: This method DELETES any existing pending effects for the PR
-    /// before inserting the new ones. This ensures that only effects from the
-    /// current transition exist. Old effects from previous transitions are cleared
-    /// because they represent stale state.
+    /// **Pending effects behavior**:
+    /// - If `effects` is non-empty: clears existing pending effects and inserts the new ones.
+    /// - If `effects` is empty: leaves existing pending effects untouched, preserving
+    ///   failed effects for retry when a no-op event triggers this method.
     async fn persist_state_and_effects(
         &self,
         pr_id: &StateMachinePrId,
@@ -475,8 +475,7 @@ impl PersistentStateStore {
     /// providing crash safety. The sequence for each event is:
     /// 1. Compute transition (pure) → get new state and effects
     /// 2. Partition effects: persistable (UI effects) vs non-persistable
-    /// 3. Atomically persist new state, CLEAR old pending effects, and INSERT new
-    ///    persistable effects to SQLite (single transaction)
+    /// 3. Atomically persist new state and (if any) new persistable effects to SQLite
     /// 4. Update in-memory state (only after DB commit succeeds)
     /// 5. Execute non-persistable effects (they don't need tracking)
     /// 6. Execute persistable effects, deleting each from DB after success
@@ -486,11 +485,12 @@ impl PersistentStateStore {
     /// persisted AND the pending effects in the database. The `recover_pending_effects`
     /// function replays any effects that weren't completed.
     ///
-    /// **Note on stale effects**: Step 3 clears any old pending effects before
-    /// inserting new ones. This ensures only effects from the current transition
-    /// exist. Old effects from previous transitions (e.g., failed UI updates) are
-    /// cleared rather than retried, because they represent stale state that would
-    /// be confusing to replay after the state has moved forward.
+    /// **Note on pending effects**:
+    /// - When a transition produces new persistable effects, old pending effects are
+    ///   cleared and replaced with the new ones (they're stale).
+    /// - When a transition produces no persistable effects (e.g., a no-op event like
+    ///   BatchStatusUpdate with no change), existing pending effects are preserved.
+    ///   This ensures failed effects get retried on restart rather than being lost.
     ///
     /// # Memory/DB Consistency
     ///
