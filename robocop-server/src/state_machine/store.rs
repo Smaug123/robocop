@@ -12,6 +12,7 @@ use tracing::info;
 
 use super::event::Event;
 use super::interpreter::{execute_effects, InterpreterContext};
+use super::repository::{InMemoryRepository, StateRepository, StoredState};
 use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
 use crate::github::GitHubClient;
@@ -44,10 +45,12 @@ impl StateMachinePrId {
 /// This store provides per-PR serialization to prevent race conditions when
 /// concurrent events (webhooks, commands, batch completions) target the same PR.
 /// All state-modifying operations acquire a per-PR lock before proceeding.
+///
+/// The actual state storage is delegated to a `StateRepository` implementation,
+/// allowing different backends (in-memory, SQLite, etc.).
 pub struct StateStore {
-    states: RwLock<HashMap<StateMachinePrId, ReviewMachineState>>,
-    /// Installation IDs for each PR (needed for batch polling to auth with GitHub).
-    installation_ids: RwLock<HashMap<StateMachinePrId, u64>>,
+    /// Repository for persisting PR states.
+    repository: Arc<dyn StateRepository>,
     /// Per-PR locks to serialize event processing.
     ///
     /// This ensures that concurrent events for the same PR are processed
@@ -63,10 +66,15 @@ impl Default for StateStore {
 }
 
 impl StateStore {
+    /// Create a new StateStore with the default in-memory repository.
     pub fn new() -> Self {
+        Self::with_repository(Arc::new(InMemoryRepository::new()))
+    }
+
+    /// Create a new StateStore with a custom repository.
+    pub fn with_repository(repository: Arc<dyn StateRepository>) -> Self {
         Self {
-            states: RwLock::new(HashMap::new()),
-            installation_ids: RwLock::new(HashMap::new()),
+            repository,
             pr_locks: RwLock::new(HashMap::new()),
         }
     }
@@ -94,8 +102,11 @@ impl StateStore {
 
     /// Get the current state for a PR, or create a default idle state.
     pub async fn get_or_default(&self, pr_id: &StateMachinePrId) -> ReviewMachineState {
-        let states = self.states.read().await;
-        states.get(pr_id).cloned().unwrap_or_default()
+        self.repository
+            .get(pr_id)
+            .await
+            .map(|s| s.state)
+            .unwrap_or_default()
     }
 
     /// Get or initialize the state for a PR with the given reviews_enabled setting.
@@ -113,38 +124,63 @@ impl StateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        let states = self.states.read().await;
-        if let Some(state) = states.get(pr_id) {
-            let state = state.clone();
-            drop(states);
-
+        if let Some(stored) = self.repository.get(pr_id).await {
             // If reviews_enabled changed (e.g., user edited PR description),
             // update the state to reflect the new value
-            if state.reviews_enabled() != reviews_enabled {
-                let updated_state = state.with_reviews_enabled(reviews_enabled);
-                self.set(pr_id.clone(), updated_state.clone()).await;
+            if stored.state.reviews_enabled() != reviews_enabled {
+                let updated_state = stored.state.with_reviews_enabled(reviews_enabled);
+                self.repository
+                    .put(
+                        pr_id,
+                        StoredState {
+                            state: updated_state.clone(),
+                            installation_id: stored.installation_id,
+                        },
+                    )
+                    .await;
                 return updated_state;
             }
-            return state;
+            return stored.state;
         }
-        drop(states);
 
         // Initialize with the given reviews_enabled
         let state = ReviewMachineState::Idle { reviews_enabled };
-        self.set(pr_id.clone(), state.clone()).await;
+        self.repository
+            .put(
+                pr_id,
+                StoredState {
+                    state: state.clone(),
+                    installation_id: 0, // Will be set when process_event is called
+                },
+            )
+            .await;
         state
     }
 
     /// Get the current state for a PR.
     pub async fn get(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
-        let states = self.states.read().await;
-        states.get(pr_id).cloned()
+        self.repository.get(pr_id).await.map(|s| s.state)
     }
 
     /// Set the state for a PR.
+    ///
+    /// This preserves the existing installation_id if one exists.
     pub async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) {
-        let mut states = self.states.write().await;
-        states.insert(pr_id, state);
+        let installation_id = self
+            .repository
+            .get(&pr_id)
+            .await
+            .map(|s| s.installation_id)
+            .unwrap_or(0);
+        self.repository
+            .put(
+                &pr_id,
+                StoredState {
+                    state,
+                    installation_id,
+                },
+            )
+            .await;
     }
 
     /// Remove the state for a PR (e.g., when PR is closed).
@@ -156,14 +192,9 @@ impl StateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        let mut states = self.states.write().await;
-        let mut installation_ids = self.installation_ids.write().await;
-        installation_ids.remove(pr_id);
-        let result = states.remove(pr_id);
+        let result = self.repository.delete(pr_id).await.map(|s| s.state);
 
         // Clean up the lock entry (we're still holding it, so this is safe)
-        drop(states);
-        drop(installation_ids);
         let mut locks = self.pr_locks.write().await;
         locks.remove(pr_id);
 
@@ -171,24 +202,33 @@ impl StateStore {
     }
 
     /// Set the installation ID for a PR.
+    ///
+    /// This preserves the existing state if one exists.
     pub async fn set_installation_id(&self, pr_id: &StateMachinePrId, installation_id: u64) {
-        let mut installation_ids = self.installation_ids.write().await;
-        installation_ids.insert(pr_id.clone(), installation_id);
+        let state = self.get_or_default(pr_id).await;
+        self.repository
+            .put(
+                pr_id,
+                StoredState {
+                    state,
+                    installation_id,
+                },
+            )
+            .await;
     }
 
     /// Get the installation ID for a PR.
     pub async fn get_installation_id(&self, pr_id: &StateMachinePrId) -> Option<u64> {
-        let installation_ids = self.installation_ids.read().await;
-        installation_ids.get(pr_id).copied()
+        self.repository.get(pr_id).await.map(|s| s.installation_id)
     }
 
     /// Get all PR IDs with pending batches.
     pub async fn get_pending_pr_ids(&self) -> Vec<StateMachinePrId> {
-        let states = self.states.read().await;
-        states
-            .iter()
-            .filter(|(_, state)| state.has_pending_batch())
-            .map(|(id, _)| id.clone())
+        self.repository
+            .get_pending()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -196,14 +236,13 @@ impl StateStore {
     ///
     /// Returns a list of (pr_id, batch_id, installation_id) tuples for all PRs with pending batches.
     pub async fn get_pending_batches(&self) -> Vec<(StateMachinePrId, super::state::BatchId, u64)> {
-        let states = self.states.read().await;
-        let installation_ids = self.installation_ids.read().await;
-        states
-            .iter()
-            .filter_map(|(id, state)| {
-                let batch_id = state.pending_batch_id()?;
-                let installation_id = installation_ids.get(id).copied()?;
-                Some((id.clone(), batch_id.clone(), installation_id))
+        self.repository
+            .get_pending()
+            .await
+            .into_iter()
+            .filter_map(|(id, stored)| {
+                let batch_id = stored.state.pending_batch_id()?.clone();
+                Some((id, batch_id, stored.installation_id))
             })
             .collect()
     }

@@ -4,11 +4,11 @@
 //! Following the principle of "make illegal states unrepresentable", we use
 //! an enum that captures exactly what states are valid.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Newtype for commit SHA to prevent mixing with other strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommitSha(pub String);
 
 impl CommitSha {
@@ -37,7 +37,7 @@ impl From<&str> for CommitSha {
 }
 
 /// Newtype for OpenAI batch ID.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BatchId(pub String);
 
 impl fmt::Display for BatchId {
@@ -53,7 +53,7 @@ impl From<String> for BatchId {
 }
 
 /// Newtype for GitHub comment ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommentId(pub u64);
 
 impl From<u64> for CommentId {
@@ -63,7 +63,7 @@ impl From<u64> for CommentId {
 }
 
 /// Newtype for GitHub check run ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CheckRunId(pub u64);
 
 impl From<u64> for CheckRunId {
@@ -74,7 +74,7 @@ impl From<u64> for CheckRunId {
 
 /// Result of a completed code review.
 /// Matches the schema sent to OpenAI.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewResult {
     pub reasoning: String,
     #[serde(rename = "substantiveComments")]
@@ -83,7 +83,7 @@ pub struct ReviewResult {
 }
 
 /// Reason why a batch failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureReason {
     /// OpenAI batch processing failed.
     BatchFailed { error: Option<String> },
@@ -122,7 +122,7 @@ impl fmt::Display for FailureReason {
 }
 
 /// Reason why a review was cancelled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancellationReason {
     /// User explicitly requested cancellation via command.
     UserRequested,
@@ -155,7 +155,7 @@ impl fmt::Display for CancellationReason {
 }
 
 /// Options for a review request.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReviewOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -174,7 +174,7 @@ impl From<crate::command::ReviewOptions> for ReviewOptions {
 ///
 /// Each variant represents a distinct state the review can be in.
 /// The `reviews_enabled` field tracks whether automatic reviews are on/off for this PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewMachineState {
     /// No active review for this PR/commit.
     Idle { reviews_enabled: bool },

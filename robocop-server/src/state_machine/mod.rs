@@ -12,6 +12,7 @@
 pub mod effect;
 pub mod event;
 pub mod interpreter;
+pub mod repository;
 pub mod state;
 pub mod store;
 pub mod transition;
@@ -19,6 +20,7 @@ pub mod transition;
 pub use effect::*;
 pub use event::*;
 pub use interpreter::*;
+pub use repository::*;
 pub use state::*;
 pub use store::*;
 pub use transition::*;
