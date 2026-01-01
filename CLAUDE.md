@@ -109,6 +109,7 @@ Environment variables required:
 - `OPENAI_API_KEY`: OpenAI API key
 - `TARGET_GITHUB_USER_ID`: Numeric GitHub user ID to monitor for pushes
 - `PORT`: Server port (default: 3000)
+- `STATE_DIR`: Directory for persistent state database (default: current directory)
 - `RECORDING_ENABLED`: Enable HTTP recording (default: false)
 - `RECORDING_LOG_PATH`: Recording log file path (default: recordings.jsonl)
 
