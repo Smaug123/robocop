@@ -60,6 +60,9 @@ pub enum Effect {
         head_sha: CommitSha,
         base_sha: CommitSha,
         options: ReviewOptions,
+        /// Reconciliation token for crash recovery. This is stored in OpenAI batch
+        /// metadata and allows us to find orphaned batches on restart.
+        reconciliation_token: String,
     },
 
     /// Cancel a pending batch.

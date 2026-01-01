@@ -19,6 +19,7 @@ use robocop_server::batch_processor::batch_polling_loop;
 use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
+use robocop_server::reconciliation::reconcile_orphaned_batches;
 use robocop_server::webhook::webhook_router;
 use robocop_server::{AppState, RecordingLogger, StateStore};
 
@@ -159,6 +160,10 @@ async fn main() -> Result<()> {
         state_store: Arc::new(StateStore::new()),
         recording_logger,
     });
+
+    // Run crash recovery reconciliation before accepting any requests
+    // This ensures any PRs stuck in BatchSubmitting state are recovered
+    reconcile_orphaned_batches(app_state.clone()).await;
 
     let app = Router::new()
         .route("/health", get(health_check))

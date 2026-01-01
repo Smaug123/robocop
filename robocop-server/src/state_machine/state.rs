@@ -4,11 +4,11 @@
 //! Following the principle of "make illegal states unrepresentable", we use
 //! an enum that captures exactly what states are valid.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Newtype for commit SHA to prevent mixing with other strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommitSha(pub String);
 
 impl CommitSha {
@@ -37,7 +37,7 @@ impl From<&str> for CommitSha {
 }
 
 /// Newtype for OpenAI batch ID.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BatchId(pub String);
 
 impl fmt::Display for BatchId {
@@ -53,7 +53,7 @@ impl From<String> for BatchId {
 }
 
 /// Newtype for GitHub comment ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommentId(pub u64);
 
 impl From<u64> for CommentId {
@@ -63,7 +63,7 @@ impl From<u64> for CommentId {
 }
 
 /// Newtype for GitHub check run ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CheckRunId(pub u64);
 
 impl From<u64> for CheckRunId {
@@ -74,7 +74,7 @@ impl From<u64> for CheckRunId {
 
 /// Result of a completed code review.
 /// Matches the schema sent to OpenAI.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewResult {
     pub reasoning: String,
     #[serde(rename = "substantiveComments")]
@@ -83,7 +83,7 @@ pub struct ReviewResult {
 }
 
 /// Reason why a batch failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureReason {
     /// OpenAI batch processing failed.
     BatchFailed { error: Option<String> },
@@ -122,7 +122,7 @@ impl fmt::Display for FailureReason {
 }
 
 /// Reason why a review was cancelled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancellationReason {
     /// User explicitly requested cancellation via command.
     UserRequested,
@@ -155,7 +155,7 @@ impl fmt::Display for CancellationReason {
 }
 
 /// Options for a review request.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReviewOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -174,7 +174,7 @@ impl From<crate::command::ReviewOptions> for ReviewOptions {
 ///
 /// Each variant represents a distinct state the review can be in.
 /// The `reviews_enabled` field tracks whether automatic reviews are on/off for this PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewMachineState {
     /// No active review for this PR/commit.
     Idle { reviews_enabled: bool },
@@ -185,6 +185,27 @@ pub enum ReviewMachineState {
         head_sha: CommitSha,
         base_sha: CommitSha,
         options: ReviewOptions,
+    },
+
+    /// Batch submission in progress to OpenAI.
+    ///
+    /// This state exists for crash recovery. The reconciliation_token is stored in
+    /// batch metadata at OpenAI, allowing us to find orphaned batches on restart.
+    /// If a crash occurs after the batch is submitted but before BatchSubmitted
+    /// is processed, we can recover by listing batches and matching tokens.
+    BatchSubmitting {
+        reviews_enabled: bool,
+        /// Token for crash recovery - stored in OpenAI batch metadata.
+        reconciliation_token: String,
+        head_sha: CommitSha,
+        base_sha: CommitSha,
+        options: ReviewOptions,
+        /// Comment ID if one was created (may be None if GitHub API failed).
+        comment_id: Option<CommentId>,
+        /// Check run ID if one was created (may be None if GitHub API failed).
+        check_run_id: Option<CheckRunId>,
+        model: String,
+        reasoning_effort: String,
     },
 
     /// Waiting for ancestry check result before deciding what to do.
@@ -256,6 +277,9 @@ impl ReviewMachineState {
             Self::Preparing {
                 reviews_enabled, ..
             } => *reviews_enabled,
+            Self::BatchSubmitting {
+                reviews_enabled, ..
+            } => *reviews_enabled,
             Self::AwaitingAncestryCheck {
                 reviews_enabled, ..
             } => *reviews_enabled,
@@ -279,6 +303,7 @@ impl ReviewMachineState {
         match self {
             Self::Idle { .. } => None,
             Self::Preparing { head_sha, .. } => Some(head_sha),
+            Self::BatchSubmitting { head_sha, .. } => Some(head_sha),
             Self::AwaitingAncestryCheck { head_sha, .. } => Some(head_sha),
             Self::BatchPending { head_sha, .. } => Some(head_sha),
             Self::Completed { head_sha, .. } => Some(head_sha),
@@ -308,6 +333,7 @@ impl ReviewMachineState {
         match self {
             Self::Idle { .. } => None,
             Self::Preparing { base_sha, .. } => Some(base_sha),
+            Self::BatchSubmitting { base_sha, .. } => Some(base_sha),
             Self::AwaitingAncestryCheck { base_sha, .. } => Some(base_sha),
             Self::BatchPending { base_sha, .. } => Some(base_sha),
             Self::Completed { .. } => None,
@@ -327,8 +353,20 @@ impl ReviewMachineState {
     /// Returns the check run ID if the state has one.
     pub fn check_run_id(&self) -> Option<CheckRunId> {
         match self {
+            Self::BatchSubmitting { check_run_id, .. } => *check_run_id,
             Self::BatchPending { check_run_id, .. } => *check_run_id,
             Self::AwaitingAncestryCheck { check_run_id, .. } => *check_run_id,
+            _ => None,
+        }
+    }
+
+    /// Returns the reconciliation token if this is a BatchSubmitting state.
+    pub fn reconciliation_token(&self) -> Option<&str> {
+        match self {
+            Self::BatchSubmitting {
+                reconciliation_token,
+                ..
+            } => Some(reconciliation_token),
             _ => None,
         }
     }
@@ -347,6 +385,13 @@ impl ReviewMachineState {
             self,
             Self::BatchPending { .. } | Self::AwaitingAncestryCheck { .. }
         )
+    }
+
+    /// Returns true if this state is BatchSubmitting (has a pending submission).
+    ///
+    /// Used by reconciliation to find states that may have orphaned batches at OpenAI.
+    pub fn is_batch_submitting(&self) -> bool {
+        matches!(self, Self::BatchSubmitting { .. })
     }
 
     /// Creates a new Idle state with the specified reviews_enabled flag.
@@ -373,6 +418,27 @@ impl ReviewMachineState {
                 head_sha,
                 base_sha,
                 options,
+            },
+            Self::BatchSubmitting {
+                reconciliation_token,
+                head_sha,
+                base_sha,
+                options,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+                ..
+            } => Self::BatchSubmitting {
+                reviews_enabled: enabled,
+                reconciliation_token,
+                head_sha,
+                base_sha,
+                options,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
             },
             Self::AwaitingAncestryCheck {
                 batch_id,

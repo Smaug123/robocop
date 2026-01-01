@@ -679,6 +679,9 @@ async fn run_review(client: &reqwest::Client, args: ReviewArgs) -> Result<()> {
                 Some(&version),
                 additional_prompt,
                 Some(&args.model),
+                None, // reconciliation_token - not needed for CLI
+                None, // comment_id - not applicable for CLI
+                None, // check_run_id - not applicable for CLI
             )
             .await?;
 

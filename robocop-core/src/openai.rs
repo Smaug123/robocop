@@ -81,6 +81,16 @@ pub struct BatchResponse {
     pub metadata: Option<HashMap<String, String>>,
 }
 
+/// Response from listing batches
+#[derive(Debug, Deserialize)]
+pub struct ListBatchesResponse {
+    pub object: String,
+    pub data: Vec<BatchResponse>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub has_more: bool,
+}
+
 /// Input message for responses API.
 /// See https://platform.openai.com/docs/guides/text?api-mode=responses
 #[derive(Debug, Serialize)]
@@ -426,6 +436,69 @@ impl OpenAIClient {
         Ok(batch_response)
     }
 
+    /// List batches with optional pagination
+    ///
+    /// # Arguments
+    /// * `correlation_id` - Optional correlation ID for request tracing
+    /// * `limit` - Maximum number of batches to return (1-100, default 20)
+    /// * `after` - Cursor for pagination (batch ID to start after)
+    pub async fn list_batches(
+        &self,
+        correlation_id: Option<&str>,
+        limit: Option<u32>,
+        after: Option<&str>,
+    ) -> Result<ListBatchesResponse> {
+        let mut url = "https://api.openai.com/v1/batches".to_string();
+
+        // Build query string
+        let mut query_parts = Vec::new();
+        if let Some(l) = limit {
+            query_parts.push(format!("limit={}", l.min(100)));
+        }
+        if let Some(a) = after {
+            query_parts.push(format!("after={}", a));
+        }
+        if !query_parts.is_empty() {
+            url.push('?');
+            url.push_str(&query_parts.join("&"));
+        }
+
+        let mut request_builder = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json");
+
+        if let Some(cid) = correlation_id {
+            request_builder = request_builder.header(CORRELATION_ID_HEADER, cid);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .context("Failed to list batches")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .context("Failed to read error response body")?;
+            error!("OpenAI List Batches API error: {} - {}", status, error_text);
+            return Err(anyhow!(
+                "OpenAI List Batches API error: {} - {}",
+                status,
+                error_text
+            ));
+        }
+
+        let list_response: ListBatchesResponse = response
+            .json()
+            .await
+            .context("Failed to parse list batches response")?;
+        Ok(list_response)
+    }
+
     pub async fn cancel_batch(
         &self,
         correlation_id: Option<&str>,
@@ -553,6 +626,12 @@ impl OpenAIClient {
 
     /// Process a code review batch request
     /// Returns the batch ID
+    ///
+    /// # Arguments
+    /// * `reconciliation_token` - Optional token for crash recovery. If provided, this token
+    ///   is stored in batch metadata and can be used to reconcile orphaned batches on restart.
+    /// * `comment_id` - Optional GitHub comment ID to store in metadata for crash recovery.
+    /// * `check_run_id` - Optional GitHub check run ID to store in metadata for crash recovery.
     #[allow(clippy::too_many_arguments)]
     pub async fn process_code_review_batch(
         &self,
@@ -564,6 +643,9 @@ impl OpenAIClient {
         version: Option<&str>,
         additional_prompt: Option<&str>,
         model: Option<&str>,
+        reconciliation_token: Option<&str>,
+        comment_id: Option<u64>,
+        check_run_id: Option<u64>,
     ) -> Result<String> {
         // Create user prompt
         let user_prompt = create_user_prompt(diff, file_contents, additional_prompt);
@@ -601,6 +683,17 @@ impl OpenAIClient {
 
         if let Some(url) = &metadata.pull_request_url {
             batch_metadata.insert("pull_request_url".to_string(), url.clone());
+        }
+
+        // Add crash recovery metadata if provided
+        if let Some(token) = reconciliation_token {
+            batch_metadata.insert("reconciliation_token".to_string(), token.to_string());
+        }
+        if let Some(id) = comment_id {
+            batch_metadata.insert("comment_id".to_string(), id.to_string());
+        }
+        if let Some(id) = check_run_id {
+            batch_metadata.insert("check_run_id".to_string(), id.to_string());
         }
 
         // Create batch request using the responses API format

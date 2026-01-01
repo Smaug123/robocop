@@ -584,7 +584,8 @@ async fn process_cancel_reviews(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("Repository error during cancel: {}", e))?;
 
     info!(
         "Cancel reviews completed for PR #{}, final state: {:?}",
@@ -659,7 +660,8 @@ async fn process_enable_reviews(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("Repository error during enable: {}", e))?;
 
     // Update the cached review state to reflect the enable command
     let pr_id = crate::PullRequestId {
@@ -721,7 +723,8 @@ async fn process_disable_reviews(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("Repository error during disable: {}", e))?;
 
     // Update the cached review state to reflect the disable command
     let pr_id = crate::PullRequestId {
@@ -905,7 +908,8 @@ async fn process_code_review(
     let _current_state = state
         .state_store
         .get_or_init(&sm_pr_id, reviews_enabled)
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("Repository error during get_or_init: {}", e))?;
 
     // Create the appropriate event
     let event = if force_review {
@@ -937,7 +941,8 @@ async fn process_code_review(
     let final_state = state
         .state_store
         .process_event(&sm_pr_id, event, &ctx)
-        .await;
+        .await
+        .map_err(|e| anyhow::anyhow!("Repository error during code review: {}", e))?;
 
     info!(
         "Code review completed for PR #{}, final state: {:?}",

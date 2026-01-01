@@ -127,7 +127,19 @@ async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResul
             head_sha,
             base_sha,
             options,
-        } => execute_submit_batch(ctx, &diff, file_contents, &head_sha, &base_sha, &options).await,
+            reconciliation_token,
+        } => {
+            execute_submit_batch(
+                ctx,
+                &diff,
+                file_contents,
+                &head_sha,
+                &base_sha,
+                &options,
+                &reconciliation_token,
+            )
+            .await
+        }
 
         Effect::CancelBatch { batch_id } => execute_cancel_batch(ctx, &batch_id).await,
 
@@ -267,10 +279,67 @@ async fn execute_fetch_data(
         .map(|(path, content)| FileContent { path, content })
         .collect();
 
+    // Generate a deterministic reconciliation token based on PR identity + commits.
+    // This ensures that retries for the same PR+commits will use the same token,
+    // preventing duplicate batch submissions when reconciliation fails to find
+    // a batch that was actually submitted. Including base_sha ensures we don't
+    // match a batch created for a different diff if the base changed.
+    let reconciliation_token = generate_reconciliation_token(
+        ctx.installation_id,
+        &ctx.repo_owner,
+        &ctx.repo_name,
+        ctx.pr_number,
+        &head_sha.0,
+        &base_sha.0,
+    );
+
     EffectResult::single(Event::DataFetched {
         diff,
         file_contents,
+        reconciliation_token,
     })
+}
+
+/// Generate a deterministic reconciliation token for crash recovery.
+///
+/// The token is derived from:
+/// - installation_id: Identifies the GitHub App installation
+/// - repo_owner/repo_name: Identifies the repository
+/// - pr_number: Identifies the pull request
+/// - head_sha: The commit being reviewed
+/// - base_sha: The base commit (merge-base) being compared against
+///
+/// Including both head_sha and base_sha ensures that if the base changes
+/// (e.g., main was rebased), a new token is generated and we don't incorrectly
+/// match a batch created for a different diff.
+///
+/// Using SHA256 ensures a consistent, collision-resistant token that will be
+/// identical across server restarts and retries for the same PR+commits.
+fn generate_reconciliation_token(
+    installation_id: u64,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+    head_sha: &str,
+    base_sha: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(installation_id.to_le_bytes());
+    hasher.update(repo_owner.as_bytes());
+    hasher.update(b"/");
+    hasher.update(repo_name.as_bytes());
+    hasher.update(b"#");
+    hasher.update(pr_number.to_le_bytes());
+    hasher.update(b"@");
+    hasher.update(head_sha.as_bytes());
+    hasher.update(b"...");
+    hasher.update(base_sha.as_bytes());
+
+    let hash = hasher.finalize();
+    // Use the first 16 bytes (32 hex chars) for a reasonably short but unique token
+    hex::encode(&hash[..16])
 }
 
 /// Check if old_sha is an ancestor of new_sha.
@@ -681,6 +750,7 @@ async fn execute_submit_batch(
     head_sha: &CommitSha,
     base_sha: &CommitSha,
     options: &ReviewOptions,
+    reconciliation_token: &str,
 ) -> EffectResult {
     use robocop_core::ReviewMetadata;
 
@@ -784,6 +854,7 @@ async fn execute_submit_batch(
     };
 
     // Submit batch to OpenAI
+    // Include comment_id and check_run_id in metadata for crash recovery
     match ctx
         .openai_client
         .process_code_review_batch(
@@ -795,6 +866,9 @@ async fn execute_submit_batch(
             Some(&version),
             None, // additional_prompt
             Some(&model),
+            Some(reconciliation_token),
+            comment_id.map(|id| id.0),
+            check_run_id.map(|id| id.0),
         )
         .await
     {
@@ -947,6 +1021,72 @@ mod tests {
         assert!(
             !formatted.contains("...and"),
             "Should not show overflow for small list"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_reconciliation_token() {
+        // Same inputs should produce the same token
+        let token1 =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456", "base111");
+        let token2 =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456", "base111");
+        assert_eq!(token1, token2, "Same inputs should produce the same token");
+
+        // Different installation_id should produce different token
+        let token_diff_install =
+            generate_reconciliation_token(99999, "owner", "repo", 42, "abc123def456", "base111");
+        assert_ne!(
+            token1, token_diff_install,
+            "Different installation_id should produce different token"
+        );
+
+        // Different repo_owner should produce different token
+        let token_diff_owner =
+            generate_reconciliation_token(12345, "other", "repo", 42, "abc123def456", "base111");
+        assert_ne!(
+            token1, token_diff_owner,
+            "Different repo_owner should produce different token"
+        );
+
+        // Different repo_name should produce different token
+        let token_diff_repo =
+            generate_reconciliation_token(12345, "owner", "other", 42, "abc123def456", "base111");
+        assert_ne!(
+            token1, token_diff_repo,
+            "Different repo_name should produce different token"
+        );
+
+        // Different pr_number should produce different token
+        let token_diff_pr =
+            generate_reconciliation_token(12345, "owner", "repo", 99, "abc123def456", "base111");
+        assert_ne!(
+            token1, token_diff_pr,
+            "Different pr_number should produce different token"
+        );
+
+        // Different head_sha should produce different token
+        let token_diff_sha =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "xyz789xyz789", "base111");
+        assert_ne!(
+            token1, token_diff_sha,
+            "Different head_sha should produce different token"
+        );
+
+        // Different base_sha should produce different token
+        // This is the key fix: ensures we don't match batches created for a different diff
+        let token_diff_base =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456", "base222");
+        assert_ne!(
+            token1, token_diff_base,
+            "Different base_sha should produce different token"
+        );
+
+        // Token should be 32 hex chars (16 bytes)
+        assert_eq!(token1.len(), 32, "Token should be 32 hex characters");
+        assert!(
+            token1.chars().all(|c| c.is_ascii_hexdigit()),
+            "Token should only contain hex digits"
         );
     }
 }

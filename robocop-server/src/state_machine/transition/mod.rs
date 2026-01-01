@@ -7,15 +7,20 @@
 //! Each state has its own handler module with co-located tests:
 //! - `idle`: Idle state transitions
 //! - `preparing`: Preparing state transitions
+//! - `batch_submitting`: BatchSubmitting state transitions (crash recovery)
 //! - `batch_pending`: BatchPending state transitions
 //! - `awaiting_ancestry`: AwaitingAncestryCheck state transitions
 //! - `terminal`: Terminal states (Completed/Failed/Cancelled) transitions
 
 mod awaiting_ancestry;
 mod batch_pending;
+mod batch_submitting;
 mod idle;
 mod preparing;
 mod terminal;
+
+// Re-export constants for use in reconciliation
+pub use preparing::{DEFAULT_MODEL, DEFAULT_REASONING_EFFORT};
 
 use super::effect::Effect;
 use super::event::Event;
@@ -75,6 +80,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
     match &state {
         ReviewMachineState::Idle { .. } => idle::handle(state, event),
         ReviewMachineState::Preparing { .. } => preparing::handle(state, event),
+        ReviewMachineState::BatchSubmitting { .. } => batch_submitting::handle(state, event),
         ReviewMachineState::BatchPending { .. } => batch_pending::handle(state, event),
         ReviewMachineState::AwaitingAncestryCheck { .. } => awaiting_ancestry::handle(state, event),
         ReviewMachineState::Completed { .. }
@@ -2402,12 +2408,18 @@ mod property_tests {
             ),
             Just(Event::DisableReviewsRequested),
             // Data fetch results
-            (".*", proptest::collection::vec(arb_file_content(), 0..5)).prop_map(
-                |(diff, file_contents)| Event::DataFetched {
-                    diff,
-                    file_contents
-                }
-            ),
+            (
+                ".*",
+                proptest::collection::vec(arb_file_content(), 0..5),
+                "[a-f0-9]{32}"
+            )
+                .prop_map(|(diff, file_contents, reconciliation_token)| {
+                    Event::DataFetched {
+                        diff,
+                        file_contents,
+                        reconciliation_token,
+                    }
+                }),
             arb_data_fetch_failure().prop_map(|reason| Event::DataFetchFailed { reason }),
             // Batch submission results
             (
@@ -2578,12 +2590,18 @@ mod property_tests {
                 }),
             Just(Event::DisableReviewsRequested),
             // Data fetch results
-            (".*", proptest::collection::vec(arb_file_content(), 0..5)).prop_map(
-                |(diff, file_contents)| Event::DataFetched {
-                    diff,
-                    file_contents
-                }
-            ),
+            (
+                ".*",
+                proptest::collection::vec(arb_file_content(), 0..5),
+                "[a-f0-9]{32}"
+            )
+                .prop_map(|(diff, file_contents, reconciliation_token)| {
+                    Event::DataFetched {
+                        diff,
+                        file_contents,
+                        reconciliation_token,
+                    }
+                }),
             arb_data_fetch_failure().prop_map(|reason| Event::DataFetchFailed { reason }),
             // Batch submission results
             (
