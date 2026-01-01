@@ -66,6 +66,21 @@ impl SqliteRepository {
                             format!("{}: {}", parent.display(), e),
                         )
                     })?;
+
+                    // Set restrictive permissions on state directory (Unix only).
+                    // This protects all database files including WAL/SHM files that
+                    // SQLite creates with default umask permissions.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let dir_permissions = std::fs::Permissions::from_mode(0o700);
+                        if let Err(e) = std::fs::set_permissions(parent, dir_permissions) {
+                            warn!(
+                                "Failed to set restrictive permissions on state directory: {}",
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -96,6 +111,30 @@ impl SqliteRepository {
             "#,
         )
         .map_err(|e| RepositoryError::storage("configure pragmas", e.to_string()))?;
+
+        // Set restrictive permissions on WAL and SHM files (Unix only).
+        // SQLite creates these with default umask permissions when WAL mode is enabled.
+        // While the directory permissions provide primary protection, we also chmod
+        // these files directly as defense in depth.
+        #[cfg(unix)]
+        if path_str != ":memory:" && !path_str.is_empty() {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+
+            let wal_path = format!("{}-wal", path_str);
+            if std::path::Path::new(&wal_path).exists() {
+                if let Err(e) = std::fs::set_permissions(&wal_path, permissions.clone()) {
+                    warn!("Failed to set restrictive permissions on WAL file: {}", e);
+                }
+            }
+
+            let shm_path = format!("{}-shm", path_str);
+            if std::path::Path::new(&shm_path).exists() {
+                if let Err(e) = std::fs::set_permissions(&shm_path, permissions) {
+                    warn!("Failed to set restrictive permissions on SHM file: {}", e);
+                }
+            }
+        }
 
         // Create schema version table if it doesn't exist
         conn.execute_batch(
@@ -1322,5 +1361,65 @@ mod tests {
             "wal",
             "Database should be in WAL mode"
         );
+    }
+
+    /// Test that state directory has restrictive permissions (0700).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_state_dir_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_dir = temp_dir.path().join("state");
+        let db_path = state_dir.join("test.db");
+
+        let _repo = SqliteRepository::new(&db_path).unwrap();
+
+        // Verify directory permissions are 0700
+        let metadata = std::fs::metadata(&state_dir).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "State directory should have 0700 permissions, got {:o}",
+            mode
+        );
+    }
+
+    /// Test that WAL and SHM files have restrictive permissions (0600).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wal_shm_have_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create repository and write something to trigger WAL file creation
+        let repo = SqliteRepository::new(&db_path).unwrap();
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+
+        // WAL and SHM files should exist after write
+        let wal_path = temp_dir.path().join("test.db-wal");
+        let shm_path = temp_dir.path().join("test.db-shm");
+
+        // Note: WAL/SHM files may not exist if SQLite hasn't written to them yet,
+        // so we only check permissions if they exist
+        if wal_path.exists() {
+            let mode = std::fs::metadata(&wal_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "WAL file should have 0600 permissions, got {:o}",
+                mode
+            );
+        }
+
+        if shm_path.exists() {
+            let mode = std::fs::metadata(&shm_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "SHM file should have 0600 permissions, got {:o}",
+                mode
+            );
+        }
     }
 }
