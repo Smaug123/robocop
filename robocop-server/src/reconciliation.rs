@@ -20,10 +20,11 @@ use crate::AppState;
 const MAX_BATCH_LIST_LIMIT: u32 = 100;
 
 /// Number of retry attempts for listing batches from OpenAI.
-const LIST_BATCHES_MAX_RETRIES: u32 = 3;
+/// Higher value reduces false-positive failures during transient API outages.
+const LIST_BATCHES_MAX_RETRIES: u32 = 10;
 
 /// Delay between retry attempts (in milliseconds).
-const LIST_BATCHES_RETRY_DELAY_MS: u64 = 1000;
+const LIST_BATCHES_RETRY_DELAY_MS: u64 = 2000;
 
 /// Number of retry attempts when a batch is not found (eventual consistency).
 /// This handles the case where a batch was just submitted but isn't visible yet.
@@ -32,6 +33,98 @@ const BATCH_NOT_FOUND_MAX_RETRIES: u32 = 2;
 /// Delay between retries when batch not found (in milliseconds).
 /// Longer than API error retries since we're waiting for eventual consistency.
 const BATCH_NOT_FOUND_RETRY_DELAY_MS: u64 = 5000;
+
+/// Matched batch information extracted from OpenAI batch metadata.
+#[derive(Default)]
+struct BatchMatch {
+    batch_id: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    comment_id: Option<u64>,
+    check_run_id: Option<u64>,
+    /// Branch name from batch metadata (key: "branch")
+    branch_name: Option<String>,
+    /// Pull request URL from batch metadata (key: "pull_request_url")
+    pr_url: Option<String>,
+}
+
+/// Returns true if the batch status indicates it's still in-flight (not terminal).
+fn is_in_flight_status(status: &str) -> bool {
+    matches!(status, "validating" | "in_progress" | "finalizing")
+}
+
+/// Compare two batches and return true if `new` should replace `existing`.
+/// Prefers in-flight batches over terminal, and newer batches within the same category.
+fn should_replace_batch(
+    existing_status: &str,
+    existing_created_at: u64,
+    new_status: &str,
+    new_created_at: u64,
+) -> bool {
+    let existing_in_flight = is_in_flight_status(existing_status);
+    let new_in_flight = is_in_flight_status(new_status);
+
+    match (existing_in_flight, new_in_flight) {
+        // New is in-flight, existing is terminal -> replace
+        (false, true) => true,
+        // Both in same category -> prefer newer
+        (true, true) | (false, false) => new_created_at > existing_created_at,
+        // Existing is in-flight, new is terminal -> keep existing
+        (true, false) => false,
+    }
+}
+
+/// Find the best matching batch for a token from a list of batches.
+/// Returns None if no batch matches the token.
+/// When multiple batches match, prefers in-flight over terminal, and newer over older.
+fn find_best_batch_for_token(
+    batches: &[robocop_core::openai::BatchResponse],
+    token: &str,
+) -> Option<BatchMatch> {
+    let mut best: Option<(BatchMatch, String, u64)> = None; // (match, status, created_at)
+
+    for batch in batches {
+        if let Some(metadata) = &batch.metadata {
+            if metadata.get("reconciliation_token").map(|t| t.as_str()) == Some(token) {
+                let dominated = match &best {
+                    None => false,
+                    Some((_, existing_status, existing_created_at)) => !should_replace_batch(
+                        existing_status,
+                        *existing_created_at,
+                        &batch.status,
+                        batch.created_at,
+                    ),
+                };
+
+                if !dominated {
+                    let branch_name = metadata.get("branch").and_then(|b| {
+                        if b == "<no branch>" {
+                            None
+                        } else {
+                            Some(b.clone())
+                        }
+                    });
+
+                    best = Some((
+                        BatchMatch {
+                            batch_id: batch.id.clone(),
+                            model: metadata.get("model").cloned(),
+                            reasoning_effort: metadata.get("reasoning_effort").cloned(),
+                            comment_id: metadata.get("comment_id").and_then(|s| s.parse().ok()),
+                            check_run_id: metadata.get("check_run_id").and_then(|s| s.parse().ok()),
+                            branch_name,
+                            pr_url: metadata.get("pull_request_url").cloned(),
+                        },
+                        batch.status.clone(),
+                        batch.created_at,
+                    ));
+                }
+            }
+        }
+    }
+
+    best.map(|(m, _, _)| m)
+}
 
 /// Reconcile any PRs stuck in BatchSubmitting state after a crash.
 ///
@@ -184,50 +277,13 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
     );
 
     // Match batches to PRs by reconciliation_token
-    // We store (batch_id, model, reasoning_effort, comment_id, check_run_id, branch_name, pr_url)
-    #[derive(Default)]
-    struct BatchMatch {
-        batch_id: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        comment_id: Option<u64>,
-        check_run_id: Option<u64>,
-        /// Branch name from batch metadata (key: "branch")
-        branch_name: Option<String>,
-        /// Pull request URL from batch metadata (key: "pull_request_url")
-        pr_url: Option<String>,
-    }
-
+    // For each token, find the best matching batch (preferring in-flight over terminal,
+    // and newer over older within the same category)
     let mut matched_tokens: HashMap<String, BatchMatch> = HashMap::new();
 
-    for batch in &all_batches {
-        if let Some(metadata) = &batch.metadata {
-            if let Some(token) = metadata.get("reconciliation_token") {
-                if token_to_pr.contains_key(token) {
-                    // Found a match!
-                    // Extract branch_name, treating "<no branch>" as None
-                    let branch_name = metadata.get("branch").and_then(|b| {
-                        if b == "<no branch>" {
-                            None
-                        } else {
-                            Some(b.clone())
-                        }
-                    });
-
-                    matched_tokens.insert(
-                        token.clone(),
-                        BatchMatch {
-                            batch_id: batch.id.clone(),
-                            model: metadata.get("model").cloned(),
-                            reasoning_effort: metadata.get("reasoning_effort").cloned(),
-                            comment_id: metadata.get("comment_id").and_then(|s| s.parse().ok()),
-                            check_run_id: metadata.get("check_run_id").and_then(|s| s.parse().ok()),
-                            branch_name,
-                            pr_url: metadata.get("pull_request_url").cloned(),
-                        },
-                    );
-                }
-            }
+    for token in token_to_pr.keys() {
+        if let Some(batch_match) = find_best_batch_for_token(&all_batches, token) {
+            matched_tokens.insert(token.clone(), batch_match);
         }
     }
 
@@ -327,36 +383,12 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
                 }
 
                 // Search for our token in the fresh batch list
-                for batch in &retry_batches {
-                    if let Some(metadata) = &batch.metadata {
-                        if metadata.get("reconciliation_token") == Some(&token) {
-                            let branch_name = metadata.get("branch").and_then(|b| {
-                                if b == "<no branch>" {
-                                    None
-                                } else {
-                                    Some(b.clone())
-                                }
-                            });
-
-                            found_match = Some(BatchMatch {
-                                batch_id: batch.id.clone(),
-                                model: metadata.get("model").cloned(),
-                                reasoning_effort: metadata.get("reasoning_effort").cloned(),
-                                comment_id: metadata.get("comment_id").and_then(|s| s.parse().ok()),
-                                check_run_id: metadata
-                                    .get("check_run_id")
-                                    .and_then(|s| s.parse().ok()),
-                                branch_name,
-                                pr_url: metadata.get("pull_request_url").cloned(),
-                            });
-
-                            info!(
-                                "Reconciliation: Found batch {} for PR #{} on retry {}",
-                                batch.id, pr_id.pr_number, retry
-                            );
-                            break;
-                        }
-                    }
+                if let Some(batch_match) = find_best_batch_for_token(&retry_batches, &token) {
+                    info!(
+                        "Reconciliation: Found batch {} for PR #{} on retry {}",
+                        batch_match.batch_id, pr_id.pr_number, retry
+                    );
+                    found_match = Some(batch_match);
                 }
 
                 if found_match.is_some() {
@@ -528,5 +560,55 @@ mod tests {
             }
         });
         assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn test_is_in_flight_status() {
+        // In-flight statuses
+        assert!(is_in_flight_status("validating"));
+        assert!(is_in_flight_status("in_progress"));
+        assert!(is_in_flight_status("finalizing"));
+
+        // Terminal statuses
+        assert!(!is_in_flight_status("completed"));
+        assert!(!is_in_flight_status("failed"));
+        assert!(!is_in_flight_status("cancelled"));
+        assert!(!is_in_flight_status("expired"));
+        assert!(!is_in_flight_status("cancelling"));
+    }
+
+    #[test]
+    fn test_should_replace_batch_prefers_in_flight() {
+        // In-flight beats terminal, regardless of age
+        assert!(should_replace_batch("completed", 200, "in_progress", 100));
+        assert!(should_replace_batch("failed", 200, "validating", 100));
+        assert!(should_replace_batch("cancelled", 200, "finalizing", 100));
+
+        // Terminal does not beat in-flight, even if newer
+        assert!(!should_replace_batch("in_progress", 100, "completed", 200));
+        assert!(!should_replace_batch("validating", 100, "failed", 200));
+    }
+
+    #[test]
+    fn test_should_replace_batch_prefers_newer_within_category() {
+        // Among in-flight, prefer newer
+        assert!(should_replace_batch("in_progress", 100, "in_progress", 200));
+        assert!(!should_replace_batch(
+            "in_progress",
+            200,
+            "in_progress",
+            100
+        ));
+
+        // Among terminal, prefer newer
+        assert!(should_replace_batch("completed", 100, "failed", 200));
+        assert!(!should_replace_batch("failed", 200, "completed", 100));
+    }
+
+    #[test]
+    fn test_should_replace_batch_keeps_in_flight_over_newer_terminal() {
+        // Older in-flight should be kept over newer terminal
+        assert!(!should_replace_batch("in_progress", 100, "completed", 200));
+        assert!(!should_replace_batch("validating", 50, "failed", 300));
     }
 }
