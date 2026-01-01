@@ -54,7 +54,7 @@ impl StateRepository for InMemoryRepository {
         let states = self.states.read().await;
         states
             .iter()
-            .filter(|(_, stored)| stored.state.has_pending_batch())
+            .filter(|(_, stored)| stored.state.pending_batch_id().is_some())
             .map(|(id, stored)| (id.clone(), stored.clone()))
             .collect()
     }
@@ -64,8 +64,10 @@ impl StateRepository for InMemoryRepository {
 mod tests {
     use super::*;
     use crate::state_machine::state::{
-        BatchId, CheckRunId, CommentId, CommitSha, ReviewMachineState,
+        BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, FailureReason,
+        ReviewMachineState, ReviewOptions, ReviewResult,
     };
+    use proptest::prelude::*;
 
     fn test_pr_id(pr_number: u64) -> StateMachinePrId {
         StateMachinePrId::new("owner", "repo", pr_number)
@@ -148,5 +150,389 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0.pr_number, 2);
         assert_eq!(pending[0].1.installation_id, 222);
+    }
+
+    /// Regression test: Cancelled states with pending_cancel_batch_id must be
+    /// returned by get_pending() so that cancel-failed batches can still be polled.
+    ///
+    /// Bug: The original implementation filtered by has_pending_batch(), which
+    /// excluded Cancelled states. This meant batches where cancel failed would
+    /// never be reconciled.
+    #[tokio::test]
+    async fn test_get_pending_includes_cancelled_with_pending_batch() {
+        let repo = InMemoryRepository::new();
+
+        // Cancelled state WITH pending_cancel_batch_id - must be included
+        let cancelled_with_pending = StoredState {
+            state: ReviewMachineState::Cancelled {
+                reviews_enabled: true,
+                head_sha: CommitSha::from("abc123"),
+                reason: CancellationReason::Superseded {
+                    new_sha: CommitSha::from("def456"),
+                },
+                pending_cancel_batch_id: Some(BatchId::from("batch_cancel_pending".to_string())),
+            },
+            installation_id: 111,
+        };
+        repo.put(&test_pr_id(1), cancelled_with_pending).await;
+
+        // Cancelled state WITHOUT pending_cancel_batch_id - must NOT be included
+        let cancelled_without_pending = StoredState {
+            state: ReviewMachineState::Cancelled {
+                reviews_enabled: true,
+                head_sha: CommitSha::from("ghi789"),
+                reason: CancellationReason::UserRequested,
+                pending_cancel_batch_id: None,
+            },
+            installation_id: 222,
+        };
+        repo.put(&test_pr_id(2), cancelled_without_pending).await;
+
+        let pending = repo.get_pending().await;
+
+        assert_eq!(
+            pending.len(),
+            1,
+            "Only Cancelled with pending_cancel_batch_id should be returned"
+        );
+        assert_eq!(pending[0].0.pr_number, 1);
+        assert_eq!(pending[0].1.installation_id, 111);
+    }
+
+    // =========================================================================
+    // Property-based tests
+    // =========================================================================
+
+    /// Generate an arbitrary CommitSha.
+    fn arb_commit_sha() -> impl Strategy<Value = CommitSha> {
+        "[a-f0-9]{40}".prop_map(CommitSha)
+    }
+
+    /// Generate an arbitrary BatchId.
+    fn arb_batch_id() -> impl Strategy<Value = BatchId> {
+        "batch_[a-zA-Z0-9]{8}".prop_map(BatchId)
+    }
+
+    /// Generate an arbitrary CancellationReason.
+    fn arb_cancellation_reason() -> impl Strategy<Value = CancellationReason> {
+        prop_oneof![
+            Just(CancellationReason::UserRequested),
+            arb_commit_sha().prop_map(|sha| CancellationReason::Superseded { new_sha: sha }),
+            Just(CancellationReason::ReviewsDisabled),
+            Just(CancellationReason::External),
+            Just(CancellationReason::NoChanges),
+            Just(CancellationReason::DiffTooLarge),
+            Just(CancellationReason::NoFiles),
+        ]
+    }
+
+    /// Generate an arbitrary FailureReason.
+    fn arb_failure_reason() -> impl Strategy<Value = FailureReason> {
+        prop_oneof![
+            any::<Option<String>>().prop_map(|error| FailureReason::BatchFailed { error }),
+            Just(FailureReason::BatchExpired),
+            Just(FailureReason::BatchCancelled),
+            any::<String>().prop_map(|error| FailureReason::DownloadFailed { error }),
+            any::<String>().prop_map(|error| FailureReason::ParseFailed { error }),
+            Just(FailureReason::NoOutputFile),
+            any::<String>().prop_map(|error| FailureReason::SubmissionFailed { error }),
+            any::<String>().prop_map(|reason| FailureReason::DataFetchFailed { reason }),
+        ]
+    }
+
+    /// Generate an arbitrary ReviewResult.
+    fn arb_review_result() -> impl Strategy<Value = ReviewResult> {
+        (any::<String>(), any::<bool>(), any::<String>()).prop_map(
+            |(reasoning, substantive_comments, summary)| ReviewResult {
+                reasoning,
+                substantive_comments,
+                summary,
+            },
+        )
+    }
+
+    /// Generate an arbitrary ReviewOptions.
+    fn arb_review_options() -> impl Strategy<Value = ReviewOptions> {
+        (any::<Option<String>>(), any::<Option<String>>()).prop_map(|(model, reasoning_effort)| {
+            ReviewOptions {
+                model,
+                reasoning_effort,
+            }
+        })
+    }
+
+    /// Generate an arbitrary ReviewMachineState.
+    ///
+    /// This covers all state variants to ensure comprehensive testing.
+    fn arb_review_state() -> impl Strategy<Value = ReviewMachineState> {
+        prop_oneof![
+            // Idle - no pending batch
+            any::<bool>().prop_map(|reviews_enabled| ReviewMachineState::Idle { reviews_enabled }),
+            // Preparing - no pending batch
+            (
+                any::<bool>(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                arb_review_options()
+            )
+                .prop_map(|(reviews_enabled, head_sha, base_sha, options)| {
+                    ReviewMachineState::Preparing {
+                        reviews_enabled,
+                        head_sha,
+                        base_sha,
+                        options,
+                    }
+                }),
+            // AwaitingAncestryCheck - HAS pending batch
+            (
+                any::<bool>(),
+                arb_batch_id(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                any::<Option<u64>>(),
+                any::<Option<u64>>(),
+                any::<String>(),
+                any::<String>(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                arb_review_options(),
+            )
+                .prop_map(
+                    |(
+                        reviews_enabled,
+                        batch_id,
+                        head_sha,
+                        base_sha,
+                        comment_id,
+                        check_run_id,
+                        model,
+                        reasoning_effort,
+                        new_head_sha,
+                        new_base_sha,
+                        new_options,
+                    )| {
+                        ReviewMachineState::AwaitingAncestryCheck {
+                            reviews_enabled,
+                            batch_id,
+                            head_sha,
+                            base_sha,
+                            comment_id: comment_id.map(CommentId),
+                            check_run_id: check_run_id.map(CheckRunId),
+                            model,
+                            reasoning_effort,
+                            new_head_sha,
+                            new_base_sha,
+                            new_options,
+                        }
+                    }
+                ),
+            // BatchPending - HAS pending batch
+            (
+                any::<bool>(),
+                arb_batch_id(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                any::<Option<u64>>(),
+                any::<Option<u64>>(),
+                any::<String>(),
+                any::<String>(),
+            )
+                .prop_map(
+                    |(
+                        reviews_enabled,
+                        batch_id,
+                        head_sha,
+                        base_sha,
+                        comment_id,
+                        check_run_id,
+                        model,
+                        reasoning_effort,
+                    )| {
+                        ReviewMachineState::BatchPending {
+                            reviews_enabled,
+                            batch_id,
+                            head_sha,
+                            base_sha,
+                            comment_id: comment_id.map(CommentId),
+                            check_run_id: check_run_id.map(CheckRunId),
+                            model,
+                            reasoning_effort,
+                        }
+                    }
+                ),
+            // Completed - no pending batch
+            (any::<bool>(), arb_commit_sha(), arb_review_result()).prop_map(
+                |(reviews_enabled, head_sha, result)| ReviewMachineState::Completed {
+                    reviews_enabled,
+                    head_sha,
+                    result,
+                }
+            ),
+            // Failed - no pending batch
+            (any::<bool>(), arb_commit_sha(), arb_failure_reason()).prop_map(
+                |(reviews_enabled, head_sha, reason)| ReviewMachineState::Failed {
+                    reviews_enabled,
+                    head_sha,
+                    reason,
+                }
+            ),
+            // Cancelled without pending_cancel_batch_id - no pending batch
+            (any::<bool>(), arb_commit_sha(), arb_cancellation_reason()).prop_map(
+                |(reviews_enabled, head_sha, reason)| ReviewMachineState::Cancelled {
+                    reviews_enabled,
+                    head_sha,
+                    reason,
+                    pending_cancel_batch_id: None,
+                }
+            ),
+            // Cancelled WITH pending_cancel_batch_id - HAS pending batch
+            (
+                any::<bool>(),
+                arb_commit_sha(),
+                arb_cancellation_reason(),
+                arb_batch_id()
+            )
+                .prop_map(|(reviews_enabled, head_sha, reason, batch_id)| {
+                    ReviewMachineState::Cancelled {
+                        reviews_enabled,
+                        head_sha,
+                        reason,
+                        pending_cancel_batch_id: Some(batch_id),
+                    }
+                }),
+        ]
+    }
+
+    proptest! {
+        /// Property: get_pending() returns exactly those states where pending_batch_id().is_some().
+        ///
+        /// This is the key invariant that ensures:
+        /// 1. Active batches (BatchPending, AwaitingAncestryCheck) are polled
+        /// 2. Cancel-failed batches (Cancelled with pending_cancel_batch_id) are polled
+        /// 3. Terminal states without pending batches are NOT polled
+        #[test]
+        fn get_pending_matches_pending_batch_id(states in proptest::collection::vec((0u64..1000, arb_review_state(), 1u64..1000000), 0..50)) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let repo = InMemoryRepository::new();
+
+                // Insert all states
+                for (pr_number, state, installation_id) in &states {
+                    let pr_id = test_pr_id(*pr_number);
+                    let stored = StoredState {
+                        state: state.clone(),
+                        installation_id: *installation_id,
+                    };
+                    repo.put(&pr_id, stored).await;
+                }
+
+                // Get pending states
+                let pending = repo.get_pending().await;
+
+                // Property: each returned state must have pending_batch_id().is_some()
+                for (pr_id, stored) in &pending {
+                    assert!(
+                        stored.state.pending_batch_id().is_some(),
+                        "get_pending() returned state without pending batch: PR #{}, state {:?}",
+                        pr_id.pr_number,
+                        stored.state
+                    );
+                }
+
+                // Property: count matches expected
+                // Note: multiple states with same pr_number will overwrite, so we need to
+                // check what's actually in the repository
+                let expected_pending: usize = {
+                    let mut seen = std::collections::HashMap::new();
+                    for (pr_number, state, installation_id) in &states {
+                        seen.insert(*pr_number, (state.clone(), *installation_id));
+                    }
+                    seen.values()
+                        .filter(|(state, _)| state.pending_batch_id().is_some())
+                        .count()
+                };
+
+                assert_eq!(
+                    pending.len(),
+                    expected_pending,
+                    "get_pending() returned {} states but expected {}",
+                    pending.len(),
+                    expected_pending
+                );
+            });
+        }
+
+        /// Property: pending_batch_id().is_some() ⟺ state should be returned by get_pending()
+        ///
+        /// This is a more direct test of the invariant for single states.
+        #[test]
+        fn single_state_pending_invariant(state in arb_review_state(), installation_id in 1u64..1000000) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let repo = InMemoryRepository::new();
+                let pr_id = test_pr_id(1);
+                let stored = StoredState {
+                    state: state.clone(),
+                    installation_id,
+                };
+
+                repo.put(&pr_id, stored).await;
+
+                let pending = repo.get_pending().await;
+                let has_pending_batch = state.pending_batch_id().is_some();
+                let was_returned = !pending.is_empty();
+
+                assert_eq!(
+                    has_pending_batch,
+                    was_returned,
+                    "State has pending_batch_id: {}, but get_pending() returned: {}.\nState: {:?}",
+                    has_pending_batch,
+                    was_returned,
+                    state
+                );
+            });
+        }
+    }
+
+    /// Test to verify the arb_review_state() generator produces states with and without
+    /// pending batches, ensuring the property tests are actually exploring both cases.
+    #[test]
+    fn arb_review_state_covers_both_pending_cases() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let mut runner = TestRunner::new(Config::default());
+        let mut with_pending = 0u32;
+        let mut without_pending = 0u32;
+
+        // Generate 200 states and count distribution
+        for _ in 0..200 {
+            let state = arb_review_state().new_tree(&mut runner).unwrap().current();
+            if state.pending_batch_id().is_some() {
+                with_pending += 1;
+            } else {
+                without_pending += 1;
+            }
+        }
+
+        // Assert reasonable distribution (at least 20% of each)
+        let total = with_pending + without_pending;
+        let with_pending_pct = (with_pending as f64 / total as f64) * 100.0;
+        let without_pending_pct = (without_pending as f64 / total as f64) * 100.0;
+
+        assert!(
+            with_pending_pct >= 20.0,
+            "Generator produced too few states with pending batches: {:.1}% ({}/{})",
+            with_pending_pct,
+            with_pending,
+            total
+        );
+        assert!(
+            without_pending_pct >= 20.0,
+            "Generator produced too few states without pending batches: {:.1}% ({}/{})",
+            without_pending_pct,
+            without_pending,
+            total
+        );
     }
 }

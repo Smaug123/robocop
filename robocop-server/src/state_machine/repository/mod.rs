@@ -42,7 +42,11 @@ pub trait StateRepository: Send + Sync {
 
     /// Get all states with pending batches.
     ///
-    /// Returns states where `ReviewMachineState::has_pending_batch()` is true.
+    /// Returns states where `ReviewMachineState::pending_batch_id()` is `Some`.
+    /// This includes:
+    /// - `BatchPending` and `AwaitingAncestryCheck` (active batches)
+    /// - `Cancelled` with `pending_cancel_batch_id` (cancel-failed batches that may complete)
+    ///
     /// Used by the polling loop to discover batches that need status checks.
     async fn get_pending(&self) -> Vec<(StateMachinePrId, StoredState)>;
 }
