@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 216b9c7385a233df47b6ac98cd2fb17a766879ecab1c48a9396b805f92c9aae8 # shrinks to states = []
+cc 5e9078a10e8c14a7da684bab660e13ecfba8845b11022cbd748ec008de74254c # shrinks to states = []
+cc a42bf6545bc69a544feeeb036f54f40f04d627b2bdd3f446620a02382e6a97a2 # shrinks to state = AwaitingAncestryCheck { reviews_enabled: false, batch_id: BatchId("batch_a00a000A"), head_sha: CommitSha("a0a0aaaaaaa0a00a0aa000000aaaaa0a0aaaaa0a"), base_sha: CommitSha("000000000a000a0d8cbc1f4c28b0e6b50cff0af1"), comment_id: Some(CommentId(15925417729578713007)), check_run_id: Some(CheckRunId(14157936816870304419)), model: "\"𖹻<ㇲￅ𖿡ùῗ𞸵", reasoning_effort: "‥!Ⱥ�.yఌ𓑂ñ", new_head_sha: CommitSha("025e53cd90acfc9ca071b3986c608d0dbc5d97b3"), new_base_sha: CommitSha("c9cd35cbd4408d6ece1b1b8e503d74e28ccbb39a"), new_options: ReviewOptions { model: Some("ᎍ{๏ຄ\\?>$𐕴"), reasoning_effort: None } }, installation_id = Some(192449)

@@ -102,10 +102,38 @@ impl SqliteRepository {
             }
         }
 
-        // Configure durability settings
+        // Configure durability settings.
+        // We must verify WAL mode was actually enabled - SQLite can silently keep
+        // DELETE mode on some filesystems (e.g., network filesystems that don't
+        // support shared memory), which would violate our durability/concurrency
+        // assumptions.
+        //
+        // For in-memory databases (:memory:), SQLite returns "memory" as the journal
+        // mode, which is expected - there's no durability concern since in-memory
+        // databases are ephemeral by design.
+        let is_in_memory = path_str == ":memory:";
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(|e| RepositoryError::storage("set journal_mode", e.to_string()))?;
+
+        let journal_mode_ok = journal_mode.eq_ignore_ascii_case("wal")
+            || (is_in_memory && journal_mode.eq_ignore_ascii_case("memory"));
+
+        if !journal_mode_ok {
+            return Err(RepositoryError::storage(
+                "configure journal_mode",
+                format!(
+                    "Failed to enable WAL mode: SQLite returned '{}' instead of 'wal'. \
+                     This can happen on filesystems that don't support shared memory \
+                     (e.g., some network filesystems). The database requires WAL mode \
+                     for durability and concurrency guarantees.",
+                    journal_mode
+                ),
+            ));
+        }
+
         conn.execute_batch(
             r#"
-            PRAGMA journal_mode = WAL;
             PRAGMA synchronous = FULL;
             PRAGMA busy_timeout = 5000;
             "#,
