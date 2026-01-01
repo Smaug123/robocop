@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::env;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct Config {
@@ -11,6 +12,9 @@ pub struct Config {
     pub port: u16,
     pub recording_enabled: bool,
     pub recording_log_path: String,
+    /// Directory for persistent state (SQLite database).
+    /// Defaults to current working directory.
+    pub state_dir: PathBuf,
 }
 
 impl Config {
@@ -48,6 +52,10 @@ impl Config {
         let recording_log_path =
             env::var("RECORDING_LOG_PATH").unwrap_or_else(|_| "recordings.jsonl".to_string());
 
+        let state_dir = env::var("STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+
         Ok(Config {
             github_app_id,
             github_private_key,
@@ -57,6 +65,7 @@ impl Config {
             port,
             recording_enabled,
             recording_log_path,
+            state_dir,
         })
     }
 }

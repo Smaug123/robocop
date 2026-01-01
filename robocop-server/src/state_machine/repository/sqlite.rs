@@ -1,16 +1,35 @@
 //! SQLite implementation of `StateRepository`.
 //!
 //! This provides persistent storage that survives service restarts.
+//!
+//! # Schema Versioning
+//!
+//! The database has a `schema_version` table that tracks the schema version.
+//! When the schema needs to change, increment `CURRENT_SCHEMA_VERSION` and add
+//! a migration in `run_migrations()`. Migrations run sequentially from the
+//! current version to the target version.
+//!
+//! # Forward Compatibility
+//!
+//! When adding new fields to `ReviewMachineState`, use `#[serde(default)]` to
+//! ensure old persisted states can still be deserialized. When removing fields
+//! or changing types in breaking ways, consider adding a migration that updates
+//! or quarantines incompatible rows.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
+use tracing::{error, warn};
 
 use super::{RepositoryError, StateRepository, StoredState};
 use crate::state_machine::state::ReviewMachineState;
 use crate::state_machine::store::StateMachinePrId;
+
+/// Current schema version. Increment this when making schema changes and add
+/// corresponding migration logic in `run_migrations()`.
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 /// SQLite-backed state repository.
 ///
@@ -25,35 +44,128 @@ impl SqliteRepository {
     /// Create a new SQLite repository at the given path.
     ///
     /// Creates the database file and schema if they don't exist.
+    /// Runs any pending migrations if the database exists but has an older schema.
+    ///
+    /// # Durability
+    ///
+    /// The database is configured with:
+    /// - `journal_mode = WAL` for better concurrency and crash safety
+    /// - `synchronous = NORMAL` for a good balance of durability and performance
+    /// - `busy_timeout = 5000ms` to handle concurrent access gracefully
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
-        let conn = Connection::open(path)
+        let path_ref = path.as_ref();
+
+        // Ensure parent directory exists (unless it's :memory: or empty path)
+        let path_str = path_ref.to_string_lossy();
+        if path_str != ":memory:" && !path_str.is_empty() {
+            if let Some(parent) = path_ref.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        RepositoryError::storage(
+                            "create database directory",
+                            format!("{}: {}", parent.display(), e),
+                        )
+                    })?;
+                }
+            }
+        }
+
+        let conn = Connection::open(path_ref)
             .map_err(|e| RepositoryError::storage("open database", e.to_string()))?;
 
-        // Create schema
+        // Configure durability settings
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS pr_states (
-                repo_owner TEXT NOT NULL,
-                repo_name TEXT NOT NULL,
-                pr_number INTEGER NOT NULL,
-                state_json TEXT NOT NULL,
-                installation_id INTEGER,
-                has_pending_batch INTEGER NOT NULL DEFAULT 0,
-                is_batch_submitting INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (repo_owner, repo_name, pr_number)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_pending
-                ON pr_states(has_pending_batch) WHERE has_pending_batch = 1;
-            CREATE INDEX IF NOT EXISTS idx_submitting
-                ON pr_states(is_batch_submitting) WHERE is_batch_submitting = 1;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
             "#,
         )
-        .map_err(|e| RepositoryError::storage("create schema", e.to_string()))?;
+        .map_err(|e| RepositoryError::storage("configure pragmas", e.to_string()))?;
+
+        // Create schema version table if it doesn't exist
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
+            );
+            "#,
+        )
+        .map_err(|e| RepositoryError::storage("create schema_version table", e.to_string()))?;
+
+        // Get current version (0 if table is empty = fresh database)
+        let current_version: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| RepositoryError::storage("get schema version", e.to_string()))?
+            .unwrap_or(0);
+
+        // Run migrations
+        Self::run_migrations(&conn, current_version)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Run migrations from `from_version` to `CURRENT_SCHEMA_VERSION`.
+    fn run_migrations(conn: &Connection, from_version: i64) -> Result<(), RepositoryError> {
+        if from_version > CURRENT_SCHEMA_VERSION {
+            return Err(RepositoryError::storage(
+                "schema version",
+                format!(
+                    "Database schema version {} is newer than supported version {}. \
+                     Please upgrade the application.",
+                    from_version, CURRENT_SCHEMA_VERSION
+                ),
+            ));
+        }
+
+        if from_version == CURRENT_SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        // Migration from version 0 (fresh database) to version 1
+        if from_version < 1 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS pr_states (
+                    repo_owner TEXT NOT NULL,
+                    repo_name TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    state_json TEXT NOT NULL,
+                    installation_id INTEGER,
+                    has_pending_batch INTEGER NOT NULL DEFAULT 0,
+                    is_batch_submitting INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (repo_owner, repo_name, pr_number)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pending
+                    ON pr_states(has_pending_batch) WHERE has_pending_batch = 1;
+                CREATE INDEX IF NOT EXISTS idx_submitting
+                    ON pr_states(is_batch_submitting) WHERE is_batch_submitting = 1;
+                "#,
+            )
+            .map_err(|e| RepositoryError::storage("migration v1", e.to_string()))?;
+        }
+
+        // Future migrations would go here:
+        // if from_version < 2 { ... }
+        // if from_version < 3 { ... }
+
+        // Update schema version
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?1)",
+            params![CURRENT_SCHEMA_VERSION],
+        )
+        .map_err(|e| RepositoryError::storage("update schema version", e.to_string()))?;
+
+        Ok(())
     }
 
     /// Create a new in-memory SQLite repository (for testing).
@@ -201,11 +313,29 @@ impl StateRepository for SqliteRepository {
 
             let mut results = Vec::new();
             for row in rows {
-                let (owner, name, pr_num, json, installation_id) =
-                    row.map_err(|e| RepositoryError::storage("get_pending", e.to_string()))?;
+                // Skip rows that fail to read from SQLite
+                let (owner, name, pr_num, json, installation_id) = match row {
+                    Ok(data) => data,
+                    Err(e) => {
+                        error!("Failed to read pending row from SQLite: {}", e);
+                        continue;
+                    }
+                };
 
-                let state: ReviewMachineState = serde_json::from_str(&json)
-                    .map_err(|_| RepositoryError::corruption("state JSON"))?;
+                // Skip rows that fail to deserialize - this allows recovery to proceed
+                // for other PRs even if one row is corrupt. Log the error for investigation.
+                let state: ReviewMachineState = match serde_json::from_str(&json) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "Skipping corrupt state for PR {}/{} #{}: {}. \
+                             This row may need manual investigation or will be overwritten \
+                             on next state update.",
+                            owner, name, pr_num, e
+                        );
+                        continue;
+                    }
+                };
 
                 let id = StateMachinePrId::new(owner, name, pr_num as u64);
                 results.push((
@@ -252,11 +382,29 @@ impl StateRepository for SqliteRepository {
 
             let mut results = Vec::new();
             for row in rows {
-                let (owner, name, pr_num, json, installation_id) =
-                    row.map_err(|e| RepositoryError::storage("get_submitting", e.to_string()))?;
+                // Skip rows that fail to read from SQLite
+                let (owner, name, pr_num, json, installation_id) = match row {
+                    Ok(data) => data,
+                    Err(e) => {
+                        error!("Failed to read submitting row from SQLite: {}", e);
+                        continue;
+                    }
+                };
 
-                let state: ReviewMachineState = serde_json::from_str(&json)
-                    .map_err(|_| RepositoryError::corruption("state JSON"))?;
+                // Skip rows that fail to deserialize - this allows recovery to proceed
+                // for other PRs even if one row is corrupt. Log the error for investigation.
+                let state: ReviewMachineState = match serde_json::from_str(&json) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "Skipping corrupt state for PR {}/{} #{}: {}. \
+                             This row may need manual investigation or will be overwritten \
+                             on next state update.",
+                            owner, name, pr_num, e
+                        );
+                        continue;
+                    }
+                };
 
                 let id = StateMachinePrId::new(owner, name, pr_num as u64);
                 results.push((
@@ -875,5 +1023,284 @@ mod tests {
                 assert_eq!(retrieved.installation_id, installation_id, "installation_id round-trip failed");
             });
         }
+
+        /// Property: on-disk persistence survives close and reopen.
+        ///
+        /// This is the core durability property: any state written to disk must
+        /// be retrievable after closing and reopening the database.
+        #[test]
+        fn on_disk_persistence_survives_reopen(state in arb_review_state(), installation_id in proptest::option::of(1u64..1000000)) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let temp_dir = tempfile::tempdir().unwrap();
+                let db_path = temp_dir.path().join("test.db");
+                let pr_id = test_pr_id(42);
+
+                let stored = StoredState {
+                    state: state.clone(),
+                    installation_id,
+                };
+
+                // Write state and close repository
+                {
+                    let repo = SqliteRepository::new(&db_path).unwrap();
+                    repo.put(&pr_id, stored.clone()).await.unwrap();
+                    // repo is dropped here, simulating a process restart
+                }
+
+                // Reopen and verify
+                {
+                    let repo = SqliteRepository::new(&db_path).unwrap();
+                    let retrieved = repo.get(&pr_id).await.unwrap();
+
+                    assert!(
+                        retrieved.is_some(),
+                        "State was not persisted across database close/reopen.\n\
+                         Expected: Some(StoredState {{ state: {:?}, installation_id: {:?} }})\n\
+                         Got: None",
+                        state, installation_id
+                    );
+
+                    let retrieved = retrieved.unwrap();
+                    assert_eq!(
+                        retrieved.state, state,
+                        "State changed after database close/reopen"
+                    );
+                    assert_eq!(
+                        retrieved.installation_id, installation_id,
+                        "installation_id changed after database close/reopen"
+                    );
+                }
+            });
+        }
+    }
+
+    // =========================================================================
+    // On-disk persistence tests
+    // =========================================================================
+
+    /// Test that states persist across database close and reopen.
+    ///
+    /// This is the core durability test: write state, close DB, reopen, verify.
+    #[tokio::test]
+    async fn test_on_disk_persistence_basic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let pr_id = test_pr_id(1);
+
+        // Write state and close repository
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            repo.put(&pr_id, pending_state(12345)).await.unwrap();
+            // repo is dropped here
+        }
+
+        // Reopen and verify
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let retrieved = repo.get(&pr_id).await.unwrap();
+            assert!(retrieved.is_some(), "State should persist after reopen");
+            assert_eq!(retrieved.unwrap().installation_id, Some(12345));
+        }
+    }
+
+    /// Test that get_pending works correctly after reopen.
+    #[tokio::test]
+    async fn test_on_disk_get_pending_after_reopen() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Write multiple states
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+            repo.put(&test_pr_id(2), pending_state(222)).await.unwrap();
+            repo.put(&test_pr_id(3), pending_state(333)).await.unwrap();
+        }
+
+        // Reopen and verify get_pending returns correct states
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let pending = repo.get_pending().await.unwrap();
+
+            assert_eq!(
+                pending.len(),
+                2,
+                "Should have 2 pending states after reopen"
+            );
+
+            let pr_numbers: Vec<_> = pending.iter().map(|(id, _)| id.pr_number).collect();
+            assert!(pr_numbers.contains(&2));
+            assert!(pr_numbers.contains(&3));
+        }
+    }
+
+    /// Test that get_submitting works correctly after reopen.
+    #[tokio::test]
+    async fn test_on_disk_get_submitting_after_reopen() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Write states including BatchSubmitting
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+            repo.put(&test_pr_id(2), submitting_state(222))
+                .await
+                .unwrap();
+            repo.put(&test_pr_id(3), pending_state(333)).await.unwrap();
+        }
+
+        // Reopen and verify get_submitting returns correct states
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let submitting = repo.get_submitting().await.unwrap();
+
+            assert_eq!(
+                submitting.len(),
+                1,
+                "Should have 1 submitting state after reopen"
+            );
+            assert_eq!(submitting[0].0.pr_number, 2);
+        }
+    }
+
+    /// Test that parent directory is created if it doesn't exist.
+    #[tokio::test]
+    async fn test_creates_parent_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("nested")
+            .join("deeply")
+            .join("test.db");
+
+        // The parent directory doesn't exist yet
+        assert!(!db_path.parent().unwrap().exists());
+
+        let repo = SqliteRepository::new(&db_path).unwrap();
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+
+        // Now parent directory should exist
+        assert!(db_path.exists());
+    }
+
+    /// Test schema version tracking.
+    #[tokio::test]
+    async fn test_schema_version_persisted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create database
+        {
+            let _repo = SqliteRepository::new(&db_path).unwrap();
+        }
+
+        // Verify schema version was written
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let version: i64 = conn
+                .query_row(
+                    "SELECT version FROM schema_version WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        }
+    }
+
+    /// Test that corrupt rows are skipped in get_pending.
+    #[tokio::test]
+    async fn test_corrupt_row_skipped_in_get_pending() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create database and insert valid state
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            repo.put(&test_pr_id(1), pending_state(111)).await.unwrap();
+        }
+
+        // Manually insert a corrupt row directly into SQLite
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO pr_states (repo_owner, repo_name, pr_number, state_json, installation_id, has_pending_batch, is_batch_submitting) \
+                 VALUES ('owner', 'repo', 2, 'not valid json', 222, 1, 0)",
+                [],
+            ).unwrap();
+        }
+
+        // get_pending should return the valid row and skip the corrupt one
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let pending = repo.get_pending().await.unwrap();
+
+            assert_eq!(
+                pending.len(),
+                1,
+                "Should skip corrupt row and return only valid state"
+            );
+            assert_eq!(pending[0].0.pr_number, 1);
+        }
+    }
+
+    /// Test that corrupt rows are skipped in get_submitting.
+    #[tokio::test]
+    async fn test_corrupt_row_skipped_in_get_submitting() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create database and insert valid state
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            repo.put(&test_pr_id(1), submitting_state(111))
+                .await
+                .unwrap();
+        }
+
+        // Manually insert a corrupt row directly into SQLite
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO pr_states (repo_owner, repo_name, pr_number, state_json, installation_id, has_pending_batch, is_batch_submitting) \
+                 VALUES ('owner', 'repo', 2, '{\"invalid\": \"state\"}', 222, 0, 1)",
+                [],
+            ).unwrap();
+        }
+
+        // get_submitting should return the valid row and skip the corrupt one
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let submitting = repo.get_submitting().await.unwrap();
+
+            assert_eq!(
+                submitting.len(),
+                1,
+                "Should skip corrupt row and return only valid state"
+            );
+            assert_eq!(submitting[0].0.pr_number, 1);
+        }
+    }
+
+    /// Test that WAL mode is enabled for durability.
+    #[tokio::test]
+    async fn test_wal_mode_enabled() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        let _repo = SqliteRepository::new(&db_path).unwrap();
+
+        // Verify WAL mode
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "wal",
+            "Database should be in WAL mode"
+        );
     }
 }

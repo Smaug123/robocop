@@ -1583,6 +1583,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "task-local-extensions",
+ "tempfile",
  "tokio",
  "tokio-test",
  "tower",

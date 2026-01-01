@@ -93,6 +93,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
             ],
             "optional_env_vars": [
                 "PORT (default: 3000)",
+                "STATE_DIR (default: current directory)",
                 "RECORDING_ENABLED (default: false)",
                 "RECORDING_LOG_PATH (default: recordings.jsonl)"
             ]
@@ -152,8 +153,10 @@ async fn main() -> Result<()> {
             .map(|l: &RecordingLogger| l.clone_for_middleware()),
     );
 
+    let db_path = config.state_dir.join("robocop-state.db");
+    info!("Using state database: {}", db_path.display());
     let sqlite_repo =
-        SqliteRepository::new("./robocop-state.db").expect("Failed to initialize SQLite database");
+        SqliteRepository::new(&db_path).expect("Failed to initialize SQLite database");
 
     let app_state = Arc::new(AppState {
         github_client: Arc::new(github_client),
