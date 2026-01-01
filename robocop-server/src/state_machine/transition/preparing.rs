@@ -29,6 +29,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             Event::DataFetched {
                 diff,
                 file_contents,
+                reconciliation_token,
             },
         ) => {
             let file_contents_tuples: Vec<(String, String)> = file_contents
@@ -36,8 +37,9 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 .map(|fc| (fc.path, fc.content))
                 .collect();
 
-            // Generate reconciliation token for crash recovery
-            let reconciliation_token = uuid::Uuid::new_v4().to_string();
+            // Use the deterministic reconciliation token from the event.
+            // This token is derived from PR identity + head_sha, ensuring retries
+            // for the same PR+commit use the same token and can find existing batches.
 
             // Extract model and reasoning effort with defaults
             let model = options

@@ -52,6 +52,11 @@ pub enum Event {
     DataFetched {
         diff: String,
         file_contents: Vec<FileContent>,
+        /// Deterministic reconciliation token for crash recovery.
+        /// Generated from PR identity (installation_id, repo, pr_number) + head_sha.
+        /// Using a deterministic token ensures retries for the same PR+commit
+        /// will look for the same batch, preventing duplicate batch submissions.
+        reconciliation_token: String,
     },
 
     /// Failed to fetch data (empty diff, too large, fetch error, etc.).
@@ -195,11 +200,13 @@ impl Event {
             Event::DataFetched {
                 diff,
                 file_contents,
+                reconciliation_token,
             } => {
                 format!(
-                    "DataFetched {{ diff_len: {}, file_count: {} }}",
+                    "DataFetched {{ diff_len: {}, file_count: {}, token: {}... }}",
                     diff.len(),
-                    file_contents.len()
+                    file_contents.len(),
+                    &reconciliation_token[..8.min(reconciliation_token.len())]
                 )
             }
             Event::DataFetchFailed { reason } => {

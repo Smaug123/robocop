@@ -2408,12 +2408,18 @@ mod property_tests {
             ),
             Just(Event::DisableReviewsRequested),
             // Data fetch results
-            (".*", proptest::collection::vec(arb_file_content(), 0..5)).prop_map(
-                |(diff, file_contents)| Event::DataFetched {
-                    diff,
-                    file_contents
-                }
-            ),
+            (
+                ".*",
+                proptest::collection::vec(arb_file_content(), 0..5),
+                "[a-f0-9]{32}"
+            )
+                .prop_map(|(diff, file_contents, reconciliation_token)| {
+                    Event::DataFetched {
+                        diff,
+                        file_contents,
+                        reconciliation_token,
+                    }
+                }),
             arb_data_fetch_failure().prop_map(|reason| Event::DataFetchFailed { reason }),
             // Batch submission results
             (
@@ -2584,12 +2590,18 @@ mod property_tests {
                 }),
             Just(Event::DisableReviewsRequested),
             // Data fetch results
-            (".*", proptest::collection::vec(arb_file_content(), 0..5)).prop_map(
-                |(diff, file_contents)| Event::DataFetched {
-                    diff,
-                    file_contents
-                }
-            ),
+            (
+                ".*",
+                proptest::collection::vec(arb_file_content(), 0..5),
+                "[a-f0-9]{32}"
+            )
+                .prop_map(|(diff, file_contents, reconciliation_token)| {
+                    Event::DataFetched {
+                        diff,
+                        file_contents,
+                        reconciliation_token,
+                    }
+                }),
             arb_data_fetch_failure().prop_map(|reason| Event::DataFetchFailed { reason }),
             // Batch submission results
             (

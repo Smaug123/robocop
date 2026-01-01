@@ -279,10 +279,57 @@ async fn execute_fetch_data(
         .map(|(path, content)| FileContent { path, content })
         .collect();
 
+    // Generate a deterministic reconciliation token based on PR identity + commit.
+    // This ensures that retries for the same PR+commit will use the same token,
+    // preventing duplicate batch submissions when reconciliation fails to find
+    // a batch that was actually submitted.
+    let reconciliation_token = generate_reconciliation_token(
+        ctx.installation_id,
+        &ctx.repo_owner,
+        &ctx.repo_name,
+        ctx.pr_number,
+        &head_sha.0,
+    );
+
     EffectResult::single(Event::DataFetched {
         diff,
         file_contents,
+        reconciliation_token,
     })
+}
+
+/// Generate a deterministic reconciliation token for crash recovery.
+///
+/// The token is derived from:
+/// - installation_id: Identifies the GitHub App installation
+/// - repo_owner/repo_name: Identifies the repository
+/// - pr_number: Identifies the pull request
+/// - head_sha: The commit being reviewed
+///
+/// Using SHA256 ensures a consistent, collision-resistant token that will be
+/// identical across server restarts and retries for the same PR+commit.
+fn generate_reconciliation_token(
+    installation_id: u64,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+    head_sha: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(installation_id.to_le_bytes());
+    hasher.update(repo_owner.as_bytes());
+    hasher.update(b"/");
+    hasher.update(repo_name.as_bytes());
+    hasher.update(b"#");
+    hasher.update(pr_number.to_le_bytes());
+    hasher.update(b"@");
+    hasher.update(head_sha.as_bytes());
+
+    let hash = hasher.finalize();
+    // Use the first 16 bytes (32 hex chars) for a reasonably short but unique token
+    hex::encode(&hash[..16])
 }
 
 /// Check if old_sha is an ancestor of new_sha.
@@ -964,6 +1011,61 @@ mod tests {
         assert!(
             !formatted.contains("...and"),
             "Should not show overflow for small list"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_reconciliation_token() {
+        // Same inputs should produce the same token
+        let token1 = generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456");
+        let token2 = generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456");
+        assert_eq!(token1, token2, "Same inputs should produce the same token");
+
+        // Different installation_id should produce different token
+        let token_diff_install =
+            generate_reconciliation_token(99999, "owner", "repo", 42, "abc123def456");
+        assert_ne!(
+            token1, token_diff_install,
+            "Different installation_id should produce different token"
+        );
+
+        // Different repo_owner should produce different token
+        let token_diff_owner =
+            generate_reconciliation_token(12345, "other", "repo", 42, "abc123def456");
+        assert_ne!(
+            token1, token_diff_owner,
+            "Different repo_owner should produce different token"
+        );
+
+        // Different repo_name should produce different token
+        let token_diff_repo =
+            generate_reconciliation_token(12345, "owner", "other", 42, "abc123def456");
+        assert_ne!(
+            token1, token_diff_repo,
+            "Different repo_name should produce different token"
+        );
+
+        // Different pr_number should produce different token
+        let token_diff_pr =
+            generate_reconciliation_token(12345, "owner", "repo", 99, "abc123def456");
+        assert_ne!(
+            token1, token_diff_pr,
+            "Different pr_number should produce different token"
+        );
+
+        // Different head_sha should produce different token
+        let token_diff_sha =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "xyz789xyz789");
+        assert_ne!(
+            token1, token_diff_sha,
+            "Different head_sha should produce different token"
+        );
+
+        // Token should be 32 hex chars (16 bytes)
+        assert_eq!(token1.len(), 32, "Token should be 32 hex characters");
+        assert!(
+            token1.chars().all(|c| c.is_ascii_hexdigit()),
+            "Token should only contain hex digits"
         );
     }
 }

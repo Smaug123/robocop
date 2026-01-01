@@ -108,8 +108,61 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
                 retry_count += 1;
                 if retry_count >= LIST_BATCHES_MAX_RETRIES {
                     error!(
-                        "Failed to list batches from OpenAI after {} attempts: {}. Reconciliation aborted.",
-                        LIST_BATCHES_MAX_RETRIES, e
+                        "Failed to list batches from OpenAI after {} attempts: {}. \
+                         Emitting ReconciliationFailed events for all {} BatchSubmitting PRs.",
+                        LIST_BATCHES_MAX_RETRIES,
+                        e,
+                        submitting_states.len()
+                    );
+
+                    // Instead of aborting silently, emit ReconciliationFailed for all PRs.
+                    // This allows them to retry the batch submission from the Preparing state.
+                    for (pr_id, token, installation_id) in &submitting_states {
+                        let fallback_pr_url = format!(
+                            "https://github.com/{}/{}/pull/{}",
+                            pr_id.repo_owner, pr_id.repo_name, pr_id.pr_number
+                        );
+
+                        let event = Event::ReconciliationFailed {
+                            reconciliation_token: token.clone(),
+                            error: format!(
+                                "OpenAI API unavailable during reconciliation after {} attempts: {}",
+                                LIST_BATCHES_MAX_RETRIES, e
+                            ),
+                        };
+
+                        let ctx = InterpreterContext {
+                            github_client: state.github_client.clone(),
+                            openai_client: state.openai_client.clone(),
+                            repo_owner: pr_id.repo_owner.clone(),
+                            repo_name: pr_id.repo_name.clone(),
+                            pr_number: pr_id.pr_number,
+                            pr_url: Some(fallback_pr_url),
+                            branch_name: None, // Unknown when list_batches fails
+                            installation_id: *installation_id,
+                            correlation_id: None,
+                        };
+
+                        match state.state_store.process_event(pr_id, event, &ctx).await {
+                            Ok(new_state) => {
+                                warn!(
+                                    "Reconciliation (OpenAI unavailable): PR #{} transitioned to {:?}. \
+                                     Will retry batch submission.",
+                                    pr_id.pr_number,
+                                    std::mem::discriminant(&new_state)
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Reconciliation: Failed to process ReconciliationFailed event for PR #{}: {}",
+                                    pr_id.pr_number, e
+                                );
+                            }
+                        }
+                    }
+
+                    info!(
+                        "Crash recovery reconciliation complete (with OpenAI unavailable - PRs will retry)."
                     );
                     return;
                 }
