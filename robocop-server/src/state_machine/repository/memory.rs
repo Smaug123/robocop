@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::{StateRepository, StoredState};
+use super::{RepositoryError, StateRepository, StoredState};
 use crate::state_machine::store::StateMachinePrId;
 
 /// In-memory state repository.
@@ -35,28 +35,29 @@ impl Default for InMemoryRepository {
 
 #[async_trait]
 impl StateRepository for InMemoryRepository {
-    async fn get(&self, id: &StateMachinePrId) -> Option<StoredState> {
+    async fn get(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
         let states = self.states.read().await;
-        states.get(id).cloned()
+        Ok(states.get(id).cloned())
     }
 
-    async fn put(&self, id: &StateMachinePrId, state: StoredState) {
+    async fn put(&self, id: &StateMachinePrId, state: StoredState) -> Result<(), RepositoryError> {
         let mut states = self.states.write().await;
         states.insert(id.clone(), state);
+        Ok(())
     }
 
-    async fn delete(&self, id: &StateMachinePrId) -> Option<StoredState> {
+    async fn delete(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
         let mut states = self.states.write().await;
-        states.remove(id)
+        Ok(states.remove(id))
     }
 
-    async fn get_pending(&self) -> Vec<(StateMachinePrId, StoredState)> {
+    async fn get_pending(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
         let states = self.states.read().await;
-        states
+        Ok(states
             .iter()
             .filter(|(_, stored)| stored.state.pending_batch_id().is_some())
             .map(|(id, stored)| (id.clone(), stored.clone()))
-            .collect()
+            .collect())
     }
 }
 
@@ -78,7 +79,7 @@ mod tests {
             state: ReviewMachineState::Idle {
                 reviews_enabled: true,
             },
-            installation_id,
+            installation_id: Some(installation_id),
         }
     }
 
@@ -94,14 +95,14 @@ mod tests {
                 model: "gpt-4".to_string(),
                 reasoning_effort: "high".to_string(),
             },
-            installation_id,
+            installation_id: Some(installation_id),
         }
     }
 
     #[tokio::test]
     async fn test_get_returns_none_for_missing() {
         let repo = InMemoryRepository::new();
-        let result = repo.get(&test_pr_id(1)).await;
+        let result = repo.get(&test_pr_id(1)).await.unwrap();
         assert!(result.is_none());
     }
 
@@ -111,12 +112,12 @@ mod tests {
         let pr_id = test_pr_id(1);
         let state = idle_state(12345);
 
-        repo.put(&pr_id, state.clone()).await;
-        let result = repo.get(&pr_id).await;
+        repo.put(&pr_id, state.clone()).await.unwrap();
+        let result = repo.get(&pr_id).await.unwrap();
 
         assert!(result.is_some());
         let retrieved = result.unwrap();
-        assert_eq!(retrieved.installation_id, 12345);
+        assert_eq!(retrieved.installation_id, Some(12345));
     }
 
     #[tokio::test]
@@ -125,11 +126,11 @@ mod tests {
         let pr_id = test_pr_id(1);
         let state = idle_state(12345);
 
-        repo.put(&pr_id, state).await;
-        let deleted = repo.delete(&pr_id).await;
+        repo.put(&pr_id, state).await.unwrap();
+        let deleted = repo.delete(&pr_id).await.unwrap();
         assert!(deleted.is_some());
 
-        let after = repo.get(&pr_id).await;
+        let after = repo.get(&pr_id).await.unwrap();
         assert!(after.is_none());
     }
 
@@ -138,18 +139,18 @@ mod tests {
         let repo = InMemoryRepository::new();
 
         // Add an idle state (not pending)
-        repo.put(&test_pr_id(1), idle_state(111)).await;
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
 
         // Add a pending batch state
-        repo.put(&test_pr_id(2), pending_state(222)).await;
+        repo.put(&test_pr_id(2), pending_state(222)).await.unwrap();
 
         // Add another idle state
-        repo.put(&test_pr_id(3), idle_state(333)).await;
+        repo.put(&test_pr_id(3), idle_state(333)).await.unwrap();
 
-        let pending = repo.get_pending().await;
+        let pending = repo.get_pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0.pr_number, 2);
-        assert_eq!(pending[0].1.installation_id, 222);
+        assert_eq!(pending[0].1.installation_id, Some(222));
     }
 
     /// Regression test: Cancelled states with pending_cancel_batch_id must be
@@ -172,9 +173,11 @@ mod tests {
                 },
                 pending_cancel_batch_id: Some(BatchId::from("batch_cancel_pending".to_string())),
             },
-            installation_id: 111,
+            installation_id: Some(111),
         };
-        repo.put(&test_pr_id(1), cancelled_with_pending).await;
+        repo.put(&test_pr_id(1), cancelled_with_pending)
+            .await
+            .unwrap();
 
         // Cancelled state WITHOUT pending_cancel_batch_id - must NOT be included
         let cancelled_without_pending = StoredState {
@@ -184,11 +187,13 @@ mod tests {
                 reason: CancellationReason::UserRequested,
                 pending_cancel_batch_id: None,
             },
-            installation_id: 222,
+            installation_id: Some(222),
         };
-        repo.put(&test_pr_id(2), cancelled_without_pending).await;
+        repo.put(&test_pr_id(2), cancelled_without_pending)
+            .await
+            .unwrap();
 
-        let pending = repo.get_pending().await;
+        let pending = repo.get_pending().await.unwrap();
 
         assert_eq!(
             pending.len(),
@@ -196,7 +201,7 @@ mod tests {
             "Only Cancelled with pending_cancel_batch_id should be returned"
         );
         assert_eq!(pending[0].0.pr_number, 1);
-        assert_eq!(pending[0].1.installation_id, 111);
+        assert_eq!(pending[0].1.installation_id, Some(111));
     }
 
     // =========================================================================
@@ -421,13 +426,13 @@ mod tests {
                     let pr_id = test_pr_id(*pr_number);
                     let stored = StoredState {
                         state: state.clone(),
-                        installation_id: *installation_id,
+                        installation_id: Some(*installation_id),
                     };
-                    repo.put(&pr_id, stored).await;
+                    repo.put(&pr_id, stored).await.unwrap();
                 }
 
                 // Get pending states
-                let pending = repo.get_pending().await;
+                let pending = repo.get_pending().await.unwrap();
 
                 // Property: each returned state must have pending_batch_id().is_some()
                 for (pr_id, stored) in &pending {
@@ -473,12 +478,12 @@ mod tests {
                 let pr_id = test_pr_id(1);
                 let stored = StoredState {
                     state: state.clone(),
-                    installation_id,
+                    installation_id: Some(installation_id),
                 };
 
-                repo.put(&pr_id, stored).await;
+                repo.put(&pr_id, stored).await.unwrap();
 
-                let pending = repo.get_pending().await;
+                let pending = repo.get_pending().await.unwrap();
                 let has_pending_batch = state.pending_batch_id().is_some();
                 let was_returned = !pending.is_empty();
 

@@ -17,6 +17,7 @@ use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
 use crate::github::GitHubClient;
 use crate::openai::OpenAIClient;
+use tracing::error;
 
 /// Unique identifier for a pull request across repositories.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -101,12 +102,20 @@ impl StateStore {
     }
 
     /// Get the current state for a PR, or create a default idle state.
+    ///
+    /// Logs an error and returns the default state if a storage error occurs.
     pub async fn get_or_default(&self, pr_id: &StateMachinePrId) -> ReviewMachineState {
-        self.repository
-            .get(pr_id)
-            .await
-            .map(|s| s.state)
-            .unwrap_or_default()
+        match self.repository.get(pr_id).await {
+            Ok(Some(stored)) => stored.state,
+            Ok(None) => ReviewMachineState::default(),
+            Err(e) => {
+                error!(
+                    "Repository error getting state for PR #{}: {}",
+                    pr_id.pr_number, e
+                );
+                ReviewMachineState::default()
+            }
+        }
     }
 
     /// Get or initialize the state for a PR with the given reviews_enabled setting.
@@ -124,55 +133,99 @@ impl StateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        if let Some(stored) = self.repository.get(pr_id).await {
-            // If reviews_enabled changed (e.g., user edited PR description),
-            // update the state to reflect the new value
-            if stored.state.reviews_enabled() != reviews_enabled {
-                let updated_state = stored.state.with_reviews_enabled(reviews_enabled);
-                self.repository
+        match self.repository.get(pr_id).await {
+            Ok(Some(stored)) => {
+                // If reviews_enabled changed (e.g., user edited PR description),
+                // update the state to reflect the new value
+                if stored.state.reviews_enabled() != reviews_enabled {
+                    let updated_state = stored.state.with_reviews_enabled(reviews_enabled);
+                    if let Err(e) = self
+                        .repository
+                        .put(
+                            pr_id,
+                            StoredState {
+                                state: updated_state.clone(),
+                                installation_id: stored.installation_id,
+                            },
+                        )
+                        .await
+                    {
+                        error!(
+                            "Repository error updating state for PR #{}: {}",
+                            pr_id.pr_number, e
+                        );
+                    }
+                    return updated_state;
+                }
+                stored.state
+            }
+            Ok(None) => {
+                // Initialize with the given reviews_enabled
+                // Note: installation_id is None until process_event is called with a real ID
+                let state = ReviewMachineState::Idle { reviews_enabled };
+                if let Err(e) = self
+                    .repository
                     .put(
                         pr_id,
                         StoredState {
-                            state: updated_state.clone(),
-                            installation_id: stored.installation_id,
+                            state: state.clone(),
+                            installation_id: None, // Will be set when process_event is called
                         },
                     )
-                    .await;
-                return updated_state;
+                    .await
+                {
+                    error!(
+                        "Repository error creating state for PR #{}: {}",
+                        pr_id.pr_number, e
+                    );
+                }
+                state
             }
-            return stored.state;
+            Err(e) => {
+                error!(
+                    "Repository error getting state for PR #{}: {}",
+                    pr_id.pr_number, e
+                );
+                // Return a default state on error
+                ReviewMachineState::Idle { reviews_enabled }
+            }
         }
-
-        // Initialize with the given reviews_enabled
-        let state = ReviewMachineState::Idle { reviews_enabled };
-        self.repository
-            .put(
-                pr_id,
-                StoredState {
-                    state: state.clone(),
-                    installation_id: 0, // Will be set when process_event is called
-                },
-            )
-            .await;
-        state
     }
 
     /// Get the current state for a PR.
+    ///
+    /// Returns `None` if not found or on storage error (error is logged).
     pub async fn get(&self, pr_id: &StateMachinePrId) -> Option<ReviewMachineState> {
-        self.repository.get(pr_id).await.map(|s| s.state)
+        match self.repository.get(pr_id).await {
+            Ok(Some(stored)) => Some(stored.state),
+            Ok(None) => None,
+            Err(e) => {
+                error!(
+                    "Repository error getting state for PR #{}: {}",
+                    pr_id.pr_number, e
+                );
+                None
+            }
+        }
     }
 
     /// Set the state for a PR.
     ///
     /// This preserves the existing installation_id if one exists.
     pub async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) {
-        let installation_id = self
+        let installation_id = match self.repository.get(&pr_id).await {
+            Ok(Some(stored)) => stored.installation_id,
+            Ok(None) => None,
+            Err(e) => {
+                error!(
+                    "Repository error getting installation_id for PR #{}: {}",
+                    pr_id.pr_number, e
+                );
+                None
+            }
+        };
+        if let Err(e) = self
             .repository
-            .get(&pr_id)
-            .await
-            .map(|s| s.installation_id)
-            .unwrap_or(0);
-        self.repository
             .put(
                 &pr_id,
                 StoredState {
@@ -180,7 +233,13 @@ impl StateStore {
                     installation_id,
                 },
             )
-            .await;
+            .await
+        {
+            error!(
+                "Repository error setting state for PR #{}: {}",
+                pr_id.pr_number, e
+            );
+        }
     }
 
     /// Remove the state for a PR (e.g., when PR is closed).
@@ -192,7 +251,17 @@ impl StateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        let result = self.repository.delete(pr_id).await.map(|s| s.state);
+        let result = match self.repository.delete(pr_id).await {
+            Ok(Some(stored)) => Some(stored.state),
+            Ok(None) => None,
+            Err(e) => {
+                error!(
+                    "Repository error deleting state for PR #{}: {}",
+                    pr_id.pr_number, e
+                );
+                None
+            }
+        };
 
         // Clean up the lock entry (we're still holding it, so this is safe)
         let mut locks = self.pr_locks.write().await;
@@ -211,45 +280,70 @@ impl StateStore {
     /// should use `process_event` which handles locking.
     async fn set_installation_id(&self, pr_id: &StateMachinePrId, installation_id: u64) {
         let state = self.get_or_default(pr_id).await;
-        self.repository
+        if let Err(e) = self
+            .repository
             .put(
                 pr_id,
                 StoredState {
                     state,
-                    installation_id,
+                    installation_id: Some(installation_id),
                 },
             )
-            .await;
+            .await
+        {
+            error!(
+                "Repository error setting installation_id for PR #{}: {}",
+                pr_id.pr_number, e
+            );
+        }
     }
 
     /// Get the installation ID for a PR.
     pub async fn get_installation_id(&self, pr_id: &StateMachinePrId) -> Option<u64> {
-        self.repository.get(pr_id).await.map(|s| s.installation_id)
+        match self.repository.get(pr_id).await {
+            Ok(Some(stored)) => stored.installation_id,
+            Ok(None) => None,
+            Err(e) => {
+                error!(
+                    "Repository error getting installation_id for PR #{}: {}",
+                    pr_id.pr_number, e
+                );
+                None
+            }
+        }
     }
 
     /// Get all PR IDs with pending batches.
     pub async fn get_pending_pr_ids(&self) -> Vec<StateMachinePrId> {
-        self.repository
-            .get_pending()
-            .await
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect()
+        match self.repository.get_pending().await {
+            Ok(pending) => pending.into_iter().map(|(id, _)| id).collect(),
+            Err(e) => {
+                error!("Repository error getting pending PR IDs: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Get all pending batches with their PR information.
     ///
     /// Returns a list of (pr_id, batch_id, installation_id) tuples for all PRs with pending batches.
+    /// States without an installation_id are filtered out since we can't authenticate to GitHub.
     pub async fn get_pending_batches(&self) -> Vec<(StateMachinePrId, super::state::BatchId, u64)> {
-        self.repository
-            .get_pending()
-            .await
-            .into_iter()
-            .filter_map(|(id, stored)| {
-                let batch_id = stored.state.pending_batch_id()?.clone();
-                Some((id, batch_id, stored.installation_id))
-            })
-            .collect()
+        match self.repository.get_pending().await {
+            Ok(pending) => pending
+                .into_iter()
+                .filter_map(|(id, stored)| {
+                    let batch_id = stored.state.pending_batch_id()?.clone();
+                    // Filter out states without installation_id - we can't authenticate to GitHub
+                    let installation_id = stored.installation_id?;
+                    Some((id, batch_id, installation_id))
+                })
+                .collect(),
+            Err(e) => {
+                error!("Repository error getting pending batches: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     /// Process an event for a PR: transition the state and execute effects.
