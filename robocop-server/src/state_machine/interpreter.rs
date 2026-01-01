@@ -279,16 +279,18 @@ async fn execute_fetch_data(
         .map(|(path, content)| FileContent { path, content })
         .collect();
 
-    // Generate a deterministic reconciliation token based on PR identity + commit.
-    // This ensures that retries for the same PR+commit will use the same token,
+    // Generate a deterministic reconciliation token based on PR identity + commits.
+    // This ensures that retries for the same PR+commits will use the same token,
     // preventing duplicate batch submissions when reconciliation fails to find
-    // a batch that was actually submitted.
+    // a batch that was actually submitted. Including base_sha ensures we don't
+    // match a batch created for a different diff if the base changed.
     let reconciliation_token = generate_reconciliation_token(
         ctx.installation_id,
         &ctx.repo_owner,
         &ctx.repo_name,
         ctx.pr_number,
         &head_sha.0,
+        &base_sha.0,
     );
 
     EffectResult::single(Event::DataFetched {
@@ -305,15 +307,21 @@ async fn execute_fetch_data(
 /// - repo_owner/repo_name: Identifies the repository
 /// - pr_number: Identifies the pull request
 /// - head_sha: The commit being reviewed
+/// - base_sha: The base commit (merge-base) being compared against
+///
+/// Including both head_sha and base_sha ensures that if the base changes
+/// (e.g., main was rebased), a new token is generated and we don't incorrectly
+/// match a batch created for a different diff.
 ///
 /// Using SHA256 ensures a consistent, collision-resistant token that will be
-/// identical across server restarts and retries for the same PR+commit.
+/// identical across server restarts and retries for the same PR+commits.
 fn generate_reconciliation_token(
     installation_id: u64,
     repo_owner: &str,
     repo_name: &str,
     pr_number: u64,
     head_sha: &str,
+    base_sha: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
 
@@ -326,6 +334,8 @@ fn generate_reconciliation_token(
     hasher.update(pr_number.to_le_bytes());
     hasher.update(b"@");
     hasher.update(head_sha.as_bytes());
+    hasher.update(b"...");
+    hasher.update(base_sha.as_bytes());
 
     let hash = hasher.finalize();
     // Use the first 16 bytes (32 hex chars) for a reasonably short but unique token
@@ -1017,13 +1027,15 @@ mod tests {
     #[test]
     fn test_deterministic_reconciliation_token() {
         // Same inputs should produce the same token
-        let token1 = generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456");
-        let token2 = generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456");
+        let token1 =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456", "base111");
+        let token2 =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456", "base111");
         assert_eq!(token1, token2, "Same inputs should produce the same token");
 
         // Different installation_id should produce different token
         let token_diff_install =
-            generate_reconciliation_token(99999, "owner", "repo", 42, "abc123def456");
+            generate_reconciliation_token(99999, "owner", "repo", 42, "abc123def456", "base111");
         assert_ne!(
             token1, token_diff_install,
             "Different installation_id should produce different token"
@@ -1031,7 +1043,7 @@ mod tests {
 
         // Different repo_owner should produce different token
         let token_diff_owner =
-            generate_reconciliation_token(12345, "other", "repo", 42, "abc123def456");
+            generate_reconciliation_token(12345, "other", "repo", 42, "abc123def456", "base111");
         assert_ne!(
             token1, token_diff_owner,
             "Different repo_owner should produce different token"
@@ -1039,7 +1051,7 @@ mod tests {
 
         // Different repo_name should produce different token
         let token_diff_repo =
-            generate_reconciliation_token(12345, "owner", "other", 42, "abc123def456");
+            generate_reconciliation_token(12345, "owner", "other", 42, "abc123def456", "base111");
         assert_ne!(
             token1, token_diff_repo,
             "Different repo_name should produce different token"
@@ -1047,7 +1059,7 @@ mod tests {
 
         // Different pr_number should produce different token
         let token_diff_pr =
-            generate_reconciliation_token(12345, "owner", "repo", 99, "abc123def456");
+            generate_reconciliation_token(12345, "owner", "repo", 99, "abc123def456", "base111");
         assert_ne!(
             token1, token_diff_pr,
             "Different pr_number should produce different token"
@@ -1055,10 +1067,19 @@ mod tests {
 
         // Different head_sha should produce different token
         let token_diff_sha =
-            generate_reconciliation_token(12345, "owner", "repo", 42, "xyz789xyz789");
+            generate_reconciliation_token(12345, "owner", "repo", 42, "xyz789xyz789", "base111");
         assert_ne!(
             token1, token_diff_sha,
             "Different head_sha should produce different token"
+        );
+
+        // Different base_sha should produce different token
+        // This is the key fix: ensures we don't match batches created for a different diff
+        let token_diff_base =
+            generate_reconciliation_token(12345, "owner", "repo", 42, "abc123def456", "base222");
+        assert_ne!(
+            token1, token_diff_base,
+            "Different base_sha should produce different token"
         );
 
         // Token should be 32 hex chars (16 bytes)
