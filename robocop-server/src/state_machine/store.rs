@@ -12,7 +12,7 @@ use tracing::info;
 
 use super::event::Event;
 use super::interpreter::{execute_effects, InterpreterContext};
-use super::repository::{InMemoryRepository, StateRepository, StoredState};
+use super::repository::{InMemoryRepository, RepositoryError, StateRepository, StoredState};
 use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
 use crate::github::GitHubClient;
@@ -103,17 +103,26 @@ impl StateStore {
 
     /// Get the current state for a PR, or create a default idle state.
     ///
-    /// Logs an error and returns the default state if a storage error occurs.
-    pub async fn get_or_default(&self, pr_id: &StateMachinePrId) -> ReviewMachineState {
+    /// Returns:
+    /// - `Ok(state)` - the current state (or default if not found)
+    /// - `Err(RepositoryError)` - if a storage error occurred
+    ///
+    /// IMPORTANT: This method distinguishes between "not found" (returns default)
+    /// and "read error" (returns Err). Callers MUST handle errors appropriately
+    /// to avoid processing from a default state when the real state couldn't be read.
+    pub async fn get_or_default(
+        &self,
+        pr_id: &StateMachinePrId,
+    ) -> Result<ReviewMachineState, RepositoryError> {
         match self.repository.get(pr_id).await {
-            Ok(Some(stored)) => stored.state,
-            Ok(None) => ReviewMachineState::default(),
+            Ok(Some(stored)) => Ok(stored.state),
+            Ok(None) => Ok(ReviewMachineState::default()),
             Err(e) => {
                 error!(
                     "Repository error getting state for PR #{}: {}",
                     pr_id.pr_number, e
                 );
-                ReviewMachineState::default()
+                Err(e)
             }
         }
     }
@@ -124,11 +133,19 @@ impl StateStore {
     /// If the PR already has a state and its reviews_enabled differs, updates it to match.
     ///
     /// This method acquires a per-PR lock to prevent races with concurrent calls.
+    ///
+    /// Returns:
+    /// - `Ok(state)` - the current/updated state (always matches what's persisted)
+    /// - `Err(RepositoryError)` - if a storage error occurred
+    ///
+    /// IMPORTANT: The returned state always matches what's persisted in storage.
+    /// On write failure when updating reviews_enabled, returns the ORIGINAL state
+    /// (not the updated one) to maintain consistency with persisted data.
     pub async fn get_or_init(
         &self,
         pr_id: &StateMachinePrId,
         reviews_enabled: bool,
-    ) -> ReviewMachineState {
+    ) -> Result<ReviewMachineState, RepositoryError> {
         // Acquire per-PR lock to serialize with other operations
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
@@ -138,7 +155,7 @@ impl StateStore {
                 // If reviews_enabled changed (e.g., user edited PR description),
                 // update the state to reflect the new value
                 if stored.state.reviews_enabled() != reviews_enabled {
-                    let updated_state = stored.state.with_reviews_enabled(reviews_enabled);
+                    let updated_state = stored.state.clone().with_reviews_enabled(reviews_enabled);
                     if let Err(e) = self
                         .repository
                         .put(
@@ -151,20 +168,23 @@ impl StateStore {
                         .await
                     {
                         error!(
-                            "Repository error updating state for PR #{}: {}",
+                            "Repository error updating state for PR #{}: {}; \
+                             returning original state to maintain consistency",
                             pr_id.pr_number, e
                         );
+                        // Return the ORIGINAL state (not updated) since write failed.
+                        // This ensures returned state matches persisted state.
+                        return Ok(stored.state);
                     }
-                    return updated_state;
+                    return Ok(updated_state);
                 }
-                stored.state
+                Ok(stored.state)
             }
             Ok(None) => {
                 // Initialize with the given reviews_enabled
                 // Note: installation_id is None until process_event is called with a real ID
                 let state = ReviewMachineState::Idle { reviews_enabled };
-                if let Err(e) = self
-                    .repository
+                self.repository
                     .put(
                         pr_id,
                         StoredState {
@@ -173,21 +193,21 @@ impl StateStore {
                         },
                     )
                     .await
-                {
-                    error!(
-                        "Repository error creating state for PR #{}: {}",
-                        pr_id.pr_number, e
-                    );
-                }
-                state
+                    .map_err(|e| {
+                        error!(
+                            "Repository error creating state for PR #{}: {}",
+                            pr_id.pr_number, e
+                        );
+                        e
+                    })?;
+                Ok(state)
             }
             Err(e) => {
                 error!(
                     "Repository error getting state for PR #{}: {}",
                     pr_id.pr_number, e
                 );
-                // Return a default state on error
-                ReviewMachineState::Idle { reviews_enabled }
+                Err(e)
             }
         }
     }
@@ -376,13 +396,19 @@ impl StateStore {
     /// processed sequentially, preventing races where one event reads stale
     /// state or overwrites another event's changes.
     ///
-    /// Returns the final state after all transitions.
+    /// Returns:
+    /// - `Ok(state)` - the final state after all transitions
+    /// - `Err(RepositoryError)` - if the initial read failed (no processing or write occurred)
+    ///
+    /// IMPORTANT: On read error, this method returns early WITHOUT processing
+    /// the event and WITHOUT writing to storage. This prevents overwriting
+    /// valid persisted state with state derived from defaults.
     pub async fn process_event(
         &self,
         pr_id: &StateMachinePrId,
         event: Event,
         ctx: &InterpreterContext,
-    ) -> ReviewMachineState {
+    ) -> Result<ReviewMachineState, RepositoryError> {
         // Acquire per-PR lock to serialize with other operations
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
@@ -390,7 +416,9 @@ impl StateStore {
         // Store the installation_id for later use by batch polling
         self.set_installation_id(pr_id, ctx.installation_id).await;
 
-        let mut current_state = self.get_or_default(pr_id).await;
+        // Get current state. On read error, return early WITHOUT processing or writing.
+        // This prevents overwriting valid persisted state with defaults.
+        let mut current_state = self.get_or_default(pr_id).await?;
 
         // Event loop: process initial event and any result events from effects
         let mut events_to_process = vec![event];
@@ -438,7 +466,7 @@ impl StateStore {
             pr_id.pr_number, current_state
         );
 
-        current_state
+        Ok(current_state)
     }
 }
 
@@ -572,7 +600,7 @@ mod tests {
         let store = StateStore::new();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
-        let state = store.get_or_default(&pr_id).await;
+        let state = store.get_or_default(&pr_id).await.unwrap();
         assert!(matches!(
             state,
             ReviewMachineState::Idle {
@@ -640,7 +668,7 @@ mod tests {
         store.set(pr_id.clone(), initial_state, Some(12345)).await;
 
         // Now rehydrate with reviews_enabled: false (user added <!-- no review -->)
-        let state = store.get_or_init(&pr_id, false).await;
+        let state = store.get_or_init(&pr_id, false).await.unwrap();
 
         // The returned state should have reviews_enabled: false
         // (Bug: previously it returned true because it didn't update existing state)
@@ -656,7 +684,7 @@ mod tests {
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // No existing state - should create Idle with reviews_enabled: false
-        let state = store.get_or_init(&pr_id, false).await;
+        let state = store.get_or_init(&pr_id, false).await.unwrap();
 
         assert!(matches!(
             state,
@@ -692,7 +720,7 @@ mod tests {
             let mismatch_count = mismatch_count.clone();
             let reviews_enabled = i % 2 == 0;
             handles.push(tokio::spawn(async move {
-                let state = store.get_or_init(&pr_id, reviews_enabled).await;
+                let state = store.get_or_init(&pr_id, reviews_enabled).await.unwrap();
                 // Each call should return a state matching its input.
                 // If serialization is broken, a call could read stale state
                 // and return reviews_enabled != what was passed in.
@@ -740,7 +768,7 @@ mod tests {
             let store = store.clone();
             handles.push(tokio::spawn(async move {
                 let pr_id = StateMachinePrId::new("owner", "repo", pr_number);
-                store.get_or_init(&pr_id, true).await
+                store.get_or_init(&pr_id, true).await.unwrap()
             }));
         }
 
@@ -858,6 +886,96 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Regression tests for repository error handling
+    // =========================================================================
+
+    /// Regression test: get_or_default must return Err on read errors, not a default.
+    ///
+    /// This prevents process_event from processing with wrong state and overwriting
+    /// valid persisted state.
+    #[tokio::test]
+    async fn test_get_or_default_returns_error_on_read_failure() {
+        let repo = Arc::new(FailingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // First, write a non-default state
+        let original_state = ReviewMachineState::Idle {
+            reviews_enabled: false, // NOT the default (which is true)
+        };
+        store
+            .set(pr_id.clone(), original_state.clone(), Some(111))
+            .await;
+
+        // Make reads fail (simulating transient storage error)
+        repo.set_fail_gets(true);
+
+        // get_or_default should return Err, not the default state
+        let result = store.get_or_default(&pr_id).await;
+        assert!(
+            result.is_err(),
+            "get_or_default should return Err on read failure, not a default state"
+        );
+
+        // Stop failing reads so we can verify the original state is still there
+        repo.set_fail_gets(false);
+
+        // The original state should be preserved (never overwritten)
+        let stored = repo.inner.get(&pr_id).await.unwrap().unwrap();
+        assert!(
+            !stored.state.reviews_enabled(),
+            "Original state must be preserved when read fails"
+        );
+    }
+
+    /// Regression test: get_or_init must not return unpersisted state when write fails.
+    ///
+    /// When storage write fails while updating reviews_enabled, get_or_init returns
+    /// the ORIGINAL state (not the updated one) to maintain consistency with
+    /// what's actually persisted.
+    #[tokio::test]
+    async fn test_get_or_init_write_error_must_not_return_unpersisted_state() {
+        let repo = Arc::new(FailingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // First, write a state with reviews_enabled: true
+        let original_state = ReviewMachineState::Idle {
+            reviews_enabled: true,
+        };
+        store
+            .set(pr_id.clone(), original_state.clone(), Some(111))
+            .await;
+
+        // Now make writes fail
+        repo.fail_puts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Call get_or_init with reviews_enabled: false
+        // With the fix: This returns the ORIGINAL state (reviews_enabled: true)
+        // because the write failed, so returned state matches persisted state.
+        let returned_state = store.get_or_init(&pr_id, false).await.unwrap();
+
+        // Stop failing writes
+        repo.fail_puts
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Read the actual persisted state
+        let persisted = repo.inner.get(&pr_id).await.unwrap().unwrap();
+
+        // CORRECT behavior: returned state must match persisted state
+        // (Since write failed, both should be true - the original value)
+        assert_eq!(
+            returned_state.reviews_enabled(),
+            persisted.state.reviews_enabled(),
+            "Returned state must match persisted state.\n\
+             Returned reviews_enabled: {}, Persisted reviews_enabled: {}",
+            returned_state.reviews_enabled(),
+            persisted.state.reviews_enabled()
+        );
+    }
+
     /// Test that installation_id is preserved across state updates.
     ///
     /// Regression test for: installation_id preservation across state updates.
@@ -947,7 +1065,7 @@ mod tests {
 
         // Call get_or_init with different reviews_enabled value
         // This should update reviews_enabled but preserve installation_id
-        let result = store.get_or_init(&pr_id, false).await;
+        let result = store.get_or_init(&pr_id, false).await.unwrap();
 
         assert!(
             !result.reviews_enabled(),
@@ -1233,7 +1351,7 @@ mod tests {
                 store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
 
                 // Call get_or_init with potentially different reviews_enabled
-                let _ = store.get_or_init(&pr_id, new_reviews_enabled).await;
+                let _ = store.get_or_init(&pr_id, new_reviews_enabled).await.unwrap();
 
                 // Verify installation_id is preserved
                 let retrieved_id = store.get_installation_id(&pr_id).await;
@@ -1266,7 +1384,7 @@ mod tests {
                 store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
 
                 // Call get_or_init
-                let result = store.get_or_init(&pr_id, requested_reviews_enabled).await;
+                let result = store.get_or_init(&pr_id, requested_reviews_enabled).await.unwrap();
 
                 // Verify reviews_enabled matches requested value
                 assert_eq!(
@@ -1276,6 +1394,58 @@ mod tests {
                      Requested reviews_enabled: {}\n\
                      Got reviews_enabled: {}",
                     state, requested_reviews_enabled, result.reviews_enabled()
+                );
+            });
+        }
+
+        // =====================================================================
+        // Property-based tests for repository error handling
+        // =====================================================================
+
+        /// Property: get_or_init returned state must always match persisted state.
+        ///
+        /// When write fails while updating reviews_enabled, get_or_init returns the
+        /// ORIGINAL state (not the updated one) to maintain consistency with storage.
+        #[test]
+        fn get_or_init_returned_state_matches_persisted_on_write_failure(
+            state in arb_review_state(),
+            installation_id in 1u64..1000000,
+            requested_reviews_enabled in any::<bool>()
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let repo = Arc::new(FailingRepository::new());
+                let store = StateStore::with_repository(repo.clone());
+                let pr_id = test_pr_id(1);
+
+                // Set initial state
+                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
+
+                // Make writes fail
+                repo.fail_puts.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                // Call get_or_init - write will fail, should return original state
+                let returned = store.get_or_init(&pr_id, requested_reviews_enabled).await.unwrap();
+
+                // Stop failing writes
+                repo.fail_puts.store(false, std::sync::atomic::Ordering::SeqCst);
+
+                // Read actual persisted state
+                let persisted = repo.inner.get(&pr_id).await.unwrap().unwrap();
+
+                // PROPERTY: returned state must match persisted state
+                assert_eq!(
+                    returned.reviews_enabled(),
+                    persisted.state.reviews_enabled(),
+                    "Returned state must match persisted state on write failure.\n\
+                     Original state: {:?}\n\
+                     Requested reviews_enabled: {}\n\
+                     Returned reviews_enabled: {}\n\
+                     Persisted reviews_enabled: {}",
+                    state,
+                    requested_reviews_enabled,
+                    returned.reviews_enabled(),
+                    persisted.state.reviews_enabled()
                 );
             });
         }

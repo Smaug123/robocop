@@ -74,7 +74,11 @@ async fn create_and_process_event(
         correlation_id: None,
     };
 
-    let final_state = state.state_store.process_event(pr_id, event, &ctx).await;
+    let final_state = state
+        .state_store
+        .process_event(pr_id, event, &ctx)
+        .await
+        .context("Repository error during batch event processing")?;
     info!(
         "Batch event processed for PR #{}, final state: {:?}",
         pr_id.pr_number, final_state
