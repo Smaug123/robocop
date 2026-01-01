@@ -147,6 +147,39 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
             let effective_comment_id = comment_id.or(*state_comment_id);
             let effective_check_run_id = check_run_id.or(*state_check_run_id);
 
+            // Emit UI updates like the normal BatchSubmitted path does
+            let mut effects = vec![
+                Effect::Log {
+                    level: LogLevel::Info,
+                    message: "Recovered from crash - found batch at OpenAI".to_string(),
+                },
+                Effect::UpdateComment {
+                    content: CommentContent::InProgress {
+                        head_sha: head_sha.clone(),
+                        batch_id: batch_id.clone(),
+                        model: model.clone(),
+                        reasoning_effort: reasoning_effort.clone(),
+                    },
+                },
+            ];
+
+            // Update check run with batch ID as external_id for correlation
+            if let Some(cr_id) = effective_check_run_id {
+                effects.push(Effect::UpdateCheckRun {
+                    check_run_id: cr_id,
+                    status: EffectCheckRunStatus::InProgress,
+                    conclusion: None,
+                    title: "Code review in progress".to_string(),
+                    summary: format!(
+                        "Reviewing commit {} with {} (batch: {}) [recovered]",
+                        head_sha.short(),
+                        model,
+                        batch_id
+                    ),
+                    external_id: Some(batch_id.clone()),
+                });
+            }
+
             TransitionResult::new(
                 ReviewMachineState::BatchPending {
                     reviews_enabled: *reviews_enabled,
@@ -158,10 +191,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                     model,
                     reasoning_effort,
                 },
-                vec![Effect::Log {
-                    level: LogLevel::Info,
-                    message: "Recovered from crash - found batch at OpenAI".to_string(),
-                }],
+                effects,
             )
         }
 
@@ -445,5 +475,89 @@ mod tests {
             .effects
             .iter()
             .any(|e| matches!(e, Effect::FetchData { .. })));
+    }
+
+    /// ReconciliationComplete should emit UpdateComment and UpdateCheckRun effects
+    /// to update the UI with the recovered batch ID, just like BatchSubmitted does.
+    #[test]
+    fn test_reconciliation_complete_emits_ui_updates() {
+        let state = make_batch_submitting_state();
+        let event = Event::ReconciliationComplete {
+            batch_id: BatchId::from("recovered_batch".to_string()),
+            comment_id: Some(CommentId(100)),
+            check_run_id: Some(CheckRunId(200)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let result = handle(state, event);
+
+        // Should transition to BatchPending
+        assert!(
+            matches!(result.state, ReviewMachineState::BatchPending { .. }),
+            "Expected BatchPending, got {:?}",
+            result.state
+        );
+
+        // Should emit UpdateComment effect to show batch ID in the comment
+        let has_update_comment = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::UpdateComment {
+                    content: CommentContent::InProgress { .. }
+                }
+            )
+        });
+        assert!(
+            has_update_comment,
+            "ReconciliationComplete should emit UpdateComment with InProgress content. Effects: {:?}",
+            result.effects
+        );
+
+        // Should emit UpdateCheckRun effect to set external_id to batch ID
+        let has_update_check_run = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::UpdateCheckRun {
+                    external_id: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_update_check_run,
+            "ReconciliationComplete should emit UpdateCheckRun with external_id. Effects: {:?}",
+            result.effects
+        );
+    }
+
+    /// ReconciliationComplete without check_run_id should still emit UpdateComment
+    #[test]
+    fn test_reconciliation_complete_without_check_run() {
+        let state = make_batch_submitting_state();
+        let event = Event::ReconciliationComplete {
+            batch_id: BatchId::from("recovered_batch".to_string()),
+            comment_id: Some(CommentId(100)),
+            check_run_id: None, // No check run
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+
+        let result = handle(state, event);
+
+        // Should still emit UpdateComment
+        let has_update_comment = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::UpdateComment {
+                    content: CommentContent::InProgress { .. }
+                }
+            )
+        });
+        assert!(
+            has_update_comment,
+            "ReconciliationComplete should emit UpdateComment even without check_run_id. Effects: {:?}",
+            result.effects
+        );
     }
 }

@@ -192,5 +192,6 @@ pub trait StateRepository: Send + Sync {
     /// Returns:
     /// - `Ok(vec)` with submitting states on success
     /// - `Err(RepositoryError)` if storage operation failed
-    async fn get_submitting(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
+    async fn get_submitting(&self)
+        -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
 }

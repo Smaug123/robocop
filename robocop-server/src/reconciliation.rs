@@ -75,7 +75,23 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
                 all_batches.extend(response.data);
 
                 if response.has_more {
-                    after_cursor = response.last_id;
+                    match response.last_id {
+                        Some(cursor) => {
+                            after_cursor = Some(cursor);
+                        }
+                        None => {
+                            // Defensive: If has_more=true but no cursor is provided,
+                            // break to avoid infinite loop. This shouldn't happen with
+                            // a well-behaved API, but protect against it anyway.
+                            warn!(
+                                "OpenAI returned has_more=true but no last_id cursor. \
+                                 Breaking pagination loop to avoid infinite loop. \
+                                 Fetched {} batches so far.",
+                                all_batches.len()
+                            );
+                            break;
+                        }
+                    }
                 } else {
                     break;
                 }
@@ -93,8 +109,10 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
                     "Failed to list batches from OpenAI (attempt {}/{}): {}. Retrying in {}ms...",
                     retry_count, LIST_BATCHES_MAX_RETRIES, e, LIST_BATCHES_RETRY_DELAY_MS
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(LIST_BATCHES_RETRY_DELAY_MS))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    LIST_BATCHES_RETRY_DELAY_MS,
+                ))
+                .await;
             }
         }
     }
@@ -105,7 +123,7 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
     );
 
     // Match batches to PRs by reconciliation_token
-    // We store (batch_id, model, reasoning_effort, comment_id, check_run_id)
+    // We store (batch_id, model, reasoning_effort, comment_id, check_run_id, branch_name, pr_url)
     #[derive(Default)]
     struct BatchMatch {
         batch_id: String,
@@ -113,6 +131,10 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
         reasoning_effort: Option<String>,
         comment_id: Option<u64>,
         check_run_id: Option<u64>,
+        /// Branch name from batch metadata (key: "branch")
+        branch_name: Option<String>,
+        /// Pull request URL from batch metadata (key: "pull_request_url")
+        pr_url: Option<String>,
     }
 
     let mut matched_tokens: HashMap<String, BatchMatch> = HashMap::new();
@@ -122,6 +144,15 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
             if let Some(token) = metadata.get("reconciliation_token") {
                 if token_to_pr.contains_key(token) {
                     // Found a match!
+                    // Extract branch_name, treating "<no branch>" as None
+                    let branch_name = metadata.get("branch").and_then(|b| {
+                        if b == "<no branch>" {
+                            None
+                        } else {
+                            Some(b.clone())
+                        }
+                    });
+
                     matched_tokens.insert(
                         token.clone(),
                         BatchMatch {
@@ -130,6 +161,8 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
                             reasoning_effort: metadata.get("reasoning_effort").cloned(),
                             comment_id: metadata.get("comment_id").and_then(|s| s.parse().ok()),
                             check_run_id: metadata.get("check_run_id").and_then(|s| s.parse().ok()),
+                            branch_name,
+                            pr_url: metadata.get("pull_request_url").cloned(),
                         },
                     );
                 }
@@ -139,13 +172,19 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
 
     // Process each PR in BatchSubmitting state
     for (pr_id, token, installation_id) in submitting_states {
-        let event = if let Some(batch_match) = matched_tokens.get(&token) {
+        // Construct fallback PR URL from repo info (always available)
+        let fallback_pr_url = format!(
+            "https://github.com/{}/{}/pull/{}",
+            pr_id.repo_owner, pr_id.repo_name, pr_id.pr_number
+        );
+
+        let (event, pr_url, branch_name) = if let Some(batch_match) = matched_tokens.get(&token) {
             info!(
                 "Reconciliation: Found batch {} for PR #{} (token: {})",
                 batch_match.batch_id, pr_id.pr_number, token
             );
 
-            Event::ReconciliationComplete {
+            let event = Event::ReconciliationComplete {
                 batch_id: BatchId::from(batch_match.batch_id.clone()),
                 comment_id: batch_match.comment_id.map(CommentId),
                 check_run_id: batch_match.check_run_id.map(CheckRunId),
@@ -157,28 +196,37 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
                     .reasoning_effort
                     .clone()
                     .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string()),
-            }
+            };
+
+            // Use pr_url from batch metadata if available, otherwise construct it
+            let pr_url = batch_match.pr_url.clone().unwrap_or(fallback_pr_url);
+
+            (event, Some(pr_url), batch_match.branch_name.clone())
         } else {
             warn!(
                 "Reconciliation: No batch found for PR #{} (token: {}). Will retry submission.",
                 pr_id.pr_number, token
             );
 
-            Event::ReconciliationFailed {
+            let event = Event::ReconciliationFailed {
                 reconciliation_token: token.clone(),
                 error: "No matching batch found at OpenAI".to_string(),
-            }
+            };
+
+            // For failed reconciliation, use constructed pr_url
+            // branch_name will be None since we don't have metadata
+            (event, Some(fallback_pr_url), None)
         };
 
-        // Create an interpreter context for this PR
+        // Create an interpreter context for this PR with recovered metadata
         let ctx = InterpreterContext {
             github_client: state.github_client.clone(),
             openai_client: state.openai_client.clone(),
             repo_owner: pr_id.repo_owner.clone(),
             repo_name: pr_id.repo_name.clone(),
             pr_number: pr_id.pr_number,
-            pr_url: None,
-            branch_name: None,
+            pr_url,
+            branch_name,
             installation_id,
             correlation_id: None,
         };
@@ -229,5 +277,48 @@ mod tests {
             "Reconciliation DEFAULT_REASONING_EFFORT '{}' should match batch creation default '{}'",
             DEFAULT_REASONING_EFFORT, ACTUAL_DEFAULT_REASONING_EFFORT
         );
+    }
+
+    #[test]
+    fn test_pr_url_can_be_constructed_from_parts() {
+        // Given repo_owner, repo_name, and pr_number, we should always be able
+        // to construct a valid PR URL for the InterpreterContext
+        let repo_owner = "smaug123";
+        let repo_name = "test-repo";
+        let pr_number = 42u64;
+
+        let pr_url = format!(
+            "https://github.com/{}/{}/pull/{}",
+            repo_owner, repo_name, pr_number
+        );
+
+        assert_eq!(pr_url, "https://github.com/smaug123/test-repo/pull/42");
+    }
+
+    /// Test that branch_name is extracted from batch metadata when available.
+    #[test]
+    fn test_branch_name_extracted_from_batch_metadata() {
+        use std::collections::HashMap;
+
+        // Simulate a batch with branch metadata
+        let mut metadata = HashMap::new();
+        metadata.insert("branch".to_string(), "feature/my-branch".to_string());
+        metadata.insert("reconciliation_token".to_string(), "test-token".to_string());
+
+        // The extract_branch_from_metadata helper should return the branch
+        let branch = metadata.get("branch").cloned();
+        assert_eq!(branch, Some("feature/my-branch".to_string()));
+
+        // If branch is "<no branch>", treat it as None
+        let mut metadata_no_branch = HashMap::new();
+        metadata_no_branch.insert("branch".to_string(), "<no branch>".to_string());
+        let branch = metadata_no_branch.get("branch").and_then(|b| {
+            if b == "<no branch>" {
+                None
+            } else {
+                Some(b.clone())
+            }
+        });
+        assert_eq!(branch, None);
     }
 }

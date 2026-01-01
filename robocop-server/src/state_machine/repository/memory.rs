@@ -60,7 +60,9 @@ impl StateRepository for InMemoryRepository {
             .collect())
     }
 
-    async fn get_submitting(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+    async fn get_submitting(
+        &self,
+    ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
         let states = self.states.read().await;
         Ok(states
             .iter()
