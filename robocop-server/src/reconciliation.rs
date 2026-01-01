@@ -165,3 +165,42 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
 
     info!("Crash recovery reconciliation complete.");
 }
+
+#[cfg(test)]
+mod tests {
+    /// BUG: Reconciliation uses incorrect defaults for model/reasoning_effort.
+    ///
+    /// When metadata is missing from OpenAI batch, reconciliation defaults to:
+    /// - model: "unknown"
+    /// - reasoning_effort: "medium"
+    ///
+    /// But the actual defaults used by the system are:
+    /// - model: DEFAULT_MODEL (from robocop_core::DEFAULT_MODEL)
+    /// - reasoning_effort: "xhigh" (from preparing.rs DEFAULT_REASONING_EFFORT)
+    ///
+    /// This causes inconsistent information to be shown in recovered batches.
+    #[test]
+    fn test_bug_reconciliation_uses_wrong_defaults() {
+        // The defaults used in reconciliation.rs
+        const RECONCILIATION_DEFAULT_MODEL: &str = "unknown";
+        const RECONCILIATION_DEFAULT_REASONING_EFFORT: &str = "medium";
+
+        // The actual defaults used when creating batches
+        const ACTUAL_DEFAULT_MODEL: &str = crate::openai::DEFAULT_MODEL;
+        const ACTUAL_DEFAULT_REASONING_EFFORT: &str = "xhigh"; // from preparing.rs
+
+        // BUG: These should match, but they don't
+        assert_eq!(
+            RECONCILIATION_DEFAULT_MODEL, ACTUAL_DEFAULT_MODEL,
+            "Reconciliation default model '{}' does not match actual default '{}'.\n\
+             This causes inconsistent info on recovered batches.",
+            RECONCILIATION_DEFAULT_MODEL, ACTUAL_DEFAULT_MODEL
+        );
+        assert_eq!(
+            RECONCILIATION_DEFAULT_REASONING_EFFORT, ACTUAL_DEFAULT_REASONING_EFFORT,
+            "Reconciliation default reasoning_effort '{}' does not match actual default '{}'.\n\
+             This causes inconsistent info on recovered batches.",
+            RECONCILIATION_DEFAULT_REASONING_EFFORT, ACTUAL_DEFAULT_REASONING_EFFORT
+        );
+    }
+}
