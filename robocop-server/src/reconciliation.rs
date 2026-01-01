@@ -25,6 +25,14 @@ const LIST_BATCHES_MAX_RETRIES: u32 = 3;
 /// Delay between retry attempts (in milliseconds).
 const LIST_BATCHES_RETRY_DELAY_MS: u64 = 1000;
 
+/// Number of retry attempts when a batch is not found (eventual consistency).
+/// This handles the case where a batch was just submitted but isn't visible yet.
+const BATCH_NOT_FOUND_MAX_RETRIES: u32 = 2;
+
+/// Delay between retries when batch not found (in milliseconds).
+/// Longer than API error retries since we're waiting for eventual consistency.
+const BATCH_NOT_FOUND_RETRY_DELAY_MS: u64 = 5000;
+
 /// Reconcile any PRs stuck in BatchSubmitting state after a crash.
 ///
 /// This function should be called on server startup, after the state store
@@ -203,19 +211,166 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
 
             (event, Some(pr_url), batch_match.branch_name.clone())
         } else {
-            warn!(
-                "Reconciliation: No batch found for PR #{} (token: {}). Will retry submission.",
-                pr_id.pr_number, token
-            );
+            // Batch not found in initial list. This could be due to eventual consistency
+            // (batch was just submitted but not visible yet). Retry a few times before giving up.
+            let mut found_match: Option<BatchMatch> = None;
 
-            let event = Event::ReconciliationFailed {
-                reconciliation_token: token.clone(),
-                error: "No matching batch found at OpenAI".to_string(),
-            };
+            for retry in 1..=BATCH_NOT_FOUND_MAX_RETRIES {
+                info!(
+                    "Reconciliation: No batch found for PR #{} (token: {}). \
+                     Waiting {}ms before retry {}/{}...",
+                    pr_id.pr_number,
+                    token,
+                    BATCH_NOT_FOUND_RETRY_DELAY_MS,
+                    retry,
+                    BATCH_NOT_FOUND_MAX_RETRIES
+                );
 
-            // For failed reconciliation, use constructed pr_url
-            // branch_name will be None since we don't have metadata
-            (event, Some(fallback_pr_url), None)
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    BATCH_NOT_FOUND_RETRY_DELAY_MS,
+                ))
+                .await;
+
+                // Re-list batches from OpenAI
+                let mut retry_batches = Vec::new();
+                let mut after_cursor: Option<String> = None;
+                let mut api_retry_count = 0;
+
+                'pagination: loop {
+                    match state
+                        .openai_client
+                        .list_batches(None, Some(MAX_BATCH_LIST_LIMIT), after_cursor.as_deref())
+                        .await
+                    {
+                        Ok(response) => {
+                            api_retry_count = 0;
+                            retry_batches.extend(response.data);
+
+                            if response.has_more {
+                                if let Some(cursor) = response.last_id {
+                                    after_cursor = Some(cursor);
+                                } else {
+                                    break 'pagination;
+                                }
+                            } else {
+                                break 'pagination;
+                            }
+                        }
+                        Err(e) => {
+                            api_retry_count += 1;
+                            if api_retry_count >= LIST_BATCHES_MAX_RETRIES {
+                                warn!(
+                                    "Failed to re-list batches during retry: {}. Continuing with stale data.",
+                                    e
+                                );
+                                break 'pagination;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                LIST_BATCHES_RETRY_DELAY_MS,
+                            ))
+                            .await;
+                        }
+                    }
+                }
+
+                // Search for our token in the fresh batch list
+                for batch in &retry_batches {
+                    if let Some(metadata) = &batch.metadata {
+                        if metadata.get("reconciliation_token") == Some(&token) {
+                            let branch_name = metadata.get("branch").and_then(|b| {
+                                if b == "<no branch>" {
+                                    None
+                                } else {
+                                    Some(b.clone())
+                                }
+                            });
+
+                            found_match = Some(BatchMatch {
+                                batch_id: batch.id.clone(),
+                                model: metadata.get("model").cloned(),
+                                reasoning_effort: metadata.get("reasoning_effort").cloned(),
+                                comment_id: metadata.get("comment_id").and_then(|s| s.parse().ok()),
+                                check_run_id: metadata
+                                    .get("check_run_id")
+                                    .and_then(|s| s.parse().ok()),
+                                branch_name,
+                                pr_url: metadata.get("pull_request_url").cloned(),
+                            });
+
+                            info!(
+                                "Reconciliation: Found batch {} for PR #{} on retry {}",
+                                batch.id, pr_id.pr_number, retry
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if found_match.is_some() {
+                    break;
+                }
+            }
+
+            if let Some(batch_match) = found_match {
+                // Found the batch on retry
+                let event = Event::ReconciliationComplete {
+                    batch_id: BatchId::from(batch_match.batch_id.clone()),
+                    comment_id: batch_match.comment_id.map(CommentId),
+                    check_run_id: batch_match.check_run_id.map(CheckRunId),
+                    model: batch_match
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                    reasoning_effort: batch_match
+                        .reasoning_effort
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string()),
+                };
+
+                let pr_url = batch_match.pr_url.clone().unwrap_or(fallback_pr_url);
+                (event, Some(pr_url), batch_match.branch_name.clone())
+            } else {
+                // Still not found after retries - fetch PR details from GitHub for branch name
+                warn!(
+                    "Reconciliation: No batch found for PR #{} (token: {}) after {} retries. Will retry submission.",
+                    pr_id.pr_number, token, BATCH_NOT_FOUND_MAX_RETRIES
+                );
+
+                // Try to fetch the current branch name from GitHub
+                let branch_name = match state
+                    .github_client
+                    .get_pull_request(
+                        None,
+                        installation_id,
+                        &pr_id.repo_owner,
+                        &pr_id.repo_name,
+                        pr_id.pr_number,
+                    )
+                    .await
+                {
+                    Ok(pr_response) => {
+                        info!(
+                            "Reconciliation: Fetched branch name '{}' from GitHub for PR #{}",
+                            pr_response.head.ref_name, pr_id.pr_number
+                        );
+                        Some(pr_response.head.ref_name)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Reconciliation: Failed to fetch PR details from GitHub: {}. Branch name will be unknown.",
+                            e
+                        );
+                        None
+                    }
+                };
+
+                let event = Event::ReconciliationFailed {
+                    reconciliation_token: token.clone(),
+                    error: "No matching batch found at OpenAI".to_string(),
+                };
+
+                (event, Some(fallback_pr_url), branch_name)
+            }
         };
 
         // Create an interpreter context for this PR with recovered metadata
