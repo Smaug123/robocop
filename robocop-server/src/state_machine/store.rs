@@ -211,24 +211,19 @@ impl StateStore {
 
     /// Set the state for a PR.
     ///
-    /// This preserves the existing installation_id if one exists.
+    /// The caller must provide the installation_id to avoid read-modify-write
+    /// races that could lose the installation_id on transient repository errors.
     ///
     /// # Safety
     /// This method must only be called while holding the per-PR lock to prevent
     /// read-modify-write races. It is intentionally private; external callers
     /// should use `process_event` which handles locking.
-    async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) {
-        let installation_id = match self.repository.get(&pr_id).await {
-            Ok(Some(stored)) => stored.installation_id,
-            Ok(None) => None,
-            Err(e) => {
-                error!(
-                    "Repository error getting installation_id for PR #{}: {}",
-                    pr_id.pr_number, e
-                );
-                None
-            }
-        };
+    async fn set(
+        &self,
+        pr_id: StateMachinePrId,
+        state: ReviewMachineState,
+        installation_id: Option<u64>,
+    ) {
         if let Err(e) = self
             .repository
             .put(
@@ -277,14 +272,30 @@ impl StateStore {
 
     /// Set the installation ID for a PR.
     ///
-    /// This preserves the existing state if one exists.
+    /// This preserves the existing state if one exists. If a repository read
+    /// error occurs, the write is skipped to avoid overwriting real state with
+    /// a default.
     ///
     /// # Safety
     /// This method must only be called while holding the per-PR lock to prevent
     /// read-modify-write races. It is intentionally private; external callers
     /// should use `process_event` which handles locking.
     async fn set_installation_id(&self, pr_id: &StateMachinePrId, installation_id: u64) {
-        let state = self.get_or_default(pr_id).await;
+        // Read directly (not via get_or_default) to distinguish "not found" from "error".
+        // On error, we skip the write to avoid overwriting real state with a default.
+        let state = match self.repository.get(pr_id).await {
+            Ok(Some(stored)) => stored.state,
+            Ok(None) => ReviewMachineState::default(),
+            Err(e) => {
+                error!(
+                    "Repository error reading state for PR #{} while setting installation_id: {}; \
+                     skipping write to avoid overwriting real state",
+                    pr_id.pr_number, e
+                );
+                return;
+            }
+        };
+
         if let Err(e) = self
             .repository
             .put(
@@ -412,8 +423,15 @@ impl StateStore {
             }
         }
 
-        // Store the final state
-        self.set(pr_id.clone(), current_state.clone()).await;
+        // Store the final state with the installation_id we received.
+        // We pass the installation_id explicitly rather than reading it back from
+        // the repository, to avoid losing it on transient read errors.
+        self.set(
+            pr_id.clone(),
+            current_state.clone(),
+            Some(ctx.installation_id),
+        )
+        .await;
 
         info!(
             "Final state for PR #{}: {:?}",
@@ -547,6 +565,7 @@ pub fn batch_status_update_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_machine::repository::RepositoryError;
 
     #[tokio::test]
     async fn test_state_store_get_or_default() {
@@ -570,7 +589,7 @@ mod tests {
         let state = ReviewMachineState::Idle {
             reviews_enabled: false,
         };
-        store.set(pr_id.clone(), state.clone()).await;
+        store.set(pr_id.clone(), state.clone(), Some(12345)).await;
 
         let retrieved = store.get(&pr_id).await;
         assert_eq!(retrieved, Some(state));
@@ -584,7 +603,7 @@ mod tests {
         let state = ReviewMachineState::Idle {
             reviews_enabled: false,
         };
-        store.set(pr_id.clone(), state.clone()).await;
+        store.set(pr_id.clone(), state.clone(), Some(12345)).await;
 
         let removed = store.remove(&pr_id).await;
         assert_eq!(removed, Some(state));
@@ -618,7 +637,7 @@ mod tests {
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
         };
-        store.set(pr_id.clone(), initial_state).await;
+        store.set(pr_id.clone(), initial_state, Some(12345)).await;
 
         // Now rehydrate with reviews_enabled: false (user added <!-- no review -->)
         let state = store.get_or_init(&pr_id, false).await;
@@ -649,24 +668,38 @@ mod tests {
 
     /// Test that concurrent get_or_init calls for the same PR are serialized.
     ///
-    /// This test spawns multiple concurrent tasks that each call get_or_init
-    /// for the same PR. The per-PR lock should ensure they're serialized,
-    /// preventing races where one task's update overwrites another's.
+    /// Property: Each call to get_or_init returns a state where reviews_enabled
+    /// matches the value passed in. This proves serialization because without it,
+    /// a call could read stale state and return a mismatched value.
+    ///
+    /// This test spawns multiple concurrent tasks that alternate between
+    /// enabling/disabling reviews. The per-PR lock should ensure they're
+    /// serialized, so each call observes the state after any prior writes.
     #[tokio::test]
     async fn test_concurrent_get_or_init_is_serialized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
         let store = Arc::new(StateStore::new());
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
+        let mismatch_count = Arc::new(AtomicUsize::new(0));
 
-        // Spawn 10 concurrent tasks that alternate between enabling/disabling reviews
+        // Spawn 20 concurrent tasks that alternate between enabling/disabling reviews
         let mut handles = vec![];
-        for i in 0..10 {
+        for i in 0..20 {
             let store = store.clone();
             let pr_id = pr_id.clone();
+            let mismatch_count = mismatch_count.clone();
             let reviews_enabled = i % 2 == 0;
             handles.push(tokio::spawn(async move {
-                store.get_or_init(&pr_id, reviews_enabled).await
+                let state = store.get_or_init(&pr_id, reviews_enabled).await;
+                // Each call should return a state matching its input.
+                // If serialization is broken, a call could read stale state
+                // and return reviews_enabled != what was passed in.
+                if state.reviews_enabled() != reviews_enabled {
+                    mismatch_count.fetch_add(1, Ordering::SeqCst);
+                }
+                state
             }));
         }
 
@@ -675,7 +708,15 @@ mod tests {
             let _ = handle.await.unwrap();
         }
 
-        // The final state should exist and be consistent
+        // Serialization ensures each call sees a consistent state and updates it
+        assert_eq!(
+            mismatch_count.load(Ordering::SeqCst),
+            0,
+            "All get_or_init calls should return states matching their input \
+             (serialization prevents stale reads)"
+        );
+
+        // The final state should exist
         let final_state = store.get(&pr_id).await;
         assert!(
             final_state.is_some(),
@@ -708,5 +749,613 @@ mod tests {
             let state = handle.await.unwrap();
             assert!(state.reviews_enabled());
         }
+    }
+
+    // =========================================================================
+    // Repository error path tests
+    // =========================================================================
+
+    /// A repository that fails on demand, for testing error handling.
+    struct FailingRepository {
+        inner: InMemoryRepository,
+        fail_gets: std::sync::atomic::AtomicBool,
+        fail_puts: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingRepository {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryRepository::new(),
+                fail_gets: std::sync::atomic::AtomicBool::new(false),
+                fail_puts: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail_gets(&self, fail: bool) {
+            self.fail_gets
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateRepository for FailingRepository {
+        async fn get(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
+            if self.fail_gets.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RepositoryError::StorageError(
+                    "simulated read failure".to_string(),
+                ));
+            }
+            self.inner.get(id).await
+        }
+
+        async fn put(
+            &self,
+            id: &StateMachinePrId,
+            state: StoredState,
+        ) -> Result<(), RepositoryError> {
+            if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RepositoryError::StorageError(
+                    "simulated write failure".to_string(),
+                ));
+            }
+            self.inner.put(id, state).await
+        }
+
+        async fn delete(
+            &self,
+            id: &StateMachinePrId,
+        ) -> Result<Option<StoredState>, RepositoryError> {
+            self.inner.delete(id).await
+        }
+
+        async fn get_pending(
+            &self,
+        ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_pending().await
+        }
+    }
+
+    /// Test that set_installation_id skips writes when repository read fails.
+    ///
+    /// This prevents overwriting real state with a default on transient errors.
+    /// Regression test for: repository read errors treated as "missing".
+    #[tokio::test]
+    async fn test_set_installation_id_skips_write_on_read_error() {
+        let repo = Arc::new(FailingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // First, write a state with installation_id 111
+        let state = ReviewMachineState::Idle {
+            reviews_enabled: false,
+        };
+        store.set(pr_id.clone(), state.clone(), Some(111)).await;
+
+        // Verify the state was written correctly
+        let stored = repo.inner.get(&pr_id).await.unwrap().unwrap();
+        assert_eq!(stored.installation_id, Some(111));
+        assert!(!stored.state.reviews_enabled());
+
+        // Now make reads fail
+        repo.set_fail_gets(true);
+
+        // Try to set a new installation_id - this should skip the write
+        store.set_installation_id(&pr_id, 222).await;
+
+        // Stop failing
+        repo.set_fail_gets(false);
+
+        // Verify the original state is preserved (not overwritten with default)
+        let stored = repo.inner.get(&pr_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.installation_id,
+            Some(111),
+            "Original installation_id should be preserved when read fails"
+        );
+        assert!(
+            !stored.state.reviews_enabled(),
+            "Original state should be preserved when read fails"
+        );
+    }
+
+    /// Test that installation_id is preserved across state updates.
+    ///
+    /// Regression test for: installation_id preservation across state updates.
+    #[tokio::test]
+    async fn test_installation_id_preserved_across_state_updates() {
+        let store = StateStore::new();
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set initial state with installation_id
+        let initial_state = ReviewMachineState::Idle {
+            reviews_enabled: true,
+        };
+        store.set(pr_id.clone(), initial_state, Some(12345)).await;
+
+        // Verify installation_id is set
+        let installation_id = store.get_installation_id(&pr_id).await;
+        assert_eq!(installation_id, Some(12345));
+
+        // Update to a different state, passing the same installation_id
+        let new_state = ReviewMachineState::Idle {
+            reviews_enabled: false,
+        };
+        store.set(pr_id.clone(), new_state, Some(12345)).await;
+
+        // Verify installation_id is still present
+        let installation_id = store.get_installation_id(&pr_id).await;
+        assert_eq!(
+            installation_id,
+            Some(12345),
+            "installation_id should be preserved across state updates"
+        );
+    }
+
+    /// Test that set_installation_id correctly updates the installation_id
+    /// while preserving the existing state.
+    #[tokio::test]
+    async fn test_set_installation_id_preserves_state() {
+        use crate::state_machine::state::{BatchId, CheckRunId, CommentId, CommitSha};
+
+        let store = StateStore::new();
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set up a BatchPending state with installation_id 111
+        let pending_state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from("batch_xyz".to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId(42)),
+            check_run_id: Some(CheckRunId(99)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        store
+            .set(pr_id.clone(), pending_state.clone(), Some(111))
+            .await;
+
+        // Update installation_id to 222
+        store.set_installation_id(&pr_id, 222).await;
+
+        // Verify state is preserved but installation_id is updated
+        let state = store.get(&pr_id).await.unwrap();
+        assert!(
+            matches!(state, ReviewMachineState::BatchPending { batch_id, .. } if batch_id.0 == "batch_xyz"),
+            "State should be preserved after set_installation_id"
+        );
+
+        let installation_id = store.get_installation_id(&pr_id).await;
+        assert_eq!(
+            installation_id,
+            Some(222),
+            "installation_id should be updated"
+        );
+    }
+
+    /// Test that get_or_init preserves installation_id when updating reviews_enabled.
+    #[tokio::test]
+    async fn test_get_or_init_preserves_installation_id() {
+        let store = StateStore::new();
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set up initial state with installation_id
+        let state = ReviewMachineState::Idle {
+            reviews_enabled: true,
+        };
+        store.set(pr_id.clone(), state, Some(12345)).await;
+
+        // Call get_or_init with different reviews_enabled value
+        // This should update reviews_enabled but preserve installation_id
+        let result = store.get_or_init(&pr_id, false).await;
+
+        assert!(
+            !result.reviews_enabled(),
+            "reviews_enabled should be updated"
+        );
+
+        let installation_id = store.get_installation_id(&pr_id).await;
+        assert_eq!(
+            installation_id,
+            Some(12345),
+            "installation_id should be preserved after get_or_init"
+        );
+    }
+
+    // =========================================================================
+    // Property-based tests
+    // =========================================================================
+
+    use crate::state_machine::state::{
+        BatchId, CancellationReason, CheckRunId, CommentId, CommitSha, FailureReason,
+        ReviewOptions, ReviewResult,
+    };
+    use proptest::prelude::*;
+
+    /// Generate an arbitrary CommitSha.
+    fn arb_commit_sha() -> impl Strategy<Value = CommitSha> {
+        "[a-f0-9]{40}".prop_map(CommitSha)
+    }
+
+    /// Generate an arbitrary BatchId.
+    fn arb_batch_id() -> impl Strategy<Value = BatchId> {
+        "batch_[a-zA-Z0-9]{8}".prop_map(BatchId)
+    }
+
+    /// Generate an arbitrary CancellationReason.
+    fn arb_cancellation_reason() -> impl Strategy<Value = CancellationReason> {
+        prop_oneof![
+            Just(CancellationReason::UserRequested),
+            arb_commit_sha().prop_map(|sha| CancellationReason::Superseded { new_sha: sha }),
+            Just(CancellationReason::ReviewsDisabled),
+            Just(CancellationReason::External),
+            Just(CancellationReason::NoChanges),
+            Just(CancellationReason::DiffTooLarge),
+            Just(CancellationReason::NoFiles),
+        ]
+    }
+
+    /// Generate an arbitrary FailureReason.
+    fn arb_failure_reason() -> impl Strategy<Value = FailureReason> {
+        prop_oneof![
+            any::<Option<String>>().prop_map(|error| FailureReason::BatchFailed { error }),
+            Just(FailureReason::BatchExpired),
+            Just(FailureReason::BatchCancelled),
+            any::<String>().prop_map(|error| FailureReason::DownloadFailed { error }),
+            any::<String>().prop_map(|error| FailureReason::ParseFailed { error }),
+            Just(FailureReason::NoOutputFile),
+            any::<String>().prop_map(|error| FailureReason::SubmissionFailed { error }),
+            any::<String>().prop_map(|reason| FailureReason::DataFetchFailed { reason }),
+        ]
+    }
+
+    /// Generate an arbitrary ReviewResult.
+    fn arb_review_result() -> impl Strategy<Value = ReviewResult> {
+        (any::<String>(), any::<bool>(), any::<String>()).prop_map(
+            |(reasoning, substantive_comments, summary)| ReviewResult {
+                reasoning,
+                substantive_comments,
+                summary,
+            },
+        )
+    }
+
+    /// Generate an arbitrary ReviewOptions.
+    fn arb_review_options() -> impl Strategy<Value = ReviewOptions> {
+        (any::<Option<String>>(), any::<Option<String>>()).prop_map(|(model, reasoning_effort)| {
+            ReviewOptions {
+                model,
+                reasoning_effort,
+            }
+        })
+    }
+
+    /// Generate an arbitrary ReviewMachineState covering all variants.
+    fn arb_review_state() -> impl Strategy<Value = ReviewMachineState> {
+        prop_oneof![
+            // Idle
+            any::<bool>().prop_map(|reviews_enabled| ReviewMachineState::Idle { reviews_enabled }),
+            // Preparing
+            (
+                any::<bool>(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                arb_review_options()
+            )
+                .prop_map(|(reviews_enabled, head_sha, base_sha, options)| {
+                    ReviewMachineState::Preparing {
+                        reviews_enabled,
+                        head_sha,
+                        base_sha,
+                        options,
+                    }
+                }),
+            // AwaitingAncestryCheck
+            (
+                any::<bool>(),
+                arb_batch_id(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                any::<Option<u64>>(),
+                any::<Option<u64>>(),
+                any::<String>(),
+                any::<String>(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                arb_review_options(),
+            )
+                .prop_map(
+                    |(
+                        reviews_enabled,
+                        batch_id,
+                        head_sha,
+                        base_sha,
+                        comment_id,
+                        check_run_id,
+                        model,
+                        reasoning_effort,
+                        new_head_sha,
+                        new_base_sha,
+                        new_options,
+                    )| {
+                        ReviewMachineState::AwaitingAncestryCheck {
+                            reviews_enabled,
+                            batch_id,
+                            head_sha,
+                            base_sha,
+                            comment_id: comment_id.map(CommentId),
+                            check_run_id: check_run_id.map(CheckRunId),
+                            model,
+                            reasoning_effort,
+                            new_head_sha,
+                            new_base_sha,
+                            new_options,
+                        }
+                    },
+                ),
+            // BatchPending
+            (
+                any::<bool>(),
+                arb_batch_id(),
+                arb_commit_sha(),
+                arb_commit_sha(),
+                any::<Option<u64>>(),
+                any::<Option<u64>>(),
+                any::<String>(),
+                any::<String>(),
+            )
+                .prop_map(
+                    |(
+                        reviews_enabled,
+                        batch_id,
+                        head_sha,
+                        base_sha,
+                        comment_id,
+                        check_run_id,
+                        model,
+                        reasoning_effort,
+                    )| {
+                        ReviewMachineState::BatchPending {
+                            reviews_enabled,
+                            batch_id,
+                            head_sha,
+                            base_sha,
+                            comment_id: comment_id.map(CommentId),
+                            check_run_id: check_run_id.map(CheckRunId),
+                            model,
+                            reasoning_effort,
+                        }
+                    },
+                ),
+            // Completed
+            (any::<bool>(), arb_commit_sha(), arb_review_result()).prop_map(
+                |(reviews_enabled, head_sha, result)| ReviewMachineState::Completed {
+                    reviews_enabled,
+                    head_sha,
+                    result,
+                }
+            ),
+            // Failed
+            (any::<bool>(), arb_commit_sha(), arb_failure_reason()).prop_map(
+                |(reviews_enabled, head_sha, reason)| ReviewMachineState::Failed {
+                    reviews_enabled,
+                    head_sha,
+                    reason,
+                }
+            ),
+            // Cancelled without pending_cancel_batch_id
+            (any::<bool>(), arb_commit_sha(), arb_cancellation_reason()).prop_map(
+                |(reviews_enabled, head_sha, reason)| ReviewMachineState::Cancelled {
+                    reviews_enabled,
+                    head_sha,
+                    reason,
+                    pending_cancel_batch_id: None,
+                }
+            ),
+            // Cancelled WITH pending_cancel_batch_id
+            (
+                any::<bool>(),
+                arb_commit_sha(),
+                arb_cancellation_reason(),
+                arb_batch_id()
+            )
+                .prop_map(|(reviews_enabled, head_sha, reason, batch_id)| {
+                    ReviewMachineState::Cancelled {
+                        reviews_enabled,
+                        head_sha,
+                        reason,
+                        pending_cancel_batch_id: Some(batch_id),
+                    }
+                }),
+        ]
+    }
+
+    fn test_pr_id(pr_number: u64) -> StateMachinePrId {
+        StateMachinePrId::new("owner", "repo", pr_number)
+    }
+
+    proptest! {
+        /// Property: set_installation_id preserves the state exactly, only changing installation_id.
+        ///
+        /// For any state, calling set_installation_id should not modify the state itself.
+        #[test]
+        fn set_installation_id_preserves_state_for_all_variants(
+            state in arb_review_state(),
+            initial_id in 1u64..1000000,
+            new_id in 1u64..1000000
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let store = StateStore::new();
+                let pr_id = test_pr_id(1);
+
+                // Set initial state with initial_id
+                store.set(pr_id.clone(), state.clone(), Some(initial_id)).await;
+
+                // Update only the installation_id
+                store.set_installation_id(&pr_id, new_id).await;
+
+                // Verify state is unchanged
+                let retrieved = store.get(&pr_id).await.expect("state should exist");
+                assert_eq!(
+                    retrieved, state,
+                    "State should be preserved after set_installation_id.\n\
+                     Expected: {:?}\n\
+                     Got: {:?}",
+                    state, retrieved
+                );
+
+                // Verify installation_id is updated
+                let retrieved_id = store.get_installation_id(&pr_id).await;
+                assert_eq!(
+                    retrieved_id, Some(new_id),
+                    "installation_id should be updated to new value"
+                );
+            });
+        }
+
+        /// Property: get_or_init preserves installation_id for all state variants.
+        ///
+        /// For any state with an installation_id, calling get_or_init (which may
+        /// update reviews_enabled) should preserve the installation_id.
+        #[test]
+        fn get_or_init_preserves_installation_id_for_all_variants(
+            state in arb_review_state(),
+            installation_id in 1u64..1000000,
+            new_reviews_enabled in any::<bool>()
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let store = StateStore::new();
+                let pr_id = test_pr_id(1);
+
+                // Set initial state with installation_id
+                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
+
+                // Call get_or_init with potentially different reviews_enabled
+                let _ = store.get_or_init(&pr_id, new_reviews_enabled).await;
+
+                // Verify installation_id is preserved
+                let retrieved_id = store.get_installation_id(&pr_id).await;
+                assert_eq!(
+                    retrieved_id, Some(installation_id),
+                    "installation_id should be preserved after get_or_init.\n\
+                     Original state: {:?}\n\
+                     new_reviews_enabled: {}",
+                    state, new_reviews_enabled
+                );
+            });
+        }
+
+        /// Property: get_or_init returns state with matching reviews_enabled.
+        ///
+        /// For any state and any reviews_enabled value, get_or_init should return
+        /// a state where reviews_enabled matches the input parameter.
+        #[test]
+        fn get_or_init_returns_matching_reviews_enabled(
+            state in arb_review_state(),
+            installation_id in 1u64..1000000,
+            requested_reviews_enabled in any::<bool>()
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let store = StateStore::new();
+                let pr_id = test_pr_id(1);
+
+                // Set initial state
+                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
+
+                // Call get_or_init
+                let result = store.get_or_init(&pr_id, requested_reviews_enabled).await;
+
+                // Verify reviews_enabled matches requested value
+                assert_eq!(
+                    result.reviews_enabled(), requested_reviews_enabled,
+                    "get_or_init should return state with reviews_enabled matching input.\n\
+                     Original state: {:?}\n\
+                     Requested reviews_enabled: {}\n\
+                     Got reviews_enabled: {}",
+                    state, requested_reviews_enabled, result.reviews_enabled()
+                );
+            });
+        }
+    }
+
+    /// Verify the arb_review_state generator covers all state variants.
+    ///
+    /// This ensures the property tests are actually exploring all state types.
+    #[test]
+    fn arb_review_state_covers_all_variants() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let mut runner = TestRunner::new(Config::default());
+        let mut idle_count = 0u32;
+        let mut preparing_count = 0u32;
+        let mut awaiting_ancestry_count = 0u32;
+        let mut batch_pending_count = 0u32;
+        let mut completed_count = 0u32;
+        let mut failed_count = 0u32;
+        let mut cancelled_count = 0u32;
+
+        // Generate 500 states and count distribution
+        for _ in 0..500 {
+            let state = arb_review_state().new_tree(&mut runner).unwrap().current();
+            match state {
+                ReviewMachineState::Idle { .. } => idle_count += 1,
+                ReviewMachineState::Preparing { .. } => preparing_count += 1,
+                ReviewMachineState::AwaitingAncestryCheck { .. } => awaiting_ancestry_count += 1,
+                ReviewMachineState::BatchPending { .. } => batch_pending_count += 1,
+                ReviewMachineState::Completed { .. } => completed_count += 1,
+                ReviewMachineState::Failed { .. } => failed_count += 1,
+                ReviewMachineState::Cancelled { .. } => cancelled_count += 1,
+            }
+        }
+
+        // Assert each variant is generated at least 5% of the time (25 out of 500)
+        let min_expected = 25;
+        assert!(
+            idle_count >= min_expected,
+            "Generator produced too few Idle states: {} (expected >= {})",
+            idle_count,
+            min_expected
+        );
+        assert!(
+            preparing_count >= min_expected,
+            "Generator produced too few Preparing states: {} (expected >= {})",
+            preparing_count,
+            min_expected
+        );
+        assert!(
+            awaiting_ancestry_count >= min_expected,
+            "Generator produced too few AwaitingAncestryCheck states: {} (expected >= {})",
+            awaiting_ancestry_count,
+            min_expected
+        );
+        assert!(
+            batch_pending_count >= min_expected,
+            "Generator produced too few BatchPending states: {} (expected >= {})",
+            batch_pending_count,
+            min_expected
+        );
+        assert!(
+            completed_count >= min_expected,
+            "Generator produced too few Completed states: {} (expected >= {})",
+            completed_count,
+            min_expected
+        );
+        assert!(
+            failed_count >= min_expected,
+            "Generator produced too few Failed states: {} (expected >= {})",
+            failed_count,
+            min_expected
+        );
+        // Cancelled has two sub-variants in the generator, so it should have ~2x the count
+        assert!(
+            cancelled_count >= min_expected,
+            "Generator produced too few Cancelled states: {} (expected >= {})",
+            cancelled_count,
+            min_expected
+        );
     }
 }
