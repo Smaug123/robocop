@@ -5,8 +5,10 @@
 //! provide different backends (in-memory, SQLite, etc.).
 
 mod memory;
+mod sqlite;
 
 pub use memory::InMemoryRepository;
+pub use sqlite::SqliteRepository;
 
 use async_trait::async_trait;
 use std::fmt;

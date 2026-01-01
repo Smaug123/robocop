@@ -20,6 +20,7 @@ use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
 use robocop_server::reconciliation::reconcile_orphaned_batches;
+use robocop_server::state_machine::repository::SqliteRepository;
 use robocop_server::webhook::webhook_router;
 use robocop_server::{AppState, RecordingLogger, StateStore};
 
@@ -151,13 +152,16 @@ async fn main() -> Result<()> {
             .map(|l: &RecordingLogger| l.clone_for_middleware()),
     );
 
+    let sqlite_repo =
+        SqliteRepository::new("./robocop-state.db").expect("Failed to initialize SQLite database");
+
     let app_state = Arc::new(AppState {
         github_client: Arc::new(github_client),
         openai_client: Arc::new(openai_client),
         webhook_secret: config.github_webhook_secret,
         target_user_id: config.target_user_id,
         review_states: Arc::new(RwLock::new(HashMap::new())),
-        state_store: Arc::new(StateStore::new()),
+        state_store: Arc::new(StateStore::with_repository(Arc::new(sqlite_repo))),
         recording_logger,
     });
 
