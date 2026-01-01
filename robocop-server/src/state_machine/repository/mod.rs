@@ -18,19 +18,90 @@ use super::store::StateMachinePrId;
 ///
 /// This allows callers to distinguish between "not found" (None) and
 /// "storage error" (Err), which is critical for crash-recovery.
-#[derive(Debug, Clone)]
+///
+/// # Security
+/// Error messages are intentionally kept generic to prevent leaking secrets
+/// (like database DSNs or credentials) that might be present in raw backend
+/// errors. The `Display` impl only shows the error kind, not raw details.
+/// Use `Debug` for troubleshooting in development only.
+#[derive(Clone)]
 pub enum RepositoryError {
     /// Storage backend is unavailable or failed.
-    StorageError(String),
+    ///
+    /// The optional raw error is stored for debugging but NOT included
+    /// in `Display` to prevent accidental secret leakage in logs.
+    StorageError {
+        /// Brief description of what operation failed (safe for logging)
+        operation: &'static str,
+        /// Raw error message from backend (NOT included in Display)
+        /// This may contain sensitive data like connection strings.
+        raw_error: Option<String>,
+    },
     /// Data is corrupted or invalid.
-    DataCorruption(String),
+    DataCorruption {
+        /// Brief description of what was corrupted (safe for logging)
+        what: &'static str,
+    },
+}
+
+impl RepositoryError {
+    /// Create a storage error for a specific operation.
+    ///
+    /// The raw_error is stored for debugging but will not appear in logs.
+    pub fn storage(operation: &'static str, raw_error: impl Into<String>) -> Self {
+        Self::StorageError {
+            operation,
+            raw_error: Some(raw_error.into()),
+        }
+    }
+
+    /// Create a storage error without raw error details.
+    pub fn storage_simple(operation: &'static str) -> Self {
+        Self::StorageError {
+            operation,
+            raw_error: None,
+        }
+    }
+
+    /// Create a data corruption error.
+    pub fn corruption(what: &'static str) -> Self {
+        Self::DataCorruption { what }
+    }
+}
+
+impl fmt::Debug for RepositoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Debug shows everything for development troubleshooting
+        match self {
+            Self::StorageError {
+                operation,
+                raw_error,
+            } => {
+                let mut d = f.debug_struct("StorageError");
+                d.field("operation", operation);
+                if let Some(raw) = raw_error {
+                    d.field("raw_error", raw);
+                }
+                d.finish()
+            }
+            Self::DataCorruption { what } => f
+                .debug_struct("DataCorruption")
+                .field("what", what)
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Display for RepositoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Display intentionally omits raw_error to prevent secret leakage in logs
         match self {
-            RepositoryError::StorageError(msg) => write!(f, "storage error: {}", msg),
-            RepositoryError::DataCorruption(msg) => write!(f, "data corruption: {}", msg),
+            Self::StorageError { operation, .. } => {
+                write!(f, "storage error during {}", operation)
+            }
+            Self::DataCorruption { what } => {
+                write!(f, "data corruption: {}", what)
+            }
         }
     }
 }

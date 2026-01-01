@@ -136,11 +136,12 @@ impl StateStore {
     ///
     /// Returns:
     /// - `Ok(state)` - the current/updated state (always matches what's persisted)
-    /// - `Err(RepositoryError)` - if a storage error occurred
+    /// - `Err(RepositoryError)` - if a storage error occurred (read or write)
     ///
-    /// IMPORTANT: The returned state always matches what's persisted in storage.
-    /// On write failure when updating reviews_enabled, returns the ORIGINAL state
-    /// (not the updated one) to maintain consistency with persisted data.
+    /// IMPORTANT: If the reviews_enabled update fails to persist, this returns Err
+    /// so callers know the update didn't take effect. This prevents the scenario where
+    /// a user disables reviews (e.g., adding <!-- no review -->) but the update fails
+    /// silently, causing reviews to run when they shouldn't.
     pub async fn get_or_init(
         &self,
         pr_id: &StateMachinePrId,
@@ -156,8 +157,7 @@ impl StateStore {
                 // update the state to reflect the new value
                 if stored.state.reviews_enabled() != reviews_enabled {
                     let updated_state = stored.state.clone().with_reviews_enabled(reviews_enabled);
-                    if let Err(e) = self
-                        .repository
+                    self.repository
                         .put(
                             pr_id,
                             StoredState {
@@ -166,16 +166,13 @@ impl StateStore {
                             },
                         )
                         .await
-                    {
-                        error!(
-                            "Repository error updating state for PR #{}: {}; \
-                             returning original state to maintain consistency",
-                            pr_id.pr_number, e
-                        );
-                        // Return the ORIGINAL state (not updated) since write failed.
-                        // This ensures returned state matches persisted state.
-                        return Ok(stored.state);
-                    }
+                        .map_err(|e| {
+                            error!(
+                                "Repository error updating reviews_enabled for PR #{}: {}",
+                                pr_id.pr_number, e
+                            );
+                            e
+                        })?;
                     return Ok(updated_state);
                 }
                 Ok(stored.state)
@@ -234,6 +231,9 @@ impl StateStore {
     /// The caller must provide the installation_id to avoid read-modify-write
     /// races that could lose the installation_id on transient repository errors.
     ///
+    /// Returns `Err` if the state could not be persisted. Callers MUST handle
+    /// this error to avoid emitting effects without durable state.
+    ///
     /// # Safety
     /// This method must only be called while holding the per-PR lock to prevent
     /// read-modify-write races. It is intentionally private; external callers
@@ -243,9 +243,8 @@ impl StateStore {
         pr_id: StateMachinePrId,
         state: ReviewMachineState,
         installation_id: Option<u64>,
-    ) {
-        if let Err(e) = self
-            .repository
+    ) -> Result<(), RepositoryError> {
+        self.repository
             .put(
                 &pr_id,
                 StoredState {
@@ -254,12 +253,13 @@ impl StateStore {
                 },
             )
             .await
-        {
-            error!(
-                "Repository error setting state for PR #{}: {}",
-                pr_id.pr_number, e
-            );
-        }
+            .map_err(|e| {
+                error!(
+                    "Repository error setting state for PR #{}: {}",
+                    pr_id.pr_number, e
+                );
+                e
+            })
     }
 
     /// Remove the state for a PR (e.g., when PR is closed).
@@ -413,12 +413,15 @@ impl StateStore {
         let pr_lock = self.get_or_create_pr_lock(pr_id).await;
         let _guard = pr_lock.lock().await;
 
-        // Store the installation_id for later use by batch polling
-        self.set_installation_id(pr_id, ctx.installation_id).await;
-
-        // Get current state. On read error, return early WITHOUT processing or writing.
-        // This prevents overwriting valid persisted state with defaults.
+        // Get current state FIRST, before any writes.
+        // On read error, return early WITHOUT processing or writing.
+        // This prevents overwriting valid persisted state with defaults,
+        // and ensures no partial writes occur before returning an error.
         let mut current_state = self.get_or_default(pr_id).await?;
+
+        // Now that read succeeded, store the installation_id for batch polling.
+        // This happens after the read to ensure no writes occur if the read fails.
+        self.set_installation_id(pr_id, ctx.installation_id).await;
 
         // Event loop: process initial event and any result events from effects
         let mut events_to_process = vec![event];
@@ -454,12 +457,16 @@ impl StateStore {
         // Store the final state with the installation_id we received.
         // We pass the installation_id explicitly rather than reading it back from
         // the repository, to avoid losing it on transient read errors.
+        //
+        // IMPORTANT: This MUST succeed for process_event to return Ok. If persistence
+        // fails, effects have been executed but state isn't durable, breaking crash
+        // recovery (duplicate/lost effects on restart).
         self.set(
             pr_id.clone(),
             current_state.clone(),
             Some(ctx.installation_id),
         )
-        .await;
+        .await?;
 
         info!(
             "Final state for PR #{}: {:?}",
@@ -617,7 +624,10 @@ mod tests {
         let state = ReviewMachineState::Idle {
             reviews_enabled: false,
         };
-        store.set(pr_id.clone(), state.clone(), Some(12345)).await;
+        store
+            .set(pr_id.clone(), state.clone(), Some(12345))
+            .await
+            .unwrap();
 
         let retrieved = store.get(&pr_id).await;
         assert_eq!(retrieved, Some(state));
@@ -631,7 +641,10 @@ mod tests {
         let state = ReviewMachineState::Idle {
             reviews_enabled: false,
         };
-        store.set(pr_id.clone(), state.clone(), Some(12345)).await;
+        store
+            .set(pr_id.clone(), state.clone(), Some(12345))
+            .await
+            .unwrap();
 
         let removed = store.remove(&pr_id).await;
         assert_eq!(removed, Some(state));
@@ -665,7 +678,10 @@ mod tests {
             model: "gpt-4".to_string(),
             reasoning_effort: "high".to_string(),
         };
-        store.set(pr_id.clone(), initial_state, Some(12345)).await;
+        store
+            .set(pr_id.clone(), initial_state, Some(12345))
+            .await
+            .unwrap();
 
         // Now rehydrate with reviews_enabled: false (user added <!-- no review -->)
         let state = store.get_or_init(&pr_id, false).await.unwrap();
@@ -809,9 +825,7 @@ mod tests {
     impl StateRepository for FailingRepository {
         async fn get(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
             if self.fail_gets.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(RepositoryError::StorageError(
-                    "simulated read failure".to_string(),
-                ));
+                return Err(RepositoryError::storage("get", "simulated read failure"));
             }
             self.inner.get(id).await
         }
@@ -822,9 +836,7 @@ mod tests {
             state: StoredState,
         ) -> Result<(), RepositoryError> {
             if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(RepositoryError::StorageError(
-                    "simulated write failure".to_string(),
-                ));
+                return Err(RepositoryError::storage("put", "simulated write failure"));
             }
             self.inner.put(id, state).await
         }
@@ -857,7 +869,10 @@ mod tests {
         let state = ReviewMachineState::Idle {
             reviews_enabled: false,
         };
-        store.set(pr_id.clone(), state.clone(), Some(111)).await;
+        store
+            .set(pr_id.clone(), state.clone(), Some(111))
+            .await
+            .unwrap();
 
         // Verify the state was written correctly
         let stored = repo.inner.get(&pr_id).await.unwrap().unwrap();
@@ -906,7 +921,8 @@ mod tests {
         };
         store
             .set(pr_id.clone(), original_state.clone(), Some(111))
-            .await;
+            .await
+            .unwrap();
 
         // Make reads fail (simulating transient storage error)
         repo.set_fail_gets(true);
@@ -929,13 +945,13 @@ mod tests {
         );
     }
 
-    /// Regression test: get_or_init must not return unpersisted state when write fails.
+    /// Regression test: get_or_init returns Err when write fails.
     ///
-    /// When storage write fails while updating reviews_enabled, get_or_init returns
-    /// the ORIGINAL state (not the updated one) to maintain consistency with
-    /// what's actually persisted.
+    /// When storage write fails while updating reviews_enabled, get_or_init
+    /// now returns Err so callers know the update didn't take effect.
+    /// This prevents reviews from running when they should be suppressed.
     #[tokio::test]
-    async fn test_get_or_init_write_error_must_not_return_unpersisted_state() {
+    async fn test_get_or_init_returns_err_on_write_failure() {
         let repo = Arc::new(FailingRepository::new());
         let store = StateStore::with_repository(repo.clone());
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
@@ -946,33 +962,31 @@ mod tests {
         };
         store
             .set(pr_id.clone(), original_state.clone(), Some(111))
-            .await;
+            .await
+            .unwrap();
 
         // Now make writes fail
         repo.fail_puts
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // Call get_or_init with reviews_enabled: false
-        // With the fix: This returns the ORIGINAL state (reviews_enabled: true)
-        // because the write failed, so returned state matches persisted state.
-        let returned_state = store.get_or_init(&pr_id, false).await.unwrap();
+        // This should return Err because the write failed
+        let result = store.get_or_init(&pr_id, false).await;
+
+        assert!(
+            result.is_err(),
+            "get_or_init should return Err when write fails, not Ok"
+        );
 
         // Stop failing writes
         repo.fail_puts
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Read the actual persisted state
+        // Read the actual persisted state - should be unchanged
         let persisted = repo.inner.get(&pr_id).await.unwrap().unwrap();
-
-        // CORRECT behavior: returned state must match persisted state
-        // (Since write failed, both should be true - the original value)
-        assert_eq!(
-            returned_state.reviews_enabled(),
+        assert!(
             persisted.state.reviews_enabled(),
-            "Returned state must match persisted state.\n\
-             Returned reviews_enabled: {}, Persisted reviews_enabled: {}",
-            returned_state.reviews_enabled(),
-            persisted.state.reviews_enabled()
+            "Persisted state should still have reviews_enabled: true"
         );
     }
 
@@ -988,7 +1002,10 @@ mod tests {
         let initial_state = ReviewMachineState::Idle {
             reviews_enabled: true,
         };
-        store.set(pr_id.clone(), initial_state, Some(12345)).await;
+        store
+            .set(pr_id.clone(), initial_state, Some(12345))
+            .await
+            .unwrap();
 
         // Verify installation_id is set
         let installation_id = store.get_installation_id(&pr_id).await;
@@ -998,7 +1015,10 @@ mod tests {
         let new_state = ReviewMachineState::Idle {
             reviews_enabled: false,
         };
-        store.set(pr_id.clone(), new_state, Some(12345)).await;
+        store
+            .set(pr_id.clone(), new_state, Some(12345))
+            .await
+            .unwrap();
 
         // Verify installation_id is still present
         let installation_id = store.get_installation_id(&pr_id).await;
@@ -1031,7 +1051,8 @@ mod tests {
         };
         store
             .set(pr_id.clone(), pending_state.clone(), Some(111))
-            .await;
+            .await
+            .unwrap();
 
         // Update installation_id to 222
         store.set_installation_id(&pr_id, 222).await;
@@ -1061,7 +1082,7 @@ mod tests {
         let state = ReviewMachineState::Idle {
             reviews_enabled: true,
         };
-        store.set(pr_id.clone(), state, Some(12345)).await;
+        store.set(pr_id.clone(), state, Some(12345)).await.unwrap();
 
         // Call get_or_init with different reviews_enabled value
         // This should update reviews_enabled but preserve installation_id
@@ -1308,7 +1329,7 @@ mod tests {
                 let pr_id = test_pr_id(1);
 
                 // Set initial state with initial_id
-                store.set(pr_id.clone(), state.clone(), Some(initial_id)).await;
+                store.set(pr_id.clone(), state.clone(), Some(initial_id)).await.unwrap();
 
                 // Update only the installation_id
                 store.set_installation_id(&pr_id, new_id).await;
@@ -1348,7 +1369,7 @@ mod tests {
                 let pr_id = test_pr_id(1);
 
                 // Set initial state with installation_id
-                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
+                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await.unwrap();
 
                 // Call get_or_init with potentially different reviews_enabled
                 let _ = store.get_or_init(&pr_id, new_reviews_enabled).await.unwrap();
@@ -1381,7 +1402,7 @@ mod tests {
                 let pr_id = test_pr_id(1);
 
                 // Set initial state
-                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
+                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await.unwrap();
 
                 // Call get_or_init
                 let result = store.get_or_init(&pr_id, requested_reviews_enabled).await.unwrap();
@@ -1402,12 +1423,12 @@ mod tests {
         // Property-based tests for repository error handling
         // =====================================================================
 
-        /// Property: get_or_init returned state must always match persisted state.
+        /// Property: get_or_init returns Err when write fails (if update is needed).
         ///
-        /// When write fails while updating reviews_enabled, get_or_init returns the
-        /// ORIGINAL state (not the updated one) to maintain consistency with storage.
+        /// When reviews_enabled differs and the write fails, get_or_init returns Err
+        /// so callers know the update didn't take effect.
         #[test]
-        fn get_or_init_returned_state_matches_persisted_on_write_failure(
+        fn get_or_init_returns_err_on_write_failure_if_update_needed(
             state in arb_review_state(),
             installation_id in 1u64..1000000,
             requested_reviews_enabled in any::<bool>()
@@ -1419,36 +1440,355 @@ mod tests {
                 let pr_id = test_pr_id(1);
 
                 // Set initial state
-                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await;
+                store.set(pr_id.clone(), state.clone(), Some(installation_id)).await.unwrap();
 
                 // Make writes fail
                 repo.fail_puts.store(true, std::sync::atomic::Ordering::SeqCst);
 
-                // Call get_or_init - write will fail, should return original state
-                let returned = store.get_or_init(&pr_id, requested_reviews_enabled).await.unwrap();
+                // Call get_or_init
+                let result = store.get_or_init(&pr_id, requested_reviews_enabled).await;
 
                 // Stop failing writes
                 repo.fail_puts.store(false, std::sync::atomic::Ordering::SeqCst);
 
-                // Read actual persisted state
-                let persisted = repo.inner.get(&pr_id).await.unwrap().unwrap();
-
-                // PROPERTY: returned state must match persisted state
-                assert_eq!(
-                    returned.reviews_enabled(),
-                    persisted.state.reviews_enabled(),
-                    "Returned state must match persisted state on write failure.\n\
-                     Original state: {:?}\n\
-                     Requested reviews_enabled: {}\n\
-                     Returned reviews_enabled: {}\n\
-                     Persisted reviews_enabled: {}",
-                    state,
-                    requested_reviews_enabled,
-                    returned.reviews_enabled(),
-                    persisted.state.reviews_enabled()
-                );
+                // PROPERTY: If update is needed (reviews_enabled differs), should return Err.
+                // If no update needed (reviews_enabled matches), should return Ok.
+                let update_needed = state.reviews_enabled() != requested_reviews_enabled;
+                if update_needed {
+                    assert!(
+                        result.is_err(),
+                        "get_or_init should return Err when write fails and update is needed.\n\
+                         Original state reviews_enabled: {}\n\
+                         Requested reviews_enabled: {}",
+                        state.reviews_enabled(),
+                        requested_reviews_enabled
+                    );
+                } else {
+                    assert!(
+                        result.is_ok(),
+                        "get_or_init should return Ok when no update is needed.\n\
+                         Original state reviews_enabled: {}\n\
+                         Requested reviews_enabled: {}",
+                        state.reviews_enabled(),
+                        requested_reviews_enabled
+                    );
+                }
             });
         }
+    }
+
+    // =========================================================================
+    // Bug regression tests: Repository error handling
+    // These tests document bugs that need to be fixed. Each test should FAIL
+    // until the corresponding bug is fixed.
+    // =========================================================================
+
+    /// A repository that tracks operations for testing atomicity guarantees.
+    struct TrackingRepository {
+        inner: InMemoryRepository,
+        fail_gets: std::sync::atomic::AtomicBool,
+        fail_puts: std::sync::atomic::AtomicBool,
+        /// Track number of successful puts (writes that went through)
+        put_count: std::sync::atomic::AtomicUsize,
+        /// Track the order of operations for atomicity testing
+        operations: std::sync::Mutex<Vec<String>>,
+        /// Track number of gets performed (including failed ones)
+        get_count: std::sync::atomic::AtomicUsize,
+        /// Fail gets only after this many successful gets (0 = fail immediately)
+        fail_gets_after: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TrackingRepository {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryRepository::new(),
+                fail_gets: std::sync::atomic::AtomicBool::new(false),
+                fail_puts: std::sync::atomic::AtomicBool::new(false),
+                put_count: std::sync::atomic::AtomicUsize::new(0),
+                operations: std::sync::Mutex::new(Vec::new()),
+                get_count: std::sync::atomic::AtomicUsize::new(0),
+                fail_gets_after: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        #[allow(dead_code)] // Keep for future tests that need simple fail-all-reads behavior
+        fn set_fail_gets(&self, fail: bool) {
+            self.fail_gets
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_fail_puts(&self, fail: bool) {
+            self.fail_puts
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Set gets to fail after N successful gets.
+        /// This simulates transient failures that happen mid-operation.
+        fn set_fail_gets_after(&self, n: usize) {
+            self.fail_gets_after
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+            self.fail_gets
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn put_count(&self) -> usize {
+            self.put_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn operations(&self) -> Vec<String> {
+            self.operations.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateRepository for TrackingRepository {
+        async fn get(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("get:{}", id.pr_number));
+
+            if self.fail_gets.load(std::sync::atomic::Ordering::SeqCst) {
+                let current_count = self
+                    .get_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let fail_after = self
+                    .fail_gets_after
+                    .load(std::sync::atomic::Ordering::SeqCst);
+
+                // Fail if we've exceeded the "fail after" threshold
+                if current_count >= fail_after {
+                    return Err(RepositoryError::storage("get", "simulated read failure"));
+                }
+            }
+            self.inner.get(id).await
+        }
+
+        async fn put(
+            &self,
+            id: &StateMachinePrId,
+            state: StoredState,
+        ) -> Result<(), RepositoryError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("put:{}", id.pr_number));
+            if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RepositoryError::storage("put", "simulated write failure"));
+            }
+            self.put_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put(id, state).await
+        }
+
+        async fn delete(
+            &self,
+            id: &StateMachinePrId,
+        ) -> Result<Option<StoredState>, RepositoryError> {
+            self.inner.delete(id).await
+        }
+
+        async fn get_pending(
+            &self,
+        ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_pending().await
+        }
+    }
+
+    /// BUG TEST (Issue 1): process_event swallows final state persistence errors.
+    ///
+    /// Property: If process_event returns Ok, the final state MUST be persisted.
+    /// Equivalently: If the final state persistence fails, process_event MUST return Err.
+    ///
+    /// Current behavior (BUG): process_event returns Ok even when the final put fails,
+    /// meaning effects have been executed but state isn't durable. On restart, the
+    /// stale state causes duplicate effects or lost progress.
+    #[tokio::test]
+    async fn test_process_event_must_return_err_on_final_persistence_failure() {
+        use crate::state_machine::event::Event;
+        use crate::state_machine::interpreter::InterpreterContext;
+
+        let repo = Arc::new(TrackingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set up initial state
+        let initial_state = ReviewMachineState::Idle {
+            reviews_enabled: true,
+        };
+        store
+            .set(pr_id.clone(), initial_state.clone(), Some(111))
+            .await
+            .unwrap();
+
+        // Create a minimal context (we need real clients for the interpreter, but
+        // we'll use an event that doesn't trigger effects requiring them)
+        // For this test, we use a DisableReviewsRequested event which transitions
+        // to a terminal state without needing external API calls.
+        let ctx = InterpreterContext {
+            github_client: Arc::new(crate::github::GitHubClient::new(
+                12345, // fake app_id
+                "fake_private_key".to_string(),
+            )),
+            openai_client: Arc::new(crate::openai::OpenAIClient::new("fake_api_key".to_string())),
+            installation_id: 12345,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 123,
+            pr_url: None,
+            branch_name: None,
+            correlation_id: None,
+        };
+
+        // Now make puts fail - this will cause the final state persistence to fail
+        repo.set_fail_puts(true);
+
+        // Process an event that transitions state
+        let result = store
+            .process_event(&pr_id, Event::DisableReviewsRequested, &ctx)
+            .await;
+
+        // BUG: Currently this returns Ok even though persistence failed.
+        // CORRECT behavior: Should return Err when final state persistence fails.
+        assert!(
+            result.is_err(),
+            "process_event MUST return Err when final state persistence fails.\n\
+             Current behavior (BUG): Returns Ok({:?}) even though state wasn't persisted.\n\
+             This allows effects to be emitted without durable state, breaking crash recovery.",
+            result
+        );
+    }
+
+    /// Regression test (Issue 2): process_event returns Err with no writes on read error.
+    ///
+    /// Property: If process_event returns Err(ReadError), no writes should have occurred.
+    ///
+    /// The fix reordered operations so that get_or_default (read) is called BEFORE
+    /// set_installation_id (read-write). This ensures that if the initial read fails,
+    /// we return Err immediately without any writes.
+    ///
+    /// Previous behavior (BUG): set_installation_id was called first, so it could write
+    /// before get_or_default failed, causing partial writes.
+    #[tokio::test]
+    async fn test_process_event_no_writes_before_read_error() {
+        use crate::state_machine::event::Event;
+        use crate::state_machine::interpreter::InterpreterContext;
+
+        let repo = Arc::new(TrackingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set up initial state with installation_id 111
+        let initial_state = ReviewMachineState::Idle {
+            reviews_enabled: false,
+        };
+        // Manually put via inner to avoid going through tracking
+        repo.inner
+            .put(
+                &pr_id,
+                StoredState {
+                    state: initial_state.clone(),
+                    installation_id: Some(111),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Reset counters after setup
+        repo.put_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        repo.operations.lock().unwrap().clear();
+
+        // Create context with a DIFFERENT installation_id (222)
+        let ctx = InterpreterContext {
+            github_client: Arc::new(crate::github::GitHubClient::new(
+                12345, // fake app_id
+                "fake_private_key".to_string(),
+            )),
+            openai_client: Arc::new(crate::openai::OpenAIClient::new("fake_api_key".to_string())),
+            installation_id: 222, // Different from the stored 111
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 123,
+            pr_url: None,
+            branch_name: None,
+            correlation_id: None,
+        };
+
+        // Make ALL reads fail immediately. This tests that:
+        // 1. get_or_default fails (the first read in the new order)
+        // 2. We return Err immediately
+        // 3. No writes occur (set_installation_id is never reached)
+        repo.set_fail_gets_after(0);
+
+        // Process an event
+        let result = store
+            .process_event(&pr_id, Event::DisableReviewsRequested, &ctx)
+            .await;
+
+        // The result should be Err because the read failed
+        assert!(result.is_err(), "Expected Err due to read failure");
+
+        // Verify no writes occurred before the read failure
+        let put_count = repo.put_count();
+        let operations = repo.operations();
+
+        assert_eq!(
+            put_count, 0,
+            "process_event returned Err but {} writes occurred before the read failure.\n\
+             Operations: {:?}\n\
+             This violates the 'no writes on read error' guarantee.",
+            put_count, operations
+        );
+
+        // Verify the original state and installation_id are preserved
+        let stored = repo.inner.get(&pr_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.installation_id,
+            Some(111),
+            "Original installation_id should be preserved when read fails"
+        );
+    }
+
+    /// Regression test (Issue 3): get_or_init returns Err when write fails.
+    ///
+    /// Property: If a write is needed (reviews_enabled differs) and that write fails,
+    /// get_or_init MUST return Err so callers know the update didn't persist.
+    ///
+    /// Previously: Returns Ok(original_state) when write fails. Callers couldn't
+    /// distinguish "no update needed" from "update failed", leading to reviews
+    /// running when they should be suppressed.
+    #[tokio::test]
+    async fn test_get_or_init_must_return_err_on_write_failure() {
+        let repo = Arc::new(TrackingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set up initial state with reviews_enabled: true
+        let initial_state = ReviewMachineState::Idle {
+            reviews_enabled: true,
+        };
+        store
+            .set(pr_id.clone(), initial_state.clone(), Some(111))
+            .await
+            .unwrap();
+
+        // Now make writes fail
+        repo.set_fail_puts(true);
+
+        // Call get_or_init with reviews_enabled: false
+        // This SHOULD try to update reviews_enabled and fail, returning Err.
+        let result = store.get_or_init(&pr_id, false).await;
+
+        // BUG: Currently returns Ok(original_state) when write fails.
+        // CORRECT behavior: Should return Err when the update couldn't be persisted.
+        assert!(
+            result.is_err(),
+            "get_or_init MUST return Err when updating reviews_enabled fails.\n\
+             Current behavior (BUG): Returns Ok({:?}) hiding the write failure.\n\
+             This allows callers to proceed unaware that the update wasn't persisted,\n\
+             leading to reviews running when they should be suppressed.",
+            result
+        );
     }
 
     /// Verify the arb_review_state generator covers all state variants.
