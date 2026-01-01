@@ -50,7 +50,7 @@ impl SqliteRepository {
     ///
     /// The database is configured with:
     /// - `journal_mode = WAL` for better concurrency and crash safety
-    /// - `synchronous = NORMAL` for a good balance of durability and performance
+    /// - `synchronous = FULL` for maximum durability (survives OS/power failure)
     /// - `busy_timeout = 5000ms` to handle concurrent access gracefully
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
         let path_ref = path.as_ref();
@@ -73,11 +73,25 @@ impl SqliteRepository {
         let conn = Connection::open(path_ref)
             .map_err(|e| RepositoryError::storage("open database", e.to_string()))?;
 
+        // Set restrictive permissions on database file (Unix only)
+        // The database may contain sensitive state (reconciliation tokens, etc.)
+        #[cfg(unix)]
+        if path_str != ":memory:" && !path_str.is_empty() {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            if let Err(e) = std::fs::set_permissions(path_ref, permissions) {
+                warn!(
+                    "Failed to set restrictive permissions on database file: {}",
+                    e
+                );
+            }
+        }
+
         // Configure durability settings
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+            PRAGMA synchronous = FULL;
             PRAGMA busy_timeout = 5000;
             "#,
         )
@@ -256,13 +270,6 @@ impl StateRepository for SqliteRepository {
     }
 
     async fn delete(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
-        // First get the existing state
-        let existing = self.get(id).await?;
-
-        if existing.is_none() {
-            return Ok(None);
-        }
-
         let conn = self.conn.clone();
         let owner = id.repo_owner.clone();
         let name = id.repo_name.clone();
@@ -271,19 +278,32 @@ impl StateRepository for SqliteRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            conn.execute(
-                "DELETE FROM pr_states
-                 WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3",
-                params![owner, name, pr_num as i64],
-            )
-            .map_err(|e| RepositoryError::storage("delete", e.to_string()))?;
+            // Use DELETE...RETURNING to atomically delete and return the row
+            let result: Option<(String, Option<u64>)> = conn
+                .query_row(
+                    "DELETE FROM pr_states
+                     WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3
+                     RETURNING state_json, installation_id",
+                    params![owner, name, pr_num as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| RepositoryError::storage("delete", e.to_string()))?;
 
-            Ok(())
+            match result {
+                Some((json, installation_id)) => {
+                    let state: ReviewMachineState = serde_json::from_str(&json)
+                        .map_err(|_| RepositoryError::corruption("state JSON"))?;
+                    Ok(Some(StoredState {
+                        state,
+                        installation_id,
+                    }))
+                }
+                None => Ok(None),
+            }
         })
         .await
-        .map_err(|e| RepositoryError::storage("delete", e.to_string()))??;
-
-        Ok(existing)
+        .map_err(|e| RepositoryError::storage("delete", e.to_string()))?
     }
 
     async fn get_pending(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
