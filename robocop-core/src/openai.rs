@@ -630,6 +630,8 @@ impl OpenAIClient {
     /// # Arguments
     /// * `reconciliation_token` - Optional token for crash recovery. If provided, this token
     ///   is stored in batch metadata and can be used to reconcile orphaned batches on restart.
+    /// * `comment_id` - Optional GitHub comment ID to store in metadata for crash recovery.
+    /// * `check_run_id` - Optional GitHub check run ID to store in metadata for crash recovery.
     #[allow(clippy::too_many_arguments)]
     pub async fn process_code_review_batch(
         &self,
@@ -642,6 +644,8 @@ impl OpenAIClient {
         additional_prompt: Option<&str>,
         model: Option<&str>,
         reconciliation_token: Option<&str>,
+        comment_id: Option<u64>,
+        check_run_id: Option<u64>,
     ) -> Result<String> {
         // Create user prompt
         let user_prompt = create_user_prompt(diff, file_contents, additional_prompt);
@@ -681,9 +685,15 @@ impl OpenAIClient {
             batch_metadata.insert("pull_request_url".to_string(), url.clone());
         }
 
-        // Add reconciliation token for crash recovery if provided
+        // Add crash recovery metadata if provided
         if let Some(token) = reconciliation_token {
             batch_metadata.insert("reconciliation_token".to_string(), token.to_string());
+        }
+        if let Some(id) = comment_id {
+            batch_metadata.insert("comment_id".to_string(), id.to_string());
+        }
+        if let Some(id) = check_run_id {
+            batch_metadata.insert("check_run_id".to_string(), id.to_string());
         }
 
         // Create batch request using the responses API format

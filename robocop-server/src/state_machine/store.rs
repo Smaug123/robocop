@@ -343,11 +343,11 @@ impl StateStore {
     /// Returns a list of (pr_id, reconciliation_token, installation_id) tuples for all PRs
     /// with in-flight batch submissions. These need to be reconciled on startup.
     pub async fn get_submitting_states(&self) -> Vec<(StateMachinePrId, String, u64)> {
-        match self.repository.get_pending().await {
-            Ok(pending) => pending
+        match self.repository.get_submitting().await {
+            Ok(submitting) => submitting
                 .into_iter()
                 .filter_map(|(id, stored)| {
-                    // Only include BatchSubmitting states
+                    // Extract reconciliation token from BatchSubmitting state
                     let token = stored.state.reconciliation_token()?.to_string();
                     // Filter out states without installation_id
                     let installation_id = stored.installation_id?;
@@ -831,6 +831,12 @@ mod tests {
             &self,
         ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_pending().await
+        }
+
+        async fn get_submitting(
+            &self,
+        ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_submitting().await
         }
     }
 
@@ -1443,6 +1449,12 @@ mod tests {
             &self,
         ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_pending().await
+        }
+
+        async fn get_submitting(
+            &self,
+        ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_submitting().await
         }
     }
 

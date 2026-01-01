@@ -180,4 +180,17 @@ pub trait StateRepository: Send + Sync {
     /// - `Ok(vec)` with pending states on success
     /// - `Err(RepositoryError)` if storage operation failed
     async fn get_pending(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    /// Get all states in BatchSubmitting (for crash recovery).
+    ///
+    /// Returns states where `ReviewMachineState::is_batch_submitting()` is true.
+    /// These represent in-flight batch submissions that may have orphaned batches
+    /// at OpenAI if the server crashed during submission.
+    ///
+    /// Used by reconciliation on startup to find and recover orphaned batches.
+    ///
+    /// Returns:
+    /// - `Ok(vec)` with submitting states on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn get_submitting(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
 }

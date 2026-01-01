@@ -11,12 +11,19 @@ use tracing::{error, info, warn};
 
 use crate::state_machine::event::Event;
 use crate::state_machine::interpreter::InterpreterContext;
-use crate::state_machine::state::BatchId;
+use crate::state_machine::state::{BatchId, CheckRunId, CommentId};
+use crate::state_machine::transition::{DEFAULT_MODEL, DEFAULT_REASONING_EFFORT};
 use crate::AppState;
 
 /// Maximum number of batches to list from OpenAI for reconciliation.
 /// We paginate through all results to ensure we don't miss any.
 const MAX_BATCH_LIST_LIMIT: u32 = 100;
+
+/// Number of retry attempts for listing batches from OpenAI.
+const LIST_BATCHES_MAX_RETRIES: u32 = 3;
+
+/// Delay between retry attempts (in milliseconds).
+const LIST_BATCHES_RETRY_DELAY_MS: u64 = 1000;
 
 /// Reconcile any PRs stuck in BatchSubmitting state after a crash.
 ///
@@ -50,10 +57,11 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
         token_to_pr.insert(token.clone(), (pr_id.clone(), *installation_id));
     }
 
-    // List all batches from OpenAI
+    // List all batches from OpenAI with retry logic
     // We need to paginate to get all batches
     let mut all_batches = Vec::new();
     let mut after_cursor: Option<String> = None;
+    let mut retry_count = 0;
 
     loop {
         match state
@@ -62,6 +70,8 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
             .await
         {
             Ok(response) => {
+                // Reset retry count on success
+                retry_count = 0;
                 all_batches.extend(response.data);
 
                 if response.has_more {
@@ -71,11 +81,20 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
                 }
             }
             Err(e) => {
-                error!(
-                    "Failed to list batches from OpenAI: {}. Reconciliation aborted.",
-                    e
+                retry_count += 1;
+                if retry_count >= LIST_BATCHES_MAX_RETRIES {
+                    error!(
+                        "Failed to list batches from OpenAI after {} attempts: {}. Reconciliation aborted.",
+                        LIST_BATCHES_MAX_RETRIES, e
+                    );
+                    return;
+                }
+                warn!(
+                    "Failed to list batches from OpenAI (attempt {}/{}): {}. Retrying in {}ms...",
+                    retry_count, LIST_BATCHES_MAX_RETRIES, e, LIST_BATCHES_RETRY_DELAY_MS
                 );
-                return;
+                tokio::time::sleep(std::time::Duration::from_millis(LIST_BATCHES_RETRY_DELAY_MS))
+                    .await;
             }
         }
     }
@@ -86,18 +105,33 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
     );
 
     // Match batches to PRs by reconciliation_token
-    let mut matched_tokens: HashMap<String, (String, Option<String>, Option<String>)> =
-        HashMap::new(); // token -> (batch_id, model, reasoning_effort)
+    // We store (batch_id, model, reasoning_effort, comment_id, check_run_id)
+    #[derive(Default)]
+    struct BatchMatch {
+        batch_id: String,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        comment_id: Option<u64>,
+        check_run_id: Option<u64>,
+    }
+
+    let mut matched_tokens: HashMap<String, BatchMatch> = HashMap::new();
 
     for batch in &all_batches {
         if let Some(metadata) = &batch.metadata {
             if let Some(token) = metadata.get("reconciliation_token") {
                 if token_to_pr.contains_key(token) {
                     // Found a match!
-                    let model = metadata.get("model").cloned();
-                    let reasoning_effort = metadata.get("reasoning_effort").cloned();
-                    matched_tokens
-                        .insert(token.clone(), (batch.id.clone(), model, reasoning_effort));
+                    matched_tokens.insert(
+                        token.clone(),
+                        BatchMatch {
+                            batch_id: batch.id.clone(),
+                            model: metadata.get("model").cloned(),
+                            reasoning_effort: metadata.get("reasoning_effort").cloned(),
+                            comment_id: metadata.get("comment_id").and_then(|s| s.parse().ok()),
+                            check_run_id: metadata.get("check_run_id").and_then(|s| s.parse().ok()),
+                        },
+                    );
                 }
             }
         }
@@ -105,20 +139,24 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
 
     // Process each PR in BatchSubmitting state
     for (pr_id, token, installation_id) in submitting_states {
-        let event = if let Some((batch_id, model, reasoning_effort)) = matched_tokens.get(&token) {
+        let event = if let Some(batch_match) = matched_tokens.get(&token) {
             info!(
                 "Reconciliation: Found batch {} for PR #{} (token: {})",
-                batch_id, pr_id.pr_number, token
+                batch_match.batch_id, pr_id.pr_number, token
             );
 
             Event::ReconciliationComplete {
-                batch_id: BatchId::from(batch_id.clone()),
-                comment_id: None,   // We don't have this info from OpenAI metadata
-                check_run_id: None, // We don't have this info from OpenAI metadata
-                model: model.clone().unwrap_or_else(|| "unknown".to_string()),
-                reasoning_effort: reasoning_effort
+                batch_id: BatchId::from(batch_match.batch_id.clone()),
+                comment_id: batch_match.comment_id.map(CommentId),
+                check_run_id: batch_match.check_run_id.map(CheckRunId),
+                model: batch_match
+                    .model
                     .clone()
-                    .unwrap_or_else(|| "medium".to_string()),
+                    .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                reasoning_effort: batch_match
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string()),
             }
         } else {
             warn!(
@@ -168,39 +206,28 @@ pub async fn reconcile_orphaned_batches(state: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
-    /// BUG: Reconciliation uses incorrect defaults for model/reasoning_effort.
-    ///
-    /// When metadata is missing from OpenAI batch, reconciliation defaults to:
-    /// - model: "unknown"
-    /// - reasoning_effort: "medium"
-    ///
-    /// But the actual defaults used by the system are:
-    /// - model: DEFAULT_MODEL (from robocop_core::DEFAULT_MODEL)
-    /// - reasoning_effort: "xhigh" (from preparing.rs DEFAULT_REASONING_EFFORT)
-    ///
-    /// This causes inconsistent information to be shown in recovered batches.
-    #[test]
-    fn test_bug_reconciliation_uses_wrong_defaults() {
-        // The defaults used in reconciliation.rs
-        const RECONCILIATION_DEFAULT_MODEL: &str = "unknown";
-        const RECONCILIATION_DEFAULT_REASONING_EFFORT: &str = "medium";
+    use super::*;
 
+    /// Test that reconciliation uses the same defaults as batch creation.
+    ///
+    /// When metadata is missing from OpenAI batch, reconciliation should use
+    /// the same defaults that are used when creating new batches.
+    #[test]
+    fn test_reconciliation_uses_correct_defaults() {
         // The actual defaults used when creating batches
         const ACTUAL_DEFAULT_MODEL: &str = crate::openai::DEFAULT_MODEL;
         const ACTUAL_DEFAULT_REASONING_EFFORT: &str = "xhigh"; // from preparing.rs
 
-        // BUG: These should match, but they don't
+        // Reconciliation should use the same defaults
         assert_eq!(
-            RECONCILIATION_DEFAULT_MODEL, ACTUAL_DEFAULT_MODEL,
-            "Reconciliation default model '{}' does not match actual default '{}'.\n\
-             This causes inconsistent info on recovered batches.",
-            RECONCILIATION_DEFAULT_MODEL, ACTUAL_DEFAULT_MODEL
+            DEFAULT_MODEL, ACTUAL_DEFAULT_MODEL,
+            "Reconciliation DEFAULT_MODEL '{}' should match batch creation default '{}'",
+            DEFAULT_MODEL, ACTUAL_DEFAULT_MODEL
         );
         assert_eq!(
-            RECONCILIATION_DEFAULT_REASONING_EFFORT, ACTUAL_DEFAULT_REASONING_EFFORT,
-            "Reconciliation default reasoning_effort '{}' does not match actual default '{}'.\n\
-             This causes inconsistent info on recovered batches.",
-            RECONCILIATION_DEFAULT_REASONING_EFFORT, ACTUAL_DEFAULT_REASONING_EFFORT
+            DEFAULT_REASONING_EFFORT, ACTUAL_DEFAULT_REASONING_EFFORT,
+            "Reconciliation DEFAULT_REASONING_EFFORT '{}' should match batch creation default '{}'",
+            DEFAULT_REASONING_EFFORT, ACTUAL_DEFAULT_REASONING_EFFORT
         );
     }
 }

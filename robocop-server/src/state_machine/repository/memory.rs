@@ -59,6 +59,15 @@ impl StateRepository for InMemoryRepository {
             .map(|(id, stored)| (id.clone(), stored.clone()))
             .collect())
     }
+
+    async fn get_submitting(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+        let states = self.states.read().await;
+        Ok(states
+            .iter()
+            .filter(|(_, stored)| stored.state.is_batch_submitting())
+            .map(|(id, stored)| (id.clone(), stored.clone()))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -503,23 +512,13 @@ mod tests {
     // Bug regression tests: Issues that need to be fixed
     // =========================================================================
 
-    /// BUG: get_pending() does not return BatchSubmitting states.
+    /// Test that get_submitting() returns BatchSubmitting states for crash recovery.
     ///
     /// The BatchSubmitting state is used for crash recovery - it contains a
     /// reconciliation_token that allows us to find orphaned batches at OpenAI.
-    /// However, get_pending() filters by pending_batch_id().is_some(), which
-    /// returns None for BatchSubmitting (the batch hasn't been submitted yet).
-    ///
-    /// This means get_submitting_states() in store.rs calls get_pending() and
-    /// then filters by reconciliation_token(), but the BatchSubmitting states
-    /// never make it through get_pending() in the first place.
-    ///
-    /// Fix: Either:
-    /// 1. Add a separate get_batch_submitting() method to the repository
-    /// 2. Change get_pending() to also include BatchSubmitting states
-    /// 3. Add a is_submitting() method to check alongside pending_batch_id()
+    /// The get_submitting() method returns these states so they can be reconciled.
     #[tokio::test]
-    async fn test_bug_get_pending_excludes_batch_submitting() {
+    async fn test_get_submitting_returns_batch_submitting() {
         let repo = InMemoryRepository::new();
 
         // Create a BatchSubmitting state (for crash recovery)
@@ -539,17 +538,23 @@ mod tests {
         };
         repo.put(&test_pr_id(1), submitting_state).await.unwrap();
 
+        // get_pending() should NOT return BatchSubmitting states
+        // (they don't have a pending batch ID yet)
         let pending = repo.get_pending().await.unwrap();
-
-        // BUG: This should include the BatchSubmitting state, but currently doesn't
-        // because pending_batch_id() returns None for BatchSubmitting.
         assert_eq!(
             pending.len(),
-            1,
-            "get_pending() should return BatchSubmitting states for crash recovery, \
-             but currently returns {} states",
-            pending.len()
+            0,
+            "get_pending() should not return BatchSubmitting states"
         );
+
+        // get_submitting() should return BatchSubmitting states
+        let submitting = repo.get_submitting().await.unwrap();
+        assert_eq!(
+            submitting.len(),
+            1,
+            "get_submitting() should return BatchSubmitting states for crash recovery"
+        );
+        assert_eq!(submitting[0].0.pr_number, 1);
     }
 
     /// Test to verify the arb_review_state() generator produces states with and without

@@ -797,6 +797,7 @@ async fn execute_submit_batch(
     };
 
     // Submit batch to OpenAI
+    // Include comment_id and check_run_id in metadata for crash recovery
     match ctx
         .openai_client
         .process_code_review_batch(
@@ -809,6 +810,8 @@ async fn execute_submit_batch(
             None, // additional_prompt
             Some(&model),
             Some(reconciliation_token),
+            comment_id.map(|id| id.0),
+            check_run_id.map(|id| id.0),
         )
         .await
     {

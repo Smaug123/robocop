@@ -19,6 +19,9 @@ mod idle;
 mod preparing;
 mod terminal;
 
+// Re-export constants for use in reconciliation
+pub use preparing::{DEFAULT_MODEL, DEFAULT_REASONING_EFFORT};
+
 use super::effect::Effect;
 use super::event::Event;
 use super::state::ReviewMachineState;

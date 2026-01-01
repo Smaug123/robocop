@@ -8,9 +8,9 @@ use crate::state_machine::event::{DataFetchFailure, Event};
 use crate::state_machine::state::{CancellationReason, FailureReason, ReviewMachineState};
 
 /// Default model for code reviews when none is specified.
-const DEFAULT_MODEL: &str = "gpt-5.2-2025-12-11";
+pub const DEFAULT_MODEL: &str = "gpt-5.2-2025-12-11";
 /// Default reasoning effort when none is specified.
-const DEFAULT_REASONING_EFFORT: &str = "xhigh";
+pub const DEFAULT_REASONING_EFFORT: &str = "xhigh";
 
 /// Handle transitions from the Preparing state.
 ///
