@@ -212,7 +212,12 @@ impl StateStore {
     /// Set the state for a PR.
     ///
     /// This preserves the existing installation_id if one exists.
-    pub async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) {
+    ///
+    /// # Safety
+    /// This method must only be called while holding the per-PR lock to prevent
+    /// read-modify-write races. It is intentionally private; external callers
+    /// should use `process_event` which handles locking.
+    async fn set(&self, pr_id: StateMachinePrId, state: ReviewMachineState) {
         let installation_id = match self.repository.get(&pr_id).await {
             Ok(Some(stored)) => stored.installation_id,
             Ok(None) => None,
