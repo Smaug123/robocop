@@ -71,7 +71,8 @@ impl RepositoryError {
 
 impl fmt::Debug for RepositoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Debug shows everything for development troubleshooting
+        // Debug shows raw_error only in debug builds to prevent secret leakage in release.
+        // In release builds, raw_error is redacted since it may contain DSNs or credentials.
         match self {
             Self::StorageError {
                 operation,
@@ -79,8 +80,13 @@ impl fmt::Debug for RepositoryError {
             } => {
                 let mut d = f.debug_struct("StorageError");
                 d.field("operation", operation);
+                #[cfg(debug_assertions)]
                 if let Some(raw) = raw_error {
                     d.field("raw_error", raw);
+                }
+                #[cfg(not(debug_assertions))]
+                if raw_error.is_some() {
+                    d.field("raw_error", &"[REDACTED]");
                 }
                 d.finish()
             }

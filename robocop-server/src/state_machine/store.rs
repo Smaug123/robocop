@@ -290,50 +290,6 @@ impl StateStore {
         result
     }
 
-    /// Set the installation ID for a PR.
-    ///
-    /// This preserves the existing state if one exists. If a repository read
-    /// error occurs, the write is skipped to avoid overwriting real state with
-    /// a default.
-    ///
-    /// # Safety
-    /// This method must only be called while holding the per-PR lock to prevent
-    /// read-modify-write races. It is intentionally private; external callers
-    /// should use `process_event` which handles locking.
-    async fn set_installation_id(&self, pr_id: &StateMachinePrId, installation_id: u64) {
-        // Read directly (not via get_or_default) to distinguish "not found" from "error".
-        // On error, we skip the write to avoid overwriting real state with a default.
-        let state = match self.repository.get(pr_id).await {
-            Ok(Some(stored)) => stored.state,
-            Ok(None) => ReviewMachineState::default(),
-            Err(e) => {
-                error!(
-                    "Repository error reading state for PR #{} while setting installation_id: {}; \
-                     skipping write to avoid overwriting real state",
-                    pr_id.pr_number, e
-                );
-                return;
-            }
-        };
-
-        if let Err(e) = self
-            .repository
-            .put(
-                pr_id,
-                StoredState {
-                    state,
-                    installation_id: Some(installation_id),
-                },
-            )
-            .await
-        {
-            error!(
-                "Repository error setting installation_id for PR #{}: {}",
-                pr_id.pr_number, e
-            );
-        }
-    }
-
     /// Get the installation ID for a PR.
     pub async fn get_installation_id(&self, pr_id: &StateMachinePrId) -> Option<u64> {
         match self.repository.get(pr_id).await {
@@ -388,21 +344,27 @@ impl StateStore {
     /// 1. Acquires a per-PR lock to serialize with concurrent events
     /// 2. Gets (or creates) the current state
     /// 3. Runs the transition function
-    /// 4. Executes effects via the interpreter
-    /// 5. Handles result events recursively
-    /// 6. Stores the final state
+    /// 4. Persists the new state BEFORE executing effects
+    /// 5. Executes effects via the interpreter
+    /// 6. Handles result events in a loop (each iteration persists before effects)
     ///
     /// The per-PR lock ensures that concurrent events for the same PR are
     /// processed sequentially, preventing races where one event reads stale
     /// state or overwrites another event's changes.
     ///
+    /// IMPORTANT: State is persisted BEFORE effects are executed. This ensures
+    /// crash recovery finds the correct state. If the process crashes after
+    /// persistence but before effects complete, effects may be lost but state
+    /// is correct. Lost effects (like batch submissions) will be picked up by
+    /// the batch poller eventually.
+    ///
     /// Returns:
     /// - `Ok(state)` - the final state after all transitions
-    /// - `Err(RepositoryError)` - if the initial read failed (no processing or write occurred)
+    /// - `Err(RepositoryError)` - if a read or write failed
     ///
-    /// IMPORTANT: On read error, this method returns early WITHOUT processing
-    /// the event and WITHOUT writing to storage. This prevents overwriting
-    /// valid persisted state with state derived from defaults.
+    /// On read error, this method returns early WITHOUT processing the event
+    /// and WITHOUT writing to storage. This prevents overwriting valid
+    /// persisted state with state derived from defaults.
     pub async fn process_event(
         &self,
         pr_id: &StateMachinePrId,
@@ -419,10 +381,6 @@ impl StateStore {
         // and ensures no partial writes occur before returning an error.
         let mut current_state = self.get_or_default(pr_id).await?;
 
-        // Now that read succeeded, store the installation_id for batch polling.
-        // This happens after the read to ensure no writes occur if the read fails.
-        self.set_installation_id(pr_id, ctx.installation_id).await;
-
         // Event loop: process initial event and any result events from effects
         let mut events_to_process = vec![event];
 
@@ -437,6 +395,17 @@ impl StateStore {
             let TransitionResult { state, effects } = transition(current_state, event);
             current_state = state;
 
+            // Persist state BEFORE executing effects.
+            // This ensures crash recovery finds the correct state even if effects fail.
+            // We persist after EACH transition, not just at the end, so that result
+            // events from effects also have their state persisted before their effects.
+            self.set(
+                pr_id.clone(),
+                current_state.clone(),
+                Some(ctx.installation_id),
+            )
+            .await?;
+
             if !effects.is_empty() {
                 info!(
                     "Executing {} effects for PR #{}",
@@ -444,7 +413,8 @@ impl StateStore {
                     pr_id.pr_number
                 );
 
-                // Execute effects and collect result events
+                // Execute effects and collect result events.
+                // State has already been persisted, so crash here is safe.
                 let result_events = execute_effects(ctx, effects).await;
 
                 // Add result events to be processed (in reverse order so they're processed in order)
@@ -453,20 +423,6 @@ impl StateStore {
                 }
             }
         }
-
-        // Store the final state with the installation_id we received.
-        // We pass the installation_id explicitly rather than reading it back from
-        // the repository, to avoid losing it on transient read errors.
-        //
-        // IMPORTANT: This MUST succeed for process_event to return Ok. If persistence
-        // fails, effects have been executed but state isn't durable, breaking crash
-        // recovery (duplicate/lost effects on restart).
-        self.set(
-            pr_id.clone(),
-            current_state.clone(),
-            Some(ctx.installation_id),
-        )
-        .await?;
 
         info!(
             "Final state for PR #{}: {:?}",
@@ -855,52 +811,6 @@ mod tests {
         }
     }
 
-    /// Test that set_installation_id skips writes when repository read fails.
-    ///
-    /// This prevents overwriting real state with a default on transient errors.
-    /// Regression test for: repository read errors treated as "missing".
-    #[tokio::test]
-    async fn test_set_installation_id_skips_write_on_read_error() {
-        let repo = Arc::new(FailingRepository::new());
-        let store = StateStore::with_repository(repo.clone());
-        let pr_id = StateMachinePrId::new("owner", "repo", 123);
-
-        // First, write a state with installation_id 111
-        let state = ReviewMachineState::Idle {
-            reviews_enabled: false,
-        };
-        store
-            .set(pr_id.clone(), state.clone(), Some(111))
-            .await
-            .unwrap();
-
-        // Verify the state was written correctly
-        let stored = repo.inner.get(&pr_id).await.unwrap().unwrap();
-        assert_eq!(stored.installation_id, Some(111));
-        assert!(!stored.state.reviews_enabled());
-
-        // Now make reads fail
-        repo.set_fail_gets(true);
-
-        // Try to set a new installation_id - this should skip the write
-        store.set_installation_id(&pr_id, 222).await;
-
-        // Stop failing
-        repo.set_fail_gets(false);
-
-        // Verify the original state is preserved (not overwritten with default)
-        let stored = repo.inner.get(&pr_id).await.unwrap().unwrap();
-        assert_eq!(
-            stored.installation_id,
-            Some(111),
-            "Original installation_id should be preserved when read fails"
-        );
-        assert!(
-            !stored.state.reviews_enabled(),
-            "Original state should be preserved when read fails"
-        );
-    }
-
     // =========================================================================
     // Regression tests for repository error handling
     // =========================================================================
@@ -1026,49 +936,6 @@ mod tests {
             installation_id,
             Some(12345),
             "installation_id should be preserved across state updates"
-        );
-    }
-
-    /// Test that set_installation_id correctly updates the installation_id
-    /// while preserving the existing state.
-    #[tokio::test]
-    async fn test_set_installation_id_preserves_state() {
-        use crate::state_machine::state::{BatchId, CheckRunId, CommentId, CommitSha};
-
-        let store = StateStore::new();
-        let pr_id = StateMachinePrId::new("owner", "repo", 123);
-
-        // Set up a BatchPending state with installation_id 111
-        let pending_state = ReviewMachineState::BatchPending {
-            reviews_enabled: true,
-            batch_id: BatchId::from("batch_xyz".to_string()),
-            head_sha: CommitSha::from("abc123"),
-            base_sha: CommitSha::from("def456"),
-            comment_id: Some(CommentId(42)),
-            check_run_id: Some(CheckRunId(99)),
-            model: "gpt-4".to_string(),
-            reasoning_effort: "high".to_string(),
-        };
-        store
-            .set(pr_id.clone(), pending_state.clone(), Some(111))
-            .await
-            .unwrap();
-
-        // Update installation_id to 222
-        store.set_installation_id(&pr_id, 222).await;
-
-        // Verify state is preserved but installation_id is updated
-        let state = store.get(&pr_id).await.unwrap();
-        assert!(
-            matches!(state, ReviewMachineState::BatchPending { batch_id, .. } if batch_id.0 == "batch_xyz"),
-            "State should be preserved after set_installation_id"
-        );
-
-        let installation_id = store.get_installation_id(&pr_id).await;
-        assert_eq!(
-            installation_id,
-            Some(222),
-            "installation_id should be updated"
         );
     }
 
@@ -1314,45 +1181,6 @@ mod tests {
     }
 
     proptest! {
-        /// Property: set_installation_id preserves the state exactly, only changing installation_id.
-        ///
-        /// For any state, calling set_installation_id should not modify the state itself.
-        #[test]
-        fn set_installation_id_preserves_state_for_all_variants(
-            state in arb_review_state(),
-            initial_id in 1u64..1000000,
-            new_id in 1u64..1000000
-        ) {
-            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-            rt.block_on(async {
-                let store = StateStore::new();
-                let pr_id = test_pr_id(1);
-
-                // Set initial state with initial_id
-                store.set(pr_id.clone(), state.clone(), Some(initial_id)).await.unwrap();
-
-                // Update only the installation_id
-                store.set_installation_id(&pr_id, new_id).await;
-
-                // Verify state is unchanged
-                let retrieved = store.get(&pr_id).await.expect("state should exist");
-                assert_eq!(
-                    retrieved, state,
-                    "State should be preserved after set_installation_id.\n\
-                     Expected: {:?}\n\
-                     Got: {:?}",
-                    state, retrieved
-                );
-
-                // Verify installation_id is updated
-                let retrieved_id = store.get_installation_id(&pr_id).await;
-                assert_eq!(
-                    retrieved_id, Some(new_id),
-                    "installation_id should be updated to new value"
-                );
-            });
-        }
-
         /// Property: get_or_init preserves installation_id for all state variants.
         ///
         /// For any state with an installation_id, calling get_or_init (which may
@@ -1595,14 +1423,14 @@ mod tests {
         }
     }
 
-    /// BUG TEST (Issue 1): process_event swallows final state persistence errors.
+    /// Regression test: process_event returns Err when state persistence fails.
     ///
-    /// Property: If process_event returns Ok, the final state MUST be persisted.
-    /// Equivalently: If the final state persistence fails, process_event MUST return Err.
+    /// Property: If process_event returns Ok, the state MUST be persisted.
+    /// Equivalently: If state persistence fails, process_event MUST return Err.
     ///
-    /// Current behavior (BUG): process_event returns Ok even when the final put fails,
-    /// meaning effects have been executed but state isn't durable. On restart, the
-    /// stale state causes duplicate effects or lost progress.
+    /// This is critical for crash recovery: state is persisted BEFORE effects are
+    /// executed. If persistence fails, we return Err without executing effects,
+    /// ensuring the system remains in a consistent state.
     #[tokio::test]
     async fn test_process_event_must_return_err_on_final_persistence_failure() {
         use crate::state_machine::event::Event;
@@ -1648,27 +1476,24 @@ mod tests {
             .process_event(&pr_id, Event::DisableReviewsRequested, &ctx)
             .await;
 
-        // BUG: Currently this returns Ok even though persistence failed.
-        // CORRECT behavior: Should return Err when final state persistence fails.
+        // process_event should return Err when state persistence fails.
+        // Since state is persisted BEFORE effects are executed, a persistence failure
+        // means no effects were executed and the system remains in a consistent state.
         assert!(
             result.is_err(),
-            "process_event MUST return Err when final state persistence fails.\n\
-             Current behavior (BUG): Returns Ok({:?}) even though state wasn't persisted.\n\
-             This allows effects to be emitted without durable state, breaking crash recovery.",
+            "process_event MUST return Err when state persistence fails.\n\
+             Got Ok({:?}) but expected Err because persistence was configured to fail.",
             result
         );
     }
 
-    /// Regression test (Issue 2): process_event returns Err with no writes on read error.
+    /// Regression test: process_event returns Err with no writes on read error.
     ///
     /// Property: If process_event returns Err(ReadError), no writes should have occurred.
     ///
-    /// The fix reordered operations so that get_or_default (read) is called BEFORE
-    /// set_installation_id (read-write). This ensures that if the initial read fails,
-    /// we return Err immediately without any writes.
-    ///
-    /// Previous behavior (BUG): set_installation_id was called first, so it could write
-    /// before get_or_default failed, causing partial writes.
+    /// The current implementation reads state first with get_or_default. If the read fails,
+    /// we return Err immediately without any writes. This prevents overwriting valid
+    /// persisted state with state derived from defaults.
     #[tokio::test]
     async fn test_process_event_no_writes_before_read_error() {
         use crate::state_machine::event::Event;
@@ -1715,9 +1540,9 @@ mod tests {
         };
 
         // Make ALL reads fail immediately. This tests that:
-        // 1. get_or_default fails (the first read in the new order)
+        // 1. get_or_default fails (the first operation)
         // 2. We return Err immediately
-        // 3. No writes occur (set_installation_id is never reached)
+        // 3. No writes occur (we never reach the transition/persist loop)
         repo.set_fail_gets_after(0);
 
         // Process an event
