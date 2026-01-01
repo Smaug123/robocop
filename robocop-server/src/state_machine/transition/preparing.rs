@@ -5,7 +5,12 @@ use crate::state_machine::effect::{
     CommentContent, Effect, EffectCheckRunConclusion, EffectCheckRunStatus, LogLevel,
 };
 use crate::state_machine::event::{DataFetchFailure, Event};
-use crate::state_machine::state::{BatchId, CancellationReason, FailureReason, ReviewMachineState};
+use crate::state_machine::state::{CancellationReason, FailureReason, ReviewMachineState};
+
+/// Default model for code reviews when none is specified.
+const DEFAULT_MODEL: &str = "gpt-5.2-2025-12-11";
+/// Default reasoning effort when none is specified.
+const DEFAULT_REASONING_EFFORT: &str = "xhigh";
 
 /// Handle transitions from the Preparing state.
 ///
@@ -13,13 +18,13 @@ use crate::state_machine::state::{BatchId, CancellationReason, FailureReason, Re
 /// the batch is submitted. We're waiting for diff/file data to be fetched.
 pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
     match (&state, event) {
-        // Data fetched successfully -> submit batch
+        // Data fetched successfully -> transition to BatchSubmitting and submit batch
         (
             ReviewMachineState::Preparing {
                 head_sha,
                 base_sha,
                 options,
-                reviews_enabled: _,
+                reviews_enabled,
             },
             Event::DataFetched {
                 diff,
@@ -31,14 +36,40 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 .map(|fc| (fc.path, fc.content))
                 .collect();
 
+            // Generate reconciliation token for crash recovery
+            let reconciliation_token = uuid::Uuid::new_v4().to_string();
+
+            // Extract model and reasoning effort with defaults
+            let model = options
+                .model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            let reasoning_effort = options
+                .reasoning_effort
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string());
+
+            // Transition to BatchSubmitting - this state is persisted BEFORE the effect
+            // executes, allowing crash recovery via the reconciliation_token.
             TransitionResult::new(
-                state.clone(), // Stay in Preparing until batch is submitted
+                ReviewMachineState::BatchSubmitting {
+                    reviews_enabled: *reviews_enabled,
+                    reconciliation_token: reconciliation_token.clone(),
+                    head_sha: head_sha.clone(),
+                    base_sha: base_sha.clone(),
+                    options: options.clone(),
+                    comment_id: None,   // Will be set by effect result
+                    check_run_id: None, // Will be set by effect result
+                    model: model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                },
                 vec![Effect::SubmitBatch {
                     diff,
                     file_contents: file_contents_tuples,
                     head_sha: head_sha.clone(),
                     base_sha: base_sha.clone(),
                     options: options.clone(),
+                    reconciliation_token,
                 }],
             )
         }
@@ -105,112 +136,6 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ),
             };
             TransitionResult::new(new_state, effects)
-        }
-
-        // Batch submitted successfully -> transition to BatchPending
-        (
-            ReviewMachineState::Preparing {
-                head_sha,
-                base_sha,
-                reviews_enabled,
-                ..
-            },
-            Event::BatchSubmitted {
-                batch_id,
-                comment_id,
-                check_run_id,
-                model,
-                reasoning_effort,
-            },
-        ) => {
-            let mut effects = vec![Effect::UpdateComment {
-                content: CommentContent::InProgress {
-                    head_sha: head_sha.clone(),
-                    batch_id: batch_id.clone(),
-                    model: model.clone(),
-                    reasoning_effort: reasoning_effort.clone(),
-                },
-            }];
-
-            // Update check run with batch ID as external_id for correlation
-            if let Some(cr_id) = check_run_id {
-                effects.push(Effect::UpdateCheckRun {
-                    check_run_id: cr_id,
-                    status: EffectCheckRunStatus::InProgress,
-                    conclusion: None,
-                    title: "Code review in progress".to_string(),
-                    summary: format!(
-                        "Reviewing commit {} with {} (batch: {})",
-                        head_sha.short(),
-                        model,
-                        batch_id
-                    ),
-                    external_id: Some(batch_id.clone()),
-                });
-            }
-
-            TransitionResult::new(
-                ReviewMachineState::BatchPending {
-                    reviews_enabled: *reviews_enabled,
-                    batch_id: batch_id.clone(),
-                    head_sha: head_sha.clone(),
-                    base_sha: base_sha.clone(),
-                    comment_id,
-                    check_run_id,
-                    model: model.clone(),
-                    reasoning_effort: reasoning_effort.clone(),
-                },
-                effects,
-            )
-        }
-
-        // Batch submission failed -> transition to Failed
-        (
-            ReviewMachineState::Preparing {
-                head_sha,
-                reviews_enabled,
-                ..
-            },
-            Event::BatchSubmissionFailed {
-                error,
-                comment_id: _,
-                check_run_id,
-            },
-        ) => {
-            // Build cleanup effects for any UI elements that were created
-            let mut effects = vec![
-                // Update comment to show failure (manage_robocop_comment will find existing)
-                Effect::UpdateComment {
-                    content: CommentContent::ReviewFailed {
-                        head_sha: head_sha.clone(),
-                        batch_id: BatchId::from("(submission failed)".to_string()),
-                        reason: FailureReason::SubmissionFailed {
-                            error: error.clone(),
-                        },
-                    },
-                },
-            ];
-
-            // Update check run if it was created
-            if let Some(cr_id) = check_run_id {
-                effects.push(Effect::UpdateCheckRun {
-                    check_run_id: cr_id,
-                    status: EffectCheckRunStatus::Completed,
-                    conclusion: Some(EffectCheckRunConclusion::Failure),
-                    title: "Code review failed".to_string(),
-                    summary: format!("Batch submission failed: {}", error),
-                    external_id: None,
-                });
-            }
-
-            TransitionResult::new(
-                ReviewMachineState::Failed {
-                    reviews_enabled: *reviews_enabled,
-                    head_sha: head_sha.clone(),
-                    reason: FailureReason::SubmissionFailed { error },
-                },
-                effects,
-            )
         }
 
         // Cancel while preparing -> go back to idle
@@ -399,21 +324,27 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
 
         // =====================================================================
         // Stale Events in Preparing State
-        // Polling events and ancestry events can arrive if a batch was cancelled
-        // before its results came back, or from a previous incarnation. Ignore them.
+        // Polling events, batch events, and ancestry events can arrive if a batch
+        // was cancelled before its results came back, or from a previous incarnation.
+        // BatchSubmitted/BatchSubmissionFailed are now handled by BatchSubmitting state.
         // =====================================================================
         (
             ReviewMachineState::Preparing { .. },
-            Event::BatchStatusUpdate { .. }
+            Event::BatchSubmitted { .. }
+            | Event::BatchSubmissionFailed { .. }
+            | Event::BatchStatusUpdate { .. }
             | Event::BatchCompleted { .. }
             | Event::BatchTerminated { .. }
             | Event::AncestryResult { .. }
-            | Event::AncestryCheckFailed { .. },
+            | Event::AncestryCheckFailed { .. }
+            | Event::ReconciliationComplete { .. }
+            | Event::ReconciliationFailed { .. },
         ) => TransitionResult::new(
             state.clone(),
             vec![Effect::Log {
                 level: LogLevel::Info,
-                message: "Ignoring stale polling/ancestry event in Preparing state".to_string(),
+                message: "Ignoring stale batch/polling/ancestry event in Preparing state"
+                    .to_string(),
             }],
         ),
 

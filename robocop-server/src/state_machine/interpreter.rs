@@ -127,7 +127,19 @@ async fn execute_effect(ctx: &InterpreterContext, effect: Effect) -> EffectResul
             head_sha,
             base_sha,
             options,
-        } => execute_submit_batch(ctx, &diff, file_contents, &head_sha, &base_sha, &options).await,
+            reconciliation_token,
+        } => {
+            execute_submit_batch(
+                ctx,
+                &diff,
+                file_contents,
+                &head_sha,
+                &base_sha,
+                &options,
+                &reconciliation_token,
+            )
+            .await
+        }
 
         Effect::CancelBatch { batch_id } => execute_cancel_batch(ctx, &batch_id).await,
 
@@ -681,6 +693,7 @@ async fn execute_submit_batch(
     head_sha: &CommitSha,
     base_sha: &CommitSha,
     options: &ReviewOptions,
+    reconciliation_token: &str,
 ) -> EffectResult {
     use robocop_core::ReviewMetadata;
 
@@ -795,6 +808,7 @@ async fn execute_submit_batch(
             Some(&version),
             None, // additional_prompt
             Some(&model),
+            Some(reconciliation_token),
         )
         .await
     {

@@ -120,6 +120,37 @@ pub enum Event {
         new_sha: CommitSha,
         error: String,
     },
+
+    // =========================================================================
+    // Reconciliation Events
+    // =========================================================================
+    /// Startup reconciliation found a batch at OpenAI matching a BatchSubmitting state.
+    ///
+    /// This event is emitted during startup recovery when we find a batch at OpenAI
+    /// that matches the reconciliation_token from a persisted BatchSubmitting state.
+    ReconciliationComplete {
+        /// The batch ID found at OpenAI.
+        batch_id: BatchId,
+        /// Comment ID if one was created before the crash.
+        comment_id: Option<CommentId>,
+        /// Check run ID if one was created before the crash.
+        check_run_id: Option<CheckRunId>,
+        /// The model used for this review.
+        model: String,
+        /// The reasoning effort used for this review.
+        reasoning_effort: String,
+    },
+
+    /// Startup reconciliation failed to find a matching batch at OpenAI.
+    ///
+    /// This means the batch was never submitted (crash happened before OpenAI call),
+    /// or the batch expired/was cancelled.
+    ReconciliationFailed {
+        /// The reconciliation token that we were looking for.
+        reconciliation_token: String,
+        /// Why reconciliation failed.
+        error: String,
+    },
 }
 
 impl Event {
@@ -234,6 +265,27 @@ impl Event {
                     old_sha.short(),
                     new_sha.short(),
                     error
+                )
+            }
+            Event::ReconciliationComplete {
+                batch_id,
+                comment_id,
+                check_run_id,
+                model,
+                reasoning_effort,
+            } => {
+                format!(
+                    "ReconciliationComplete {{ batch: {}, comment: {:?}, check_run: {:?}, model: {}, reasoning: {} }}",
+                    batch_id, comment_id.map(|c| c.0), check_run_id.map(|c| c.0), model, reasoning_effort
+                )
+            }
+            Event::ReconciliationFailed {
+                reconciliation_token,
+                error,
+            } => {
+                format!(
+                    "ReconciliationFailed {{ token: {}, error: {} }}",
+                    reconciliation_token, error
                 )
             }
         }

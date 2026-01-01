@@ -7,12 +7,14 @@
 //! Each state has its own handler module with co-located tests:
 //! - `idle`: Idle state transitions
 //! - `preparing`: Preparing state transitions
+//! - `batch_submitting`: BatchSubmitting state transitions (crash recovery)
 //! - `batch_pending`: BatchPending state transitions
 //! - `awaiting_ancestry`: AwaitingAncestryCheck state transitions
 //! - `terminal`: Terminal states (Completed/Failed/Cancelled) transitions
 
 mod awaiting_ancestry;
 mod batch_pending;
+mod batch_submitting;
 mod idle;
 mod preparing;
 mod terminal;
@@ -75,6 +77,7 @@ pub fn transition(state: ReviewMachineState, event: Event) -> TransitionResult {
     match &state {
         ReviewMachineState::Idle { .. } => idle::handle(state, event),
         ReviewMachineState::Preparing { .. } => preparing::handle(state, event),
+        ReviewMachineState::BatchSubmitting { .. } => batch_submitting::handle(state, event),
         ReviewMachineState::BatchPending { .. } => batch_pending::handle(state, event),
         ReviewMachineState::AwaitingAncestryCheck { .. } => awaiting_ancestry::handle(state, event),
         ReviewMachineState::Completed { .. }

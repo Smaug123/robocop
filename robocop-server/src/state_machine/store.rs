@@ -338,6 +338,29 @@ impl StateStore {
         }
     }
 
+    /// Get all PRs in the BatchSubmitting state (for crash recovery).
+    ///
+    /// Returns a list of (pr_id, reconciliation_token, installation_id) tuples for all PRs
+    /// with in-flight batch submissions. These need to be reconciled on startup.
+    pub async fn get_submitting_states(&self) -> Vec<(StateMachinePrId, String, u64)> {
+        match self.repository.get_pending().await {
+            Ok(pending) => pending
+                .into_iter()
+                .filter_map(|(id, stored)| {
+                    // Only include BatchSubmitting states
+                    let token = stored.state.reconciliation_token()?.to_string();
+                    // Filter out states without installation_id
+                    let installation_id = stored.installation_id?;
+                    Some((id, token, installation_id))
+                })
+                .collect(),
+            Err(e) => {
+                error!("Repository error getting submitting states: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:
@@ -1639,6 +1662,10 @@ mod tests {
             match state {
                 ReviewMachineState::Idle { .. } => idle_count += 1,
                 ReviewMachineState::Preparing { .. } => preparing_count += 1,
+                ReviewMachineState::BatchSubmitting { .. } => {
+                    // BatchSubmitting counts as a preparing-like state for this test
+                    preparing_count += 1;
+                }
                 ReviewMachineState::AwaitingAncestryCheck { .. } => awaiting_ancestry_count += 1,
                 ReviewMachineState::BatchPending { .. } => batch_pending_count += 1,
                 ReviewMachineState::Completed { .. } => completed_count += 1,
