@@ -7,6 +7,7 @@ pub mod openai;
 pub mod reconciliation;
 pub mod review_state;
 pub mod state_machine;
+pub mod status;
 pub mod webhook;
 
 use std::collections::HashMap;
@@ -41,4 +42,8 @@ pub struct AppState {
     pub review_states: Arc<RwLock<HashMap<PullRequestId, ReviewState>>>,
     pub state_store: Arc<StateStore>,
     pub recording_logger: Option<RecordingLogger>,
+    /// Optional bearer token for /status endpoint authentication.
+    /// If `Some`, requests must include `Authorization: Bearer <token>`.
+    /// If `None`, /status endpoint is disabled (returns 403 Forbidden).
+    pub status_auth_token: Option<String>,
 }

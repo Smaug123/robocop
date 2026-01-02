@@ -112,6 +112,7 @@ Environment variables required:
 - `STATE_DIR`: Directory for persistent state database (default: current directory)
 - `RECORDING_ENABLED`: Enable HTTP recording (default: false)
 - `RECORDING_LOG_PATH`: Recording log file path (default: recordings.jsonl)
+- `STATUS_AUTH_TOKEN`: Bearer token for /status endpoint authentication (if not set, endpoint is disabled)
 
 
 ### Review Dashboard

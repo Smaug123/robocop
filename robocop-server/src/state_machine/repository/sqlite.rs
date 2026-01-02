@@ -508,6 +508,73 @@ impl StateRepository for SqliteRepository {
         .await
         .map_err(|e| RepositoryError::storage("get_submitting", e.to_string()))?
     }
+
+    async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT repo_owner, repo_name, pr_number, state_json, installation_id
+                     FROM pr_states ORDER BY repo_owner, repo_name, pr_number",
+                )
+                .map_err(|e| RepositoryError::storage("get_all", e.to_string()))?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<u64>>(4)?,
+                    ))
+                })
+                .map_err(|e| RepositoryError::storage("get_all", e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                // Skip rows that fail to read from SQLite
+                let (owner, name, pr_num, json, installation_id) = match row {
+                    Ok(data) => data,
+                    Err(e) => {
+                        error!("Failed to read row from SQLite: {}", e);
+                        continue;
+                    }
+                };
+
+                // Skip rows that fail to deserialize - this allows the status page to
+                // show valid states even if one row is corrupt. Log the error for investigation.
+                let state: ReviewMachineState = match serde_json::from_str(&json) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "Skipping corrupt state for PR {}/{} #{}: {}. \
+                             This row may need manual investigation or will be overwritten \
+                             on next state update.",
+                            owner, name, pr_num, e
+                        );
+                        continue;
+                    }
+                };
+
+                let id = StateMachinePrId::new(owner, name, pr_num as u64);
+                results.push((
+                    id,
+                    StoredState {
+                        state,
+                        installation_id,
+                    },
+                ));
+            }
+
+            Ok(results)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("get_all", e.to_string()))?
+    }
 }
 
 #[cfg(test)]

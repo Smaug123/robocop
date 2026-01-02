@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robocop Status Dashboard</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .version {
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .timestamp {
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .auth-container {
+            max-width: 400px;
+            margin: 40px auto;
+            text-align: center;
+        }
+        .auth-container h2 {
+            color: #2c3e50;
+            margin-bottom: 20px;
+        }
+        .auth-container p {
+            color: #7f8c8d;
+            margin-bottom: 20px;
+        }
+        .auth-input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .auth-input-group input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #bdc3c7;
+            border-radius: 5px;
+            font-size: 1em;
+        }
+        .auth-input-group button {
+            padding: 10px 20px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1em;
+        }
+        .auth-input-group button:hover {
+            background: #2980b9;
+        }
+        .auth-error {
+            color: #e74c3c;
+            margin-top: 10px;
+        }
+        .refresh-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 20px 0;
+            padding: 10px;
+            background: #ecf0f1;
+            border-radius: 5px;
+            flex-wrap: wrap;
+        }
+        .refresh-controls label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+        }
+        .refresh-controls select {
+            padding: 5px;
+            border-radius: 3px;
+            border: 1px solid #bdc3c7;
+        }
+        .refresh-controls button {
+            padding: 5px 10px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .refresh-controls button:hover {
+            background: #2980b9;
+        }
+        .refresh-controls .logout-btn {
+            background: #95a5a6;
+            margin-left: auto;
+        }
+        .refresh-controls .logout-btn:hover {
+            background: #7f8c8d;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .summary-card {
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+            border-left: 4px solid #3498db;
+        }
+        .summary-card.active {
+            border-left-color: #f39c12;
+            background: #fef9e7;
+        }
+        .summary-card.success {
+            border-left-color: #27ae60;
+            background: #e8f6ef;
+        }
+        .summary-card.error {
+            border-left-color: #e74c3c;
+            background: #fdedec;
+        }
+        .summary-card .count {
+            font-size: 2em;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .summary-card .label {
+            font-size: 0.85em;
+            color: #7f8c8d;
+            text-transform: uppercase;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ecf0f1;
+        }
+        th {
+            background: #34495e;
+            color: white;
+            font-weight: 500;
+        }
+        tr:hover {
+            background: #f8f9fa;
+        }
+        .state-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            font-weight: 500;
+        }
+        .state-idle { background: #ecf0f1; color: #7f8c8d; }
+        .state-preparing, .state-batchsubmitting, .state-awaitingancestrycheck, .state-batchpending {
+            background: #fef9e7; color: #9a7b00;
+        }
+        .state-completed { background: #e8f6ef; color: #1e8449; }
+        .state-failed { background: #fdedec; color: #c0392b; }
+        .state-cancelled { background: #f5eef8; color: #7d3c98; }
+        .enabled-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.75em;
+        }
+        .enabled-yes { background: #d5f5e3; color: #1e8449; }
+        .enabled-no { background: #fadbd8; color: #c0392b; }
+        .sha {
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        .batch-id {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .reason {
+            font-size: 0.85em;
+            color: #7f8c8d;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+        }
+        .loading-state {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+        }
+        footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ecf0f1;
+            text-align: center;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Authentication prompt (shown when no token) -->
+        <div id="auth-view" class="auth-container">
+            <h2>Authentication Required</h2>
+            <p>Enter your STATUS_AUTH_TOKEN to view the dashboard.</p>
+            <div class="auth-input-group">
+                <input type="password" id="token-input" placeholder="Enter token...">
+                <button onclick="authenticate()">Submit</button>
+            </div>
+            <p id="auth-error" class="auth-error hidden"></p>
+        </div>
+
+        <!-- Dashboard view (shown when authenticated) -->
+        <div id="dashboard-view" class="hidden">
+            <div class="header-row">
+                <div>
+                    <h1>Robocop Status Dashboard</h1>
+                    <p class="version">Version: <span id="version-text">-</span></p>
+                </div>
+                <p class="timestamp">Last updated: <span id="timestamp-text">-</span></p>
+            </div>
+
+            <div class="refresh-controls">
+                <label>
+                    <input type="checkbox" id="auto-refresh">
+                    Auto-refresh
+                </label>
+                <select id="refresh-interval">
+                    <option value="30000">30 seconds</option>
+                    <option value="60000" selected>1 minute</option>
+                    <option value="300000">5 minutes</option>
+                </select>
+                <button id="refresh-now" onclick="refreshData()">Refresh Now</button>
+                <button class="logout-btn" onclick="logout()">Logout</button>
+            </div>
+
+            <div id="loading-state" class="loading-state">
+                Loading...
+            </div>
+
+            <div id="data-view" class="hidden">
+                <div class="summary-grid" id="summary-grid">
+                    <!-- Populated by JavaScript -->
+                </div>
+
+                <table id="pr-table">
+                    <thead>
+                        <tr>
+                            <th>Repository</th>
+                            <th>PR #</th>
+                            <th>State</th>
+                            <th>Commit</th>
+                            <th>Batch ID</th>
+                            <th>Model</th>
+                            <th>Reviews</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pr-table-body">
+                        <!-- Populated by JavaScript -->
+                    </tbody>
+                </table>
+
+                <div id="empty-state" class="empty-state hidden">
+                    No tracked PRs
+                </div>
+            </div>
+
+            <footer>
+                <p>Robocop Status Dashboard</p>
+            </footer>
+        </div>
+    </div>
+
+    <script>
+        const STORAGE_KEY = 'robocop_status_token';
+        let refreshTimer = null;
+        let currentData = null;
+
+        function escapeHtml(text) {
+            if (text === null || text === undefined) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function getToken() {
+            return localStorage.getItem(STORAGE_KEY);
+        }
+
+        function setToken(token) {
+            localStorage.setItem(STORAGE_KEY, token);
+        }
+
+        function clearToken() {
+            localStorage.removeItem(STORAGE_KEY);
+        }
+
+        function showAuthView() {
+            document.getElementById('auth-view').classList.remove('hidden');
+            document.getElementById('dashboard-view').classList.add('hidden');
+        }
+
+        function showDashboardView() {
+            document.getElementById('auth-view').classList.add('hidden');
+            document.getElementById('dashboard-view').classList.remove('hidden');
+        }
+
+        function showAuthError(message) {
+            const errorEl = document.getElementById('auth-error');
+            errorEl.textContent = message;
+            errorEl.classList.remove('hidden');
+        }
+
+        function hideAuthError() {
+            document.getElementById('auth-error').classList.add('hidden');
+        }
+
+        async function fetchData() {
+            const token = getToken();
+            if (!token) {
+                showAuthView();
+                return null;
+            }
+
+            const response = await fetch('/status', {
+                headers: {
+                    'Accept': 'application/json',
+                    'Authorization': 'Bearer ' + token
+                }
+            });
+
+            if (response.status === 401) {
+                clearToken();
+                showAuthView();
+                showAuthError('Token expired or invalid. Please re-enter.');
+                return null;
+            }
+
+            if (response.status === 403) {
+                clearToken();
+                showAuthView();
+                showAuthError('Status endpoint is disabled on this server.');
+                return null;
+            }
+
+            if (!response.ok) {
+                throw new Error('Failed to fetch status: ' + response.status);
+            }
+
+            return await response.json();
+        }
+
+        async function authenticate() {
+            const tokenInput = document.getElementById('token-input');
+            const token = tokenInput.value.trim();
+
+            if (!token) {
+                showAuthError('Please enter a token.');
+                return;
+            }
+
+            hideAuthError();
+            setToken(token);
+
+            try {
+                const data = await fetchData();
+                if (data) {
+                    tokenInput.value = '';
+                    showDashboardView();
+                    renderData(data);
+                    setupAutoRefresh();
+                }
+            } catch (e) {
+                showAuthError('Failed to connect: ' + e.message);
+                clearToken();
+            }
+        }
+
+        function logout() {
+            if (refreshTimer) {
+                clearInterval(refreshTimer);
+                refreshTimer = null;
+            }
+            clearToken();
+            showAuthView();
+        }
+
+        async function refreshData() {
+            const loadingEl = document.getElementById('loading-state');
+            const dataView = document.getElementById('data-view');
+
+            try {
+                const data = await fetchData();
+                if (data) {
+                    loadingEl.classList.add('hidden');
+                    dataView.classList.remove('hidden');
+                    renderData(data);
+                }
+            } catch (e) {
+                console.error('Failed to refresh data:', e);
+            }
+        }
+
+        function renderData(data) {
+            currentData = data;
+            document.getElementById('version-text').textContent = data.version || '-';
+            document.getElementById('timestamp-text').textContent = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+            renderSummary(data.summary);
+            renderTable(data.prs);
+        }
+
+        function renderSummary(summaryData) {
+            const grid = document.getElementById('summary-grid');
+            const cards = [
+                { label: 'Total', count: summaryData.total_prs, class: '' },
+                { label: 'Idle', count: summaryData.idle, class: '' },
+                { label: 'Preparing', count: summaryData.preparing, class: 'active' },
+                { label: 'Submitting', count: summaryData.batch_submitting, class: 'active' },
+                { label: 'Ancestry Check', count: summaryData.awaiting_ancestry_check, class: 'active' },
+                { label: 'Pending', count: summaryData.batch_pending, class: 'active' },
+                { label: 'Completed', count: summaryData.completed, class: 'success' },
+                { label: 'Failed', count: summaryData.failed, class: 'error' },
+                { label: 'Cancelled', count: summaryData.cancelled, class: 'error' },
+            ];
+
+            grid.innerHTML = cards.map(card => `
+                <div class="summary-card ${card.class}">
+                    <div class="count">${card.count}</div>
+                    <div class="label">${escapeHtml(card.label)}</div>
+                </div>
+            `).join('');
+        }
+
+        function getStateClass(stateName) {
+            return 'state-' + stateName.toLowerCase().replace(/_/g, '');
+        }
+
+        function renderTable(prsData) {
+            const tbody = document.getElementById('pr-table-body');
+            const emptyState = document.getElementById('empty-state');
+            const table = document.getElementById('pr-table');
+
+            if (!prsData || prsData.length === 0) {
+                table.classList.add('hidden');
+                emptyState.classList.remove('hidden');
+                return;
+            }
+
+            table.classList.remove('hidden');
+            emptyState.classList.add('hidden');
+
+            tbody.innerHTML = prsData.map(pr => {
+                const details = pr.failure_reason || pr.cancellation_reason || '';
+                return `
+                    <tr>
+                        <td>${escapeHtml(pr.repo_owner)}/${escapeHtml(pr.repo_name)}</td>
+                        <td>#${pr.pr_number}</td>
+                        <td><span class="state-badge ${getStateClass(pr.state_name)}">${escapeHtml(pr.state_name)}</span></td>
+                        <td>${pr.head_sha ? `<span class="sha">${escapeHtml(pr.head_sha)}</span>` : '-'}</td>
+                        <td>${pr.batch_id ? `<span class="batch-id" title="${escapeHtml(pr.batch_id)}">${escapeHtml(pr.batch_id)}</span>` : '-'}</td>
+                        <td>${pr.model ? escapeHtml(pr.model) : '-'}</td>
+                        <td><span class="enabled-badge ${pr.reviews_enabled ? 'enabled-yes' : 'enabled-no'}">${pr.reviews_enabled ? 'Yes' : 'No'}</span></td>
+                        <td>${details ? `<span class="reason" title="${escapeHtml(details)}">${escapeHtml(details)}</span>` : '-'}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function setupAutoRefresh() {
+            const checkbox = document.getElementById('auto-refresh');
+            const intervalSelect = document.getElementById('refresh-interval');
+
+            function updateRefresh() {
+                if (refreshTimer) {
+                    clearInterval(refreshTimer);
+                    refreshTimer = null;
+                }
+
+                if (checkbox.checked) {
+                    const interval = parseInt(intervalSelect.value, 10);
+                    refreshTimer = setInterval(refreshData, interval);
+                }
+            }
+
+            checkbox.addEventListener('change', updateRefresh);
+            intervalSelect.addEventListener('change', updateRefresh);
+        }
+
+        // Handle Enter key in token input
+        document.getElementById('token-input').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                authenticate();
+            }
+        });
+
+        // Initialize
+        async function init() {
+            const token = getToken();
+            if (token) {
+                showDashboardView();
+                await refreshData();
+                setupAutoRefresh();
+            } else {
+                showAuthView();
+            }
+        }
+
+        init();
+    </script>
+</body>
+</html>

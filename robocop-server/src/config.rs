@@ -15,6 +15,10 @@ pub struct Config {
     /// Directory for persistent state (SQLite database).
     /// Defaults to current working directory.
     pub state_dir: PathBuf,
+    /// Optional bearer token for /status endpoint authentication.
+    /// If set, requests to /status must include `Authorization: Bearer <token>`.
+    /// If not set, /status endpoint is disabled (returns 403 Forbidden).
+    pub status_auth_token: Option<String>,
 }
 
 impl Config {
@@ -56,6 +60,15 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
 
+        let status_auth_token = env::var("STATUS_AUTH_TOKEN").ok().and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
         Ok(Config {
             github_app_id,
             github_private_key,
@@ -66,6 +79,68 @@ impl Config {
             recording_enabled,
             recording_log_path,
             state_dir,
+            status_auth_token,
         })
+    }
+}
+
+/// Parse STATUS_AUTH_TOKEN from an optional string value.
+///
+/// Returns None if the value is missing, empty, or contains only whitespace.
+/// Trims leading/trailing whitespace from the token to match UI behavior
+/// (the UI trims input before sending, so tokens copied with accidental
+/// whitespace still authenticate correctly).
+/// This prevents security issues where an empty token would allow unauthenticated access.
+pub fn parse_status_auth_token(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_status_auth_token_none() {
+        assert_eq!(parse_status_auth_token(None), None);
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_empty_string() {
+        // Empty string should be treated as unset (None)
+        assert_eq!(parse_status_auth_token(Some("".to_string())), None);
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_whitespace_only() {
+        // Whitespace-only should be treated as unset (None)
+        assert_eq!(parse_status_auth_token(Some("   ".to_string())), None);
+        assert_eq!(parse_status_auth_token(Some("\t\n".to_string())), None);
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_valid() {
+        // Valid tokens should be preserved
+        assert_eq!(
+            parse_status_auth_token(Some("secret-token".to_string())),
+            Some("secret-token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_with_surrounding_whitespace() {
+        // Tokens with surrounding whitespace should be trimmed to match UI behavior.
+        // The UI trims input before sending, so server must also trim to ensure
+        // tokens copied with accidental whitespace still authenticate correctly.
+        assert_eq!(
+            parse_status_auth_token(Some("  token  ".to_string())),
+            Some("token".to_string())
+        );
     }
 }
