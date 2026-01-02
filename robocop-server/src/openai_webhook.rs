@@ -5,7 +5,7 @@
 //! processing instead of waiting for the polling loop.
 
 use axum::{
-    extract::{Request, State},
+    extract::{Extension, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{Json, Response},
@@ -13,6 +13,11 @@ use axum::{
     Router,
 };
 use base64::prelude::*;
+
+/// Webhook ID extracted from the Standard Webhooks header.
+/// Passed to handler so it can mark the webhook as processed on success.
+#[derive(Clone)]
+struct WebhookId(String);
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -100,9 +105,17 @@ fn verify_standard_webhook_signature(
         }
     };
 
-    // Build the signed payload: {webhook-id}.{webhook-timestamp}.{body}
-    let body_str = String::from_utf8_lossy(body);
-    let signed_payload = format!("{}.{}.{}", webhook_id, timestamp, body_str);
+    // Build the signed payload as raw bytes: {webhook-id}.{webhook-timestamp}.{body}
+    // We must use raw bytes, not String::from_utf8_lossy, because:
+    // 1. The Standard Webhooks spec signs the raw byte stream
+    // 2. from_utf8_lossy replaces invalid UTF-8 with U+FFFD, corrupting the signature input
+    let mut signed_payload =
+        Vec::with_capacity(webhook_id.len() + 1 + timestamp.len() + 1 + body.len());
+    signed_payload.extend_from_slice(webhook_id.as_bytes());
+    signed_payload.push(b'.');
+    signed_payload.extend_from_slice(timestamp.as_bytes());
+    signed_payload.push(b'.');
+    signed_payload.extend_from_slice(body);
 
     // Parse the signature header - format is "v1,<base64>" or multiple space-separated
     // versions like "v1,<sig1> v1a,<sig2>"
@@ -124,7 +137,7 @@ fn verify_standard_webhook_signature(
                     return false;
                 }
             };
-            mac.update(signed_payload.as_bytes());
+            mac.update(&signed_payload);
 
             // verify_slice performs constant-time comparison
             if mac.verify_slice(&sig_bytes).is_ok() {
@@ -168,7 +181,8 @@ async fn verify_openai_webhook_signature(
         .ok_or_else(|| {
             error!("Missing webhook-id header");
             StatusCode::UNAUTHORIZED
-        })?;
+        })?
+        .to_string();
 
     let timestamp = parts
         .headers
@@ -208,19 +222,22 @@ async fn verify_openai_webhook_signature(
         })?;
 
     // Verify signature
-    if !verify_standard_webhook_signature(&secret, webhook_id, timestamp, &bytes, signature) {
+    if !verify_standard_webhook_signature(&secret, &webhook_id, timestamp, &bytes, signature) {
         error!("Invalid OpenAI webhook signature");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Atomically try to claim the webhook ID for processing.
-    // This prevents race conditions where concurrent retries both pass the check
-    // before either records, leading to double-processing.
-    if !state.state_store.try_claim_webhook_id(webhook_id).await {
-        warn!("Rejecting replayed webhook: {}", webhook_id);
-        // Return 200 OK to prevent the sender from retrying.
-        // The webhook was valid but we've already processed it.
-        // Using CONFLICT (409) would cause retries we don't want.
+    // Check if this webhook was already successfully processed.
+    // We only mark webhooks as "seen" after successful processing, so:
+    // - If seen → already processed successfully, return 200
+    // - If not seen → proceed to handler (may be first attempt or a retry after failure)
+    //
+    // This approach is safe for concurrent duplicates because:
+    // 1. The state machine's per-PR locking serializes state transitions
+    // 2. Terminal state handlers ignore stale batch events
+    // 3. Worst case: both process, but second is a safe no-op
+    if state.state_store.is_webhook_seen(&webhook_id).await {
+        info!("Rejecting already-processed webhook: {}", webhook_id);
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .body(axum::body::Body::from(
@@ -229,15 +246,17 @@ async fn verify_openai_webhook_signature(
             .unwrap());
     }
 
-    // Pass through to handler
-    let new_request = Request::from_parts(parts, axum::body::Body::from(bytes));
+    // Pass through to handler with webhook_id for recording on success
+    let mut new_request = Request::from_parts(parts, axum::body::Body::from(bytes));
+    new_request.extensions_mut().insert(WebhookId(webhook_id));
 
     Ok(next.run(new_request).await)
 }
 
 /// Handler for OpenAI webhook events.
-pub async fn openai_webhook_handler(
+async fn openai_webhook_handler(
     State(state): State<Arc<AppState>>,
+    Extension(webhook_id): Extension<WebhookId>,
     request: Request,
 ) -> Result<Json<WebhookResponse>, StatusCode> {
     info!("Received OpenAI webhook");
@@ -266,7 +285,11 @@ pub async fn openai_webhook_handler(
     let (pr_id, installation_id) = match lookup_result {
         Some(result) => result,
         None => {
-            // Batch not found - may be from CLI or already completed
+            // Batch not found - may be from CLI or already completed.
+            // Mark as seen so we don't process again (even though it's a no-op).
+            if let Err(e) = state.state_store.record_webhook_id(&webhook_id.0).await {
+                warn!("Failed to record webhook ID for untracked batch: {}", e);
+            }
             info!(
                 "Batch {} not found in state store, ignoring webhook",
                 batch_id
@@ -294,10 +317,20 @@ pub async fn openai_webhook_handler(
             "Failed to process OpenAI webhook for batch {}: {}",
             batch_id, e
         );
-        // Return 500 so OpenAI retries the webhook.
-        // The webhook ID is already claimed, but that's fine - the retry will come with
-        // a new webhook ID (OpenAI generates a new event ID for each delivery attempt).
+        // Don't mark as seen - return 500 so OpenAI retries.
+        // Per Standard Webhooks spec, retries reuse the same webhook-id.
+        // Since we only mark as seen on success, the retry will be allowed through.
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Success! Mark the webhook as processed so future retries are rejected.
+    if let Err(e) = state.state_store.record_webhook_id(&webhook_id.0).await {
+        // Log but don't fail - the batch was processed successfully.
+        // Worst case: a late retry arrives and is a no-op (state machine handles it).
+        warn!(
+            "Failed to record webhook ID after successful processing: {}",
+            e
+        );
     }
 
     Ok(Json(WebhookResponse {
@@ -633,5 +666,123 @@ mod tests {
              Got {} successful claims, indicating a race condition.",
             claims
         );
+    }
+
+    // =========================================================================
+    // Property-based tests for webhook deduplication semantics
+    // =========================================================================
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        /// Generate a random webhook ID.
+        fn arb_webhook_id()(id in "[a-z]{3,10}") -> String {
+            format!("msg_{}", id)
+        }
+    }
+
+    proptest! {
+        /// Property: is_webhook_seen returns true iff the webhook was successfully processed.
+        ///
+        /// This is the core semantic invariant for webhook deduplication:
+        /// - After successful processing → is_webhook_seen returns true
+        /// - After failed processing → is_webhook_seen returns false (retry allowed)
+        ///
+        /// The original bug violated this: webhook IDs were marked "seen" before
+        /// processing, so failures left them marked, blocking retries.
+        #[test]
+        fn webhook_seen_iff_successfully_processed(
+            webhook_id in arb_webhook_id(),
+            outcomes in prop::collection::vec(prop::bool::ANY, 1..10)
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                use crate::state_machine::repository::InMemoryRepository;
+                use crate::state_machine::store::StateStore;
+                use std::sync::Arc;
+
+                let repo = Arc::new(InMemoryRepository::new());
+                let state_store = StateStore::with_repository(repo);
+
+                let mut any_success = false;
+
+                // Simulate a sequence of processing attempts
+                for success in &outcomes {
+                    // Check current state before processing
+                    let was_seen_before = state_store.is_webhook_seen(&webhook_id).await;
+
+                    if was_seen_before {
+                        // If already seen, we would reject - no state change
+                        continue;
+                    }
+
+                    // Simulate processing attempt
+                    if *success {
+                        // Success: mark as seen (this is what the handler does)
+                        state_store.record_webhook_id(&webhook_id).await.unwrap();
+                        any_success = true;
+                    }
+                    // Failure: don't mark as seen (retry should work)
+                }
+
+                // Verify the invariant
+                let is_seen = state_store.is_webhook_seen(&webhook_id).await;
+                assert_eq!(
+                    is_seen, any_success,
+                    "Webhook {} should be seen={} but was seen={}.\n\
+                     Outcomes: {:?}",
+                    webhook_id, any_success, is_seen, outcomes
+                );
+            });
+        }
+
+        /// Property: Failed processing attempts don't block retries.
+        ///
+        /// If a webhook fails N times and then succeeds, the final state should
+        /// be "seen". This tests the retry path that the original bug broke.
+        #[test]
+        fn failed_attempts_allow_retry(
+            webhook_id in arb_webhook_id(),
+            num_failures in 0usize..10,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                use crate::state_machine::repository::InMemoryRepository;
+                use crate::state_machine::store::StateStore;
+                use std::sync::Arc;
+
+                let repo = Arc::new(InMemoryRepository::new());
+                let state_store = StateStore::with_repository(repo);
+
+                // Simulate N failed attempts (don't mark as seen)
+                for _ in 0..num_failures {
+                    // Each failure should NOT mark the webhook as seen
+                    let seen = state_store.is_webhook_seen(&webhook_id).await;
+                    assert!(
+                        !seen,
+                        "Webhook should not be seen after {} failures",
+                        num_failures
+                    );
+                    // On failure, we don't call record_webhook_id
+                }
+
+                // Now simulate a successful attempt
+                let seen_before_success = state_store.is_webhook_seen(&webhook_id).await;
+                assert!(
+                    !seen_before_success,
+                    "Webhook should not be seen before successful processing"
+                );
+
+                // Success! Mark as seen
+                state_store.record_webhook_id(&webhook_id).await.unwrap();
+
+                // Now it should be seen
+                let seen_after_success = state_store.is_webhook_seen(&webhook_id).await;
+                assert!(
+                    seen_after_success,
+                    "Webhook should be seen after successful processing"
+                );
+            });
+        }
     }
 }

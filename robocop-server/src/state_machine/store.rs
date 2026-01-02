@@ -447,7 +447,7 @@ impl StateStore {
     /// Returns `true` if this caller successfully claimed the webhook (first
     /// to see it), `false` if already claimed (replay).
     ///
-    /// On storage error, returns `false` (fail open: allow through since the
+    /// On storage error, returns `true` (fail open: allow through since the
     /// signature already validated the webhook is legitimate).
     pub async fn try_claim_webhook_id(&self, webhook_id: &str) -> bool {
         match self.repository.try_claim_webhook_id(webhook_id).await {
