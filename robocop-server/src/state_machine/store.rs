@@ -378,6 +378,128 @@ impl StateStore {
         })
     }
 
+    /// Look up a PR by its pending batch ID.
+    ///
+    /// This is used by the OpenAI webhook handler to find which PR a batch
+    /// completion event belongs to. Returns the PR ID and installation ID
+    /// needed to process the batch result.
+    ///
+    /// Returns:
+    /// - `Ok(Some((pr_id, installation_id)))` if found with a valid installation ID
+    /// - `Ok(None)` if no PR has this batch ID, or if it lacks an installation ID
+    /// - `Err(RepositoryError)` if the lookup failed due to a storage error
+    ///
+    /// IMPORTANT: Callers MUST handle `Err` differently from `Ok(None)`:
+    /// - `Ok(None)` means the batch isn't tracked (e.g., CLI batch) - safe to ignore
+    /// - `Err` means a transient failure - callers should retry or fail visibly
+    ///
+    /// For webhooks: `Ok(None)` → return 200, `Err` → return 500 (trigger retry)
+    pub async fn get_pr_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, u64)>, RepositoryError> {
+        match self.repository.get_by_batch_id(batch_id).await {
+            Ok(Some((pr_id, stored))) => {
+                // Filter out states without installation_id - we can't authenticate to GitHub
+                let installation_id = match stored.installation_id {
+                    Some(id) => id,
+                    None => return Ok(None),
+                };
+                Ok(Some((pr_id, installation_id)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                error!("Repository error looking up batch_id {}: {}", batch_id, e);
+                Err(e)
+            }
+        }
+    }
+
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    /// Check if a webhook ID has been seen recently.
+    ///
+    /// Used by the webhook middleware to prevent replay attacks where an
+    /// attacker captures a valid webhook and replays it within the timestamp
+    /// tolerance window.
+    ///
+    /// Returns `true` if the webhook ID has been seen (i.e., it's a replay).
+    /// On repository errors, returns `false` to fail open (allowing the webhook)
+    /// rather than blocking legitimate traffic.
+    pub async fn is_webhook_seen(&self, webhook_id: &str) -> bool {
+        match self.repository.is_webhook_seen(webhook_id).await {
+            Ok(seen) => seen,
+            Err(e) => {
+                error!("Repository error checking webhook_id {}: {}", webhook_id, e);
+                // Fail open: allow the webhook through on storage errors.
+                // The signature check already validated the webhook is legitimate.
+                false
+            }
+        }
+    }
+
+    /// Record a webhook ID to prevent replay attacks.
+    ///
+    /// Should be called after successful webhook validation but before
+    /// processing the webhook payload.
+    ///
+    /// Returns `Ok(())` on success, `Err` on storage failure.
+    /// On storage failure, the caller should log but continue processing
+    /// (fail open) since the webhook was already validated.
+    pub async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        self.repository.record_webhook_id(webhook_id).await
+    }
+
+    /// Atomically try to claim a webhook ID for processing.
+    ///
+    /// This combines the check and record operations into a single atomic
+    /// operation to prevent race conditions where concurrent requests both
+    /// pass the "is_webhook_seen" check before either records.
+    ///
+    /// Returns `true` if this caller successfully claimed the webhook (first
+    /// to see it), `false` if already claimed (replay).
+    ///
+    /// On storage error, returns `true` (fail open: allow through since the
+    /// signature already validated the webhook is legitimate).
+    pub async fn try_claim_webhook_id(&self, webhook_id: &str) -> bool {
+        match self.repository.try_claim_webhook_id(webhook_id).await {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                error!("Repository error claiming webhook_id {}: {}", webhook_id, e);
+                // Fail open: allow the webhook through on storage errors.
+                // The signature check already validated the webhook is legitimate.
+                // We return true (claimed) so the webhook proceeds.
+                true
+            }
+        }
+    }
+
+    /// Clean up expired webhook IDs from the replay protection cache.
+    ///
+    /// This should be called periodically (e.g., from the batch polling loop)
+    /// to prevent unbounded growth of the seen_webhook_ids store.
+    ///
+    /// # Arguments
+    /// * `ttl_seconds` - Entries older than this are considered expired
+    ///
+    /// Returns the number of entries removed, or 0 on error.
+    pub async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> usize {
+        match self.repository.cleanup_expired_webhooks(ttl_seconds).await {
+            Ok(count) => {
+                if count > 0 {
+                    info!("Cleaned up {} expired webhook IDs", count);
+                }
+                count
+            }
+            Err(e) => {
+                error!("Repository error cleaning up expired webhooks: {}", e);
+                0
+            }
+        }
+    }
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:
@@ -858,6 +980,32 @@ mod tests {
 
         async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_all().await
+        }
+
+        async fn get_by_batch_id(
+            &self,
+            batch_id: &str,
+        ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_by_batch_id(batch_id).await
+        }
+
+        async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.is_webhook_seen(webhook_id).await
+        }
+
+        async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.record_webhook_id(webhook_id).await
+        }
+
+        async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.try_claim_webhook_id(webhook_id).await
+        }
+
+        async fn cleanup_expired_webhooks(
+            &self,
+            ttl_seconds: i64,
+        ) -> Result<usize, RepositoryError> {
+            self.inner.cleanup_expired_webhooks(ttl_seconds).await
         }
     }
 
@@ -1366,6 +1514,7 @@ mod tests {
         inner: InMemoryRepository,
         fail_gets: std::sync::atomic::AtomicBool,
         fail_puts: std::sync::atomic::AtomicBool,
+        fail_get_by_batch_id: std::sync::atomic::AtomicBool,
         /// Track number of successful puts (writes that went through)
         put_count: std::sync::atomic::AtomicUsize,
         /// Track the order of operations for atomicity testing
@@ -1382,6 +1531,7 @@ mod tests {
                 inner: InMemoryRepository::new(),
                 fail_gets: std::sync::atomic::AtomicBool::new(false),
                 fail_puts: std::sync::atomic::AtomicBool::new(false),
+                fail_get_by_batch_id: std::sync::atomic::AtomicBool::new(false),
                 put_count: std::sync::atomic::AtomicUsize::new(0),
                 operations: std::sync::Mutex::new(Vec::new()),
                 get_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1397,6 +1547,11 @@ mod tests {
 
         fn set_fail_puts(&self, fail: bool) {
             self.fail_puts
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_fail_get_by_batch_id(&self, fail: bool) {
+            self.fail_get_by_batch_id
                 .store(fail, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -1480,6 +1635,41 @@ mod tests {
 
         async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_all().await
+        }
+
+        async fn get_by_batch_id(
+            &self,
+            batch_id: &str,
+        ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+            if self
+                .fail_get_by_batch_id
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(RepositoryError::storage(
+                    "get_by_batch_id",
+                    "simulated lookup failure",
+                ));
+            }
+            self.inner.get_by_batch_id(batch_id).await
+        }
+
+        async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.is_webhook_seen(webhook_id).await
+        }
+
+        async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.record_webhook_id(webhook_id).await
+        }
+
+        async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.try_claim_webhook_id(webhook_id).await
+        }
+
+        async fn cleanup_expired_webhooks(
+            &self,
+            ttl_seconds: i64,
+        ) -> Result<usize, RepositoryError> {
+            self.inner.cleanup_expired_webhooks(ttl_seconds).await
         }
     }
 
@@ -1755,6 +1945,62 @@ mod tests {
             "Generator produced too few Cancelled states: {} (expected >= {})",
             cancelled_count,
             min_expected
+        );
+    }
+
+    /// Regression test: get_pr_by_batch_id must return Err on repository errors.
+    ///
+    /// Bug: get_pr_by_batch_id returns None on errors, making it impossible for
+    /// callers (like the OpenAI webhook handler) to distinguish between:
+    /// - "batch not found" (legitimate, e.g., CLI batch) → return 200, mark seen
+    /// - "transient DB error" → return 500, DON'T mark seen, allow retry
+    ///
+    /// Impact: During DB hiccups, the webhook handler marks the webhook as seen
+    /// and returns 200, so OpenAI won't retry and the batch completion is lost.
+    #[tokio::test]
+    async fn test_get_pr_by_batch_id_must_return_err_on_repository_error() {
+        let repo = Arc::new(TrackingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set up a state with a pending batch
+        let batch_id = "batch_test123";
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from(batch_id.to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        store.set(pr_id.clone(), state, Some(12345)).await.unwrap();
+
+        // Verify lookup works when repository is healthy
+        let healthy_result = store.get_pr_by_batch_id(batch_id).await;
+        assert!(
+            healthy_result.is_ok(),
+            "Lookup should succeed when repository is healthy"
+        );
+        assert!(
+            healthy_result.unwrap().is_some(),
+            "Should find the batch when repository is healthy"
+        );
+
+        // Now make the repository fail on get_by_batch_id
+        repo.set_fail_get_by_batch_id(true);
+
+        // get_pr_by_batch_id MUST return Err, not None
+        let result = store.get_pr_by_batch_id(batch_id).await;
+
+        assert!(
+            result.is_err(),
+            "get_pr_by_batch_id MUST return Err on repository errors.\n\
+             Current behavior (BUG): Returns Ok(None), making it impossible for\n\
+             callers to distinguish 'not found' from 'transient error'.\n\
+             Got: {:?}",
+            result
         );
     }
 }

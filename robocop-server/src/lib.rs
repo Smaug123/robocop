@@ -4,6 +4,7 @@ pub mod config;
 pub mod git;
 pub mod github;
 pub mod openai;
+pub mod openai_webhook;
 pub mod reconciliation;
 pub mod review_state;
 pub mod state_machine;
@@ -46,4 +47,8 @@ pub struct AppState {
     /// If `Some`, requests must include `Authorization: Bearer <token>`.
     /// If `None`, /status endpoint is disabled (returns 403 Forbidden).
     pub status_auth_token: Option<String>,
+    /// Optional signing secret for OpenAI webhook verification.
+    /// If `Some`, webhooks are verified using the Standard Webhooks spec.
+    /// If `None`, /openai-webhook endpoint returns 503 Service Unavailable.
+    pub openai_webhook_secret: Option<String>,
 }

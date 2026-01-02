@@ -29,7 +29,7 @@ use crate::state_machine::store::StateMachinePrId;
 
 /// Current schema version. Increment this when making schema changes and add
 /// corresponding migration logic in `run_migrations()`.
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// SQLite-backed state repository.
 ///
@@ -235,9 +235,35 @@ impl SqliteRepository {
             .map_err(|e| RepositoryError::storage("migration v1", e.to_string()))?;
         }
 
+        // Migration from version 1 to version 2: Add batch_id column for webhook lookup
+        if from_version < 2 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE pr_states ADD COLUMN batch_id TEXT;
+                CREATE INDEX IF NOT EXISTS idx_batch_id_lookup
+                    ON pr_states(batch_id) WHERE batch_id IS NOT NULL;
+                "#,
+            )
+            .map_err(|e| RepositoryError::storage("migration v2", e.to_string()))?;
+        }
+
+        // Migration from version 2 to version 3: Add seen_webhook_ids table for replay protection
+        if from_version < 3 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS seen_webhook_ids (
+                    webhook_id TEXT PRIMARY KEY,
+                    recorded_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_webhook_recorded_at
+                    ON seen_webhook_ids(recorded_at);
+                "#,
+            )
+            .map_err(|e| RepositoryError::storage("migration v3", e.to_string()))?;
+        }
+
         // Future migrations would go here:
-        // if from_version < 2 { ... }
-        // if from_version < 3 { ... }
+        // if from_version < 4 { ... }
 
         // Update schema version
         conn.execute(
@@ -305,19 +331,22 @@ impl StateRepository for SqliteRepository {
         let has_pending_batch = state.state.pending_batch_id().is_some();
         let is_batch_submitting = state.state.is_batch_submitting();
         let installation_id = state.installation_id;
+        // Extract batch_id for indexed lookup (used by webhook handler)
+        let batch_id = state.state.pending_batch_id().map(|id| id.0.clone());
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
             conn.execute(
                 "INSERT INTO pr_states (repo_owner, repo_name, pr_number, state_json,
-                                        installation_id, has_pending_batch, is_batch_submitting)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                        installation_id, has_pending_batch, is_batch_submitting, batch_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(repo_owner, repo_name, pr_number) DO UPDATE SET
                      state_json = excluded.state_json,
                      installation_id = excluded.installation_id,
                      has_pending_batch = excluded.has_pending_batch,
-                     is_batch_submitting = excluded.is_batch_submitting",
+                     is_batch_submitting = excluded.is_batch_submitting,
+                     batch_id = excluded.batch_id",
                 params![
                     owner,
                     name,
@@ -325,7 +354,8 @@ impl StateRepository for SqliteRepository {
                     state_json,
                     installation_id,
                     has_pending_batch,
-                    is_batch_submitting
+                    is_batch_submitting,
+                    batch_id
                 ],
             )
             .map_err(|e| RepositoryError::storage("put", e.to_string()))?;
@@ -574,6 +604,155 @@ impl StateRepository for SqliteRepository {
         })
         .await
         .map_err(|e| RepositoryError::storage("get_all", e.to_string()))?
+    }
+
+    async fn get_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+        let conn = self.conn.clone();
+        let batch_id = batch_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let result: Option<(String, String, i64, String, Option<u64>)> = conn
+                .query_row(
+                    "SELECT repo_owner, repo_name, pr_number, state_json, installation_id
+                     FROM pr_states WHERE batch_id = ?1",
+                    params![batch_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| RepositoryError::storage("get_by_batch_id", e.to_string()))?;
+
+            match result {
+                Some((owner, name, pr_num, json, installation_id)) => {
+                    let state: ReviewMachineState = serde_json::from_str(&json)
+                        .map_err(|_| RepositoryError::corruption("state JSON"))?;
+                    let id = StateMachinePrId::new(owner, name, pr_num as u64);
+                    Ok(Some((
+                        id,
+                        StoredState {
+                            state,
+                            installation_id,
+                        },
+                    )))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("get_by_batch_id", e.to_string()))?
+    }
+
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM seen_webhook_ids WHERE webhook_id = ?1)",
+                    params![webhook_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| RepositoryError::storage("is_webhook_seen", e.to_string()))?;
+
+            Ok(exists)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("is_webhook_seen", e.to_string()))?
+    }
+
+    async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            conn.execute(
+                "INSERT OR REPLACE INTO seen_webhook_ids (webhook_id, recorded_at) VALUES (?1, ?2)",
+                params![webhook_id, now_secs],
+            )
+            .map_err(|e| RepositoryError::storage("record_webhook_id", e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("record_webhook_id", e.to_string()))?
+    }
+
+    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            // Use INSERT OR IGNORE to atomically try to insert.
+            // If the row already exists (webhook_id is PRIMARY KEY), no insert happens.
+            // We then check changes() to see if we successfully inserted.
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_webhook_ids (webhook_id, recorded_at) VALUES (?1, ?2)",
+                params![webhook_id, now_secs],
+            )
+            .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
+
+            // changes() returns the number of rows modified by the last statement.
+            // If 1, we successfully claimed it. If 0, it was already claimed.
+            let claimed = conn.changes() > 0;
+            Ok(claimed)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?
+    }
+
+    async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError> {
+        let conn = self.conn.clone();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now_secs - ttl_seconds;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let deleted = conn
+                .execute(
+                    "DELETE FROM seen_webhook_ids WHERE recorded_at <= ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| RepositoryError::storage("cleanup_expired_webhooks", e.to_string()))?;
+
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("cleanup_expired_webhooks", e.to_string()))?
     }
 }
 

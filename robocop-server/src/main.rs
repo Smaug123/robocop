@@ -20,6 +20,7 @@ use robocop_server::batch_processor::batch_polling_loop;
 use robocop_server::config::Config;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
+use robocop_server::openai_webhook::openai_webhook_router;
 use robocop_server::reconciliation::reconcile_orphaned_batches;
 use robocop_server::state_machine::repository::SqliteRepository;
 use robocop_server::webhook::webhook_router;
@@ -325,6 +326,15 @@ async fn main() -> Result<()> {
         info!("STATUS_AUTH_TOKEN not set: /status endpoint is disabled");
     }
 
+    // Log info about OpenAI webhook configuration
+    if config.openai_webhook_secret.is_some() {
+        info!("OPENAI_WEBHOOK_SECRET set: /openai-webhook endpoint enabled");
+    } else {
+        info!(
+            "OPENAI_WEBHOOK_SECRET not set: /openai-webhook endpoint disabled (using polling only)"
+        );
+    }
+
     let app_state = Arc::new(AppState {
         github_client: Arc::new(github_client),
         openai_client: Arc::new(openai_client),
@@ -334,6 +344,7 @@ async fn main() -> Result<()> {
         state_store: Arc::new(StateStore::with_repository(Arc::new(sqlite_repo))),
         recording_logger,
         status_auth_token: config.status_auth_token,
+        openai_webhook_secret: config.openai_webhook_secret,
     });
 
     // Run crash recovery reconciliation before accepting any requests
@@ -345,6 +356,7 @@ async fn main() -> Result<()> {
         .route("/help", get(help_handler))
         .route("/status", get(status_handler))
         .merge(webhook_router(app_state.clone()))
+        .merge(openai_webhook_router(app_state.clone()))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(app_state.clone());
 

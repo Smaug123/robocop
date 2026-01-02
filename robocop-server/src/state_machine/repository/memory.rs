@@ -4,6 +4,7 @@
 //! all state is held in memory and lost on restart.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -17,13 +18,25 @@ use crate::state_machine::store::StateMachinePrId;
 /// All state is lost on restart.
 pub struct InMemoryRepository {
     states: RwLock<HashMap<StateMachinePrId, StoredState>>,
+    /// Seen webhook IDs with their recording timestamp (unix seconds).
+    /// Used for replay attack prevention.
+    seen_webhook_ids: RwLock<HashMap<String, i64>>,
 }
 
 impl InMemoryRepository {
     pub fn new() -> Self {
         Self {
             states: RwLock::new(HashMap::new()),
+            seen_webhook_ids: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Get current unix timestamp in seconds.
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
 }
 
@@ -77,6 +90,64 @@ impl StateRepository for InMemoryRepository {
             .iter()
             .map(|(id, stored)| (id.clone(), stored.clone()))
             .collect())
+    }
+
+    async fn get_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+        let states = self.states.read().await;
+        Ok(states
+            .iter()
+            .find(|(_, stored)| {
+                stored
+                    .state
+                    .pending_batch_id()
+                    .is_some_and(|id| id.0 == batch_id)
+            })
+            .map(|(id, stored)| (id.clone(), stored.clone())))
+    }
+
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        let seen = self.seen_webhook_ids.read().await;
+        Ok(seen.contains_key(webhook_id))
+    }
+
+    async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        let mut seen = self.seen_webhook_ids.write().await;
+        seen.insert(webhook_id.to_string(), Self::now_secs());
+        Ok(())
+    }
+
+    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        use std::collections::hash_map::Entry;
+
+        let mut seen = self.seen_webhook_ids.write().await;
+        match seen.entry(webhook_id.to_string()) {
+            Entry::Occupied(_) => {
+                // Already claimed by another caller
+                Ok(false)
+            }
+            Entry::Vacant(entry) => {
+                // We're the first - claim it
+                entry.insert(Self::now_secs());
+                Ok(true)
+            }
+        }
+    }
+
+    async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError> {
+        let now = Self::now_secs();
+        let cutoff = now - ttl_seconds;
+
+        let mut seen = self.seen_webhook_ids.write().await;
+        let initial_len = seen.len();
+        seen.retain(|_, timestamp| *timestamp > cutoff);
+        Ok(initial_len - seen.len())
     }
 }
 

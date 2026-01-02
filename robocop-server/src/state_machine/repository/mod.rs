@@ -206,4 +206,72 @@ pub trait StateRepository: Send + Sync {
     /// - `Ok(vec)` with all states on success
     /// - `Err(RepositoryError)` if storage operation failed
     async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    /// Look up a PR by its pending batch ID.
+    ///
+    /// This is used by the OpenAI webhook handler to find which PR a batch
+    /// completion event belongs to. The lookup includes both active batches
+    /// (in `BatchPending` and `AwaitingAncestryCheck` states) and batches
+    /// that are being cancelled (in `Cancelled` state with `pending_cancel_batch_id`).
+    ///
+    /// Returns:
+    /// - `Ok(Some((id, state)))` if a PR with this batch_id is found
+    /// - `Ok(None)` if no PR has this batch_id
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn get_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    /// Check if a webhook ID has been seen recently.
+    ///
+    /// Used to prevent replay attacks where an attacker captures a valid
+    /// webhook and replays it within the timestamp tolerance window.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the webhook ID has been seen within the TTL window
+    /// - `Ok(false)` if the webhook ID has not been seen (or has expired)
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
+
+    /// Record a webhook ID to prevent replay attacks.
+    ///
+    /// The webhook ID should be stored with a timestamp so it can be cleaned
+    /// up after the TTL expires (typically matching the webhook timestamp
+    /// tolerance window).
+    ///
+    /// Returns:
+    /// - `Ok(())` on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError>;
+
+    /// Atomically try to claim a webhook ID for processing.
+    ///
+    /// This combines the check and record operations into a single atomic
+    /// operation to prevent race conditions where concurrent requests both
+    /// pass the "is_webhook_seen" check before either records.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if this caller successfully claimed the webhook (first to see it)
+    /// - `Ok(false)` if the webhook was already claimed by another caller (replay)
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
+
+    /// Clean up expired webhook IDs.
+    ///
+    /// This is called periodically or opportunistically to remove webhook IDs
+    /// older than the TTL. Implementations may also clean up during other
+    /// operations if convenient.
+    ///
+    /// # Arguments
+    /// * `ttl_seconds` - Entries older than this are considered expired
+    ///
+    /// Returns:
+    /// - `Ok(count)` with the number of entries removed
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError>;
 }
