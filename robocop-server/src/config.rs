@@ -60,7 +60,9 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
 
-        let status_auth_token = env::var("STATUS_AUTH_TOKEN").ok();
+        let status_auth_token = env::var("STATUS_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
 
         Ok(Config {
             github_app_id,
@@ -74,5 +76,55 @@ impl Config {
             state_dir,
             status_auth_token,
         })
+    }
+}
+
+/// Parse STATUS_AUTH_TOKEN from an optional string value.
+///
+/// Returns None if the value is missing, empty, or contains only whitespace.
+/// This prevents security issues where an empty token would allow unauthenticated access.
+pub fn parse_status_auth_token(value: Option<String>) -> Option<String> {
+    value.filter(|s| !s.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_status_auth_token_none() {
+        assert_eq!(parse_status_auth_token(None), None);
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_empty_string() {
+        // Empty string should be treated as unset (None)
+        assert_eq!(parse_status_auth_token(Some("".to_string())), None);
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_whitespace_only() {
+        // Whitespace-only should be treated as unset (None)
+        assert_eq!(parse_status_auth_token(Some("   ".to_string())), None);
+        assert_eq!(parse_status_auth_token(Some("\t\n".to_string())), None);
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_valid() {
+        // Valid tokens should be preserved
+        assert_eq!(
+            parse_status_auth_token(Some("secret-token".to_string())),
+            Some("secret-token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_status_auth_token_with_surrounding_whitespace() {
+        // Tokens with surrounding whitespace should be preserved (not trimmed)
+        // The filter only checks if there's non-whitespace content
+        assert_eq!(
+            parse_status_auth_token(Some("  token  ".to_string())),
+            Some("  token  ".to_string())
+        );
     }
 }

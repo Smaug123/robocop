@@ -77,7 +77,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
                 "path": "/status",
                 "method": "GET",
                 "description": "Status dashboard showing all tracked PRs and their review states",
-                "authentication": "None",
+                "authentication": "Bearer token (Authorization: Bearer <STATUS_AUTH_TOKEN>)",
                 "response_format": "Supports content negotiation (JSON/HTML)"
             }
         ],
@@ -276,6 +276,8 @@ async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) 
 /// - `<` to `\u003c` (prevents `</script>` and `<!--` sequences)
 /// - `>` to `\u003e` (prevents `-->` and similar)
 /// - `&` to `\u0026` (prevents HTML entity interpretation)
+/// - U+2028 (LINE SEPARATOR) to `\u2028` (prevents JS line terminator issues)
+/// - U+2029 (PARAGRAPH SEPARATOR) to `\u2029` (prevents JS line terminator issues)
 ///
 /// These escape sequences are valid JSON, so the resulting string remains
 /// valid JSON that JavaScript can parse correctly.
@@ -283,6 +285,8 @@ fn escape_json_for_script_tag(json: &str) -> String {
     json.replace('&', r"\u0026")
         .replace('<', r"\u003c")
         .replace('>', r"\u003e")
+        .replace('\u{2028}', r"\u2028")
+        .replace('\u{2029}', r"\u2029")
 }
 
 fn generate_status_html(data: &robocop_server::status::StatusData) -> String {
@@ -463,6 +467,50 @@ mod tests {
         assert_eq!(parsed["text"].as_str().unwrap(), "a & b < c > d");
     }
 
+    #[test]
+    fn test_escape_json_for_script_tag_line_separator() {
+        // U+2028 (LINE SEPARATOR) is valid in JSON but breaks JavaScript parsing
+        // when embedded in <script> tags because JS treats it as a line terminator
+        let json = "{\"text\": \"line1\u{2028}line2\"}";
+        let escaped = escape_json_for_script_tag(json);
+
+        // Must not contain literal U+2028
+        assert!(
+            !escaped.contains('\u{2028}'),
+            "Escaped JSON must not contain U+2028: {}",
+            escaped
+        );
+        // Should contain escaped version
+        assert!(escaped.contains(r"\u2028"));
+
+        // Verify it's still valid JSON that parses correctly
+        let parsed: serde_json::Value =
+            serde_json::from_str(&escaped).expect("Escaped JSON should still be valid JSON");
+        assert_eq!(parsed["text"].as_str().unwrap(), "line1\u{2028}line2");
+    }
+
+    #[test]
+    fn test_escape_json_for_script_tag_paragraph_separator() {
+        // U+2029 (PARAGRAPH SEPARATOR) is valid in JSON but breaks JavaScript parsing
+        // when embedded in <script> tags because JS treats it as a line terminator
+        let json = "{\"text\": \"para1\u{2029}para2\"}";
+        let escaped = escape_json_for_script_tag(json);
+
+        // Must not contain literal U+2029
+        assert!(
+            !escaped.contains('\u{2029}'),
+            "Escaped JSON must not contain U+2029: {}",
+            escaped
+        );
+        // Should contain escaped version
+        assert!(escaped.contains(r"\u2029"));
+
+        // Verify it's still valid JSON that parses correctly
+        let parsed: serde_json::Value =
+            serde_json::from_str(&escaped).expect("Escaped JSON should still be valid JSON");
+        assert_eq!(parsed["text"].as_str().unwrap(), "para1\u{2029}para2");
+    }
+
     // =========================================================================
     // Authentication: validate_status_auth tests
     // =========================================================================
@@ -569,6 +617,25 @@ mod tests {
         assert_eq!(
             StatusAuthError::Unauthorized.status_code(),
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Documents why config.rs must filter out empty STATUS_AUTH_TOKEN values.
+    ///
+    /// If an empty string token were allowed through config parsing,
+    /// `Authorization: Bearer ` (with trailing space but no token) would authenticate
+    /// successfully, effectively making /status unauthenticated.
+    #[test]
+    fn test_empty_token_would_be_vulnerable() {
+        // This demonstrates the vulnerability that config.rs prevents by filtering empty strings
+        let headers = make_headers_with_auth("Bearer "); // Note: "Bearer " with trailing space
+        let token = Some("".to_string()); // Empty token (config.rs prevents this)
+
+        // Empty provided token matches empty expected token - this would be a security hole!
+        let result = validate_status_auth(&headers, &token);
+        assert!(
+            result.is_ok(),
+            "Empty token matches empty bearer - config.rs must filter empty STATUS_AUTH_TOKEN"
         );
     }
 }
