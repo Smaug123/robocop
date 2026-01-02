@@ -77,7 +77,7 @@ async fn help_handler(headers: HeaderMap) -> Response {
                 "path": "/status",
                 "method": "GET",
                 "description": "Status dashboard showing all tracked PRs and their review states",
-                "authentication": "Bearer token (Authorization: Bearer <STATUS_AUTH_TOKEN>)",
+                "authentication": "HTML: none (prompts for token, stores in localStorage); JSON: Bearer token required",
                 "response_format": "Supports content negotiation (JSON/HTML)"
             }
         ],
@@ -166,7 +166,12 @@ fn validate_status_auth(
     }
 }
 
-/// Constant-time byte comparison to prevent timing attacks.
+/// Byte comparison that is constant-time for equal-length inputs.
+///
+/// Note: Returns early on length mismatch, so an attacker can infer the expected
+/// token length via timing. This is acceptable here since token length is not
+/// sensitive (it's effectively public via the env var name/docs), and the main
+/// goal is preventing character-by-character timing attacks on the token value.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -189,124 +194,44 @@ async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) 
 
     let prefers_html = accept.to_lowercase().contains("text/html");
 
-    // Validate authentication
+    // HTML requests get the static SPA page without authentication.
+    // The SPA fetches data via JSON API with the token stored in localStorage.
+    if prefers_html {
+        return Html(generate_status_html()).into_response();
+    }
+
+    // JSON requests require Bearer token authentication
     let auth_result = validate_status_auth(&headers, &state.status_auth_token);
     if let Err(response) = auth_result {
-        return if prefers_html {
-            let error_html = match response {
-                StatusAuthError::Disabled => {
-                    r#"<!DOCTYPE html>
-<html>
-<head><title>Robocop Status - Disabled</title></head>
-<body>
-<h1>Status Endpoint Disabled</h1>
-<p>The /status endpoint is disabled. Set STATUS_AUTH_TOKEN to enable it.</p>
-</body>
-</html>"#
-                }
-                StatusAuthError::Unauthorized => {
-                    r#"<!DOCTYPE html>
-<html>
-<head><title>Robocop Status - Unauthorized</title></head>
-<body>
-<h1>Unauthorized</h1>
-<p>Valid Authorization header required. Use: Authorization: Bearer &lt;token&gt;</p>
-</body>
-</html>"#
-                }
-            };
-            (response.status_code(), Html(error_html.to_string())).into_response()
-        } else {
-            let error_json = match response {
-                StatusAuthError::Disabled => json!({"error": "Status endpoint disabled"}),
-                StatusAuthError::Unauthorized => json!({"error": "Unauthorized"}),
-            };
-            (response.status_code(), Json(error_json)).into_response()
+        let error_json = match response {
+            StatusAuthError::Disabled => json!({"error": "Status endpoint disabled"}),
+            StatusAuthError::Unauthorized => json!({"error": "Unauthorized"}),
         };
+        return (response.status_code(), Json(error_json)).into_response();
     }
 
     match state.state_store.get_all_states().await {
         Ok(all_states) => {
             let status_data = robocop_server::status::StatusData::from_states(all_states, version);
-            if prefers_html {
-                Html(generate_status_html(&status_data)).into_response()
-            } else {
-                Json(status_data).into_response()
-            }
+            Json(status_data).into_response()
         }
         Err(e) => {
             error!("Failed to retrieve states for status endpoint: {}", e);
-            if prefers_html {
-                // Return an error page for HTML clients
-                let error_html = format!(
-                    r#"<!DOCTYPE html>
-<html>
-<head><title>Robocop Status - Error</title></head>
-<body>
-<h1>Status Unavailable</h1>
-<p>Failed to retrieve PR states from the database. Please try again later.</p>
-<p>Version: {}</p>
-</body>
-</html>"#,
-                    version
-                );
-                (StatusCode::INTERNAL_SERVER_ERROR, Html(error_html)).into_response()
-            } else {
-                // Return a JSON error for API clients
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": "Failed to retrieve states",
-                        "version": version
-                    })),
-                )
-                    .into_response()
-            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Failed to retrieve states",
+                    "version": version
+                })),
+            )
+                .into_response()
         }
     }
 }
 
-/// Escape JSON string for safe embedding in HTML `<script>` tags.
-///
-/// Standard JSON serialization doesn't escape characters that are safe in JSON
-/// but dangerous in HTML context. For example, `</script>` in a JSON string
-/// would close the enclosing script tag, enabling XSS attacks.
-///
-/// This function escapes:
-/// - `<` to `\u003c` (prevents `</script>` and `<!--` sequences)
-/// - `>` to `\u003e` (prevents `-->` and similar)
-/// - `&` to `\u0026` (prevents HTML entity interpretation)
-/// - U+2028 (LINE SEPARATOR) to `\u2028` (prevents JS line terminator issues)
-/// - U+2029 (PARAGRAPH SEPARATOR) to `\u2029` (prevents JS line terminator issues)
-///
-/// These escape sequences are valid JSON, so the resulting string remains
-/// valid JSON that JavaScript can parse correctly.
-fn escape_json_for_script_tag(json: &str) -> String {
-    json.replace('&', r"\u0026")
-        .replace('<', r"\u003c")
-        .replace('>', r"\u003e")
-        .replace('\u{2028}', r"\u2028")
-        .replace('\u{2029}', r"\u2029")
-}
-
-fn generate_status_html(data: &robocop_server::status::StatusData) -> String {
+fn generate_status_html() -> String {
     const STATUS_HTML_TEMPLATE: &str = include_str!("status.html");
-
-    let summary_json = serde_json::to_string(&data.summary).unwrap_or_else(|_| "{}".to_string());
-    let prs_json = serde_json::to_string(&data.prs).unwrap_or_else(|_| "[]".to_string());
-    let timestamp = chrono::Utc::now()
-        .format("%Y-%m-%d %H:%M:%S UTC")
-        .to_string();
-
-    // Escape JSON for safe embedding in <script> tags to prevent XSS
-    let summary_json = escape_json_for_script_tag(&summary_json);
-    let prs_json = escape_json_for_script_tag(&prs_json);
-
-    STATUS_HTML_TEMPLATE
-        .replace("{version}", &data.version)
-        .replace("{timestamp}", &timestamp)
-        .replace("{summary_json}", &summary_json)
-        .replace("{prs_json}", &prs_json)
+    STATUS_HTML_TEMPLATE.to_string()
 }
 
 #[tokio::main]
@@ -402,114 +327,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // =========================================================================
-    // XSS prevention: escape_json_for_script_tag tests
-    // =========================================================================
-
-    #[test]
-    fn test_escape_json_for_script_tag_basic() {
-        // Simple JSON without dangerous characters
-        let json = r#"{"name": "test", "value": 42}"#;
-        let escaped = escape_json_for_script_tag(json);
-        assert_eq!(escaped, json); // No changes needed
-    }
-
-    #[test]
-    fn test_escape_json_for_script_tag_closes_script_tag() {
-        // XSS payload: closing script tag
-        let json = r#"{"error": "</script><script>alert('xss')</script>"}"#;
-        let escaped = escape_json_for_script_tag(json);
-
-        // Must not contain literal </script>
-        assert!(
-            !escaped.contains("</script>"),
-            "Escaped JSON must not contain </script>: {}",
-            escaped
-        );
-        // Should contain escaped versions
-        assert!(escaped.contains(r"\u003c/script\u003e"));
-    }
-
-    #[test]
-    fn test_escape_json_for_script_tag_html_comment() {
-        // XSS payload: HTML comment that could break out
-        let json = r#"{"comment": "<!-- <script>alert('xss')</script> -->"}"#;
-        let escaped = escape_json_for_script_tag(json);
-
-        assert!(!escaped.contains("<!--"));
-        assert!(!escaped.contains("-->"));
-        assert!(escaped.contains(r"\u003c!--"));
-    }
-
-    #[test]
-    fn test_escape_json_for_script_tag_ampersand() {
-        // Ampersand that could be interpreted as HTML entity
-        let json = r#"{"text": "a & b"}"#;
-        let escaped = escape_json_for_script_tag(json);
-
-        assert!(!escaped.contains(" & "));
-        assert!(escaped.contains(r"\u0026"));
-    }
-
-    #[test]
-    fn test_escape_json_for_script_tag_preserves_json_validity() {
-        // The escaped output should still be valid JSON that parses to the same value
-        let original = r#"{"error": "</script>", "text": "a & b < c > d"}"#;
-        let escaped = escape_json_for_script_tag(original);
-
-        // The escaped version should be parseable
-        let parsed: serde_json::Value =
-            serde_json::from_str(&escaped).expect("Escaped JSON should still be valid JSON");
-
-        // The parsed values should contain the original text
-        assert_eq!(parsed["error"].as_str().unwrap(), "</script>");
-        assert_eq!(parsed["text"].as_str().unwrap(), "a & b < c > d");
-    }
-
-    #[test]
-    fn test_escape_json_for_script_tag_line_separator() {
-        // U+2028 (LINE SEPARATOR) is valid in JSON but breaks JavaScript parsing
-        // when embedded in <script> tags because JS treats it as a line terminator
-        let json = "{\"text\": \"line1\u{2028}line2\"}";
-        let escaped = escape_json_for_script_tag(json);
-
-        // Must not contain literal U+2028
-        assert!(
-            !escaped.contains('\u{2028}'),
-            "Escaped JSON must not contain U+2028: {}",
-            escaped
-        );
-        // Should contain escaped version
-        assert!(escaped.contains(r"\u2028"));
-
-        // Verify it's still valid JSON that parses correctly
-        let parsed: serde_json::Value =
-            serde_json::from_str(&escaped).expect("Escaped JSON should still be valid JSON");
-        assert_eq!(parsed["text"].as_str().unwrap(), "line1\u{2028}line2");
-    }
-
-    #[test]
-    fn test_escape_json_for_script_tag_paragraph_separator() {
-        // U+2029 (PARAGRAPH SEPARATOR) is valid in JSON but breaks JavaScript parsing
-        // when embedded in <script> tags because JS treats it as a line terminator
-        let json = "{\"text\": \"para1\u{2029}para2\"}";
-        let escaped = escape_json_for_script_tag(json);
-
-        // Must not contain literal U+2029
-        assert!(
-            !escaped.contains('\u{2029}'),
-            "Escaped JSON must not contain U+2029: {}",
-            escaped
-        );
-        // Should contain escaped version
-        assert!(escaped.contains(r"\u2029"));
-
-        // Verify it's still valid JSON that parses correctly
-        let parsed: serde_json::Value =
-            serde_json::from_str(&escaped).expect("Escaped JSON should still be valid JSON");
-        assert_eq!(parsed["text"].as_str().unwrap(), "para1\u{2029}para2");
-    }
 
     // =========================================================================
     // Authentication: validate_status_auth tests

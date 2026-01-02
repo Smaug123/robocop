@@ -120,7 +120,11 @@
         <div class="endpoint">
             <div><span class="method">GET</span><span class="endpoint-path">/status</span></div>
             <p>Status dashboard - shows all tracked PRs and their review states</p>
-            <p><strong>Authentication:</strong> Bearer token (<code>Authorization: Bearer &lt;STATUS_AUTH_TOKEN&gt;</code>)</p>
+            <p><strong>Authentication:</strong></p>
+            <ul>
+                <li><strong>HTML (browsers):</strong> Page served without auth; prompts for token which is stored in localStorage</li>
+                <li><strong>JSON (API):</strong> Bearer token required (<code>Authorization: Bearer &lt;STATUS_AUTH_TOKEN&gt;</code>)</li>
+            </ul>
             <p><strong>Content Negotiation:</strong> Returns JSON for API clients, HTML for browsers</p>
         </div>
 
