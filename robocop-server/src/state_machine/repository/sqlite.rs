@@ -29,7 +29,7 @@ use crate::state_machine::store::StateMachinePrId;
 
 /// Current schema version. Increment this when making schema changes and add
 /// corresponding migration logic in `run_migrations()`.
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// SQLite-backed state repository.
 ///
@@ -247,8 +247,23 @@ impl SqliteRepository {
             .map_err(|e| RepositoryError::storage("migration v2", e.to_string()))?;
         }
 
+        // Migration from version 2 to version 3: Add seen_webhook_ids table for replay protection
+        if from_version < 3 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS seen_webhook_ids (
+                    webhook_id TEXT PRIMARY KEY,
+                    recorded_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_webhook_recorded_at
+                    ON seen_webhook_ids(recorded_at);
+                "#,
+            )
+            .map_err(|e| RepositoryError::storage("migration v3", e.to_string()))?;
+        }
+
         // Future migrations would go here:
-        // if from_version < 3 { ... }
+        // if from_version < 4 { ... }
 
         // Update schema version
         conn.execute(
@@ -637,6 +652,78 @@ impl StateRepository for SqliteRepository {
         })
         .await
         .map_err(|e| RepositoryError::storage("get_by_batch_id", e.to_string()))?
+    }
+
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM seen_webhook_ids WHERE webhook_id = ?1)",
+                    params![webhook_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| RepositoryError::storage("is_webhook_seen", e.to_string()))?;
+
+            Ok(exists)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("is_webhook_seen", e.to_string()))?
+    }
+
+    async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            conn.execute(
+                "INSERT OR REPLACE INTO seen_webhook_ids (webhook_id, recorded_at) VALUES (?1, ?2)",
+                params![webhook_id, now_secs],
+            )
+            .map_err(|e| RepositoryError::storage("record_webhook_id", e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("record_webhook_id", e.to_string()))?
+    }
+
+    async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError> {
+        let conn = self.conn.clone();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now_secs - ttl_seconds;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let deleted = conn
+                .execute(
+                    "DELETE FROM seen_webhook_ids WHERE recorded_at <= ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| RepositoryError::storage("cleanup_expired_webhooks", e.to_string()))?;
+
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("cleanup_expired_webhooks", e.to_string()))?
     }
 }
 

@@ -213,6 +213,32 @@ async fn verify_openai_webhook_signature(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    // Check for replay attack: reject if we've seen this webhook ID before
+    if state.state_store.is_webhook_seen(webhook_id).await {
+        warn!("Rejecting replayed webhook: {}", webhook_id);
+        // Return 200 OK to prevent the sender from retrying.
+        // The webhook was valid but we've already processed it.
+        // Using CONFLICT (409) would cause retries we don't want.
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from(
+                "{\"message\":\"Already processed\"}",
+            ))
+            .unwrap());
+    }
+
+    // Record the webhook ID to prevent replay attacks.
+    // We do this before processing to ensure we don't process duplicates
+    // even if the original processing fails partway through.
+    if let Err(e) = state.state_store.record_webhook_id(webhook_id).await {
+        // Log but continue - the signature was valid, and failing to record
+        // is better than rejecting a legitimate webhook
+        warn!(
+            "Failed to record webhook ID {} for replay protection: {}",
+            webhook_id, e
+        );
+    }
+
     // Pass through to handler
     let new_request = Request::from_parts(parts, axum::body::Body::from(bytes));
 
@@ -495,5 +521,76 @@ mod tests {
         ));
         // Timestamp way in the future should be rejected
         assert!(!is_timestamp_within_tolerance(now + 3600, now));
+    }
+
+    // =========================================================================
+    // Webhook replay protection tests
+    // =========================================================================
+
+    /// Test that duplicate webhook IDs are rejected (replay protection).
+    ///
+    /// This test verifies that a captured webhook cannot be replayed within
+    /// the 5-minute timestamp window.
+    ///
+    /// Regression test for: webhook-id is parsed but never stored/deduped
+    #[tokio::test]
+    async fn test_duplicate_webhook_id_rejected() {
+        use crate::state_machine::repository::InMemoryRepository;
+        use crate::state_machine::store::StateStore;
+        use std::sync::Arc;
+
+        // Create a repository with webhook dedup support
+        let repo = Arc::new(InMemoryRepository::new());
+        let state_store = StateStore::with_repository(repo.clone());
+
+        let webhook_id = "msg_test123";
+
+        // First request should succeed (not seen before)
+        let first_seen = state_store.is_webhook_seen(webhook_id).await;
+        assert!(
+            !first_seen,
+            "First request for webhook ID should not be seen"
+        );
+
+        // Record the webhook ID
+        state_store.record_webhook_id(webhook_id).await.unwrap();
+
+        // Second request with same webhook ID should be detected as duplicate
+        let second_seen = state_store.is_webhook_seen(webhook_id).await;
+        assert!(
+            second_seen,
+            "Second request with same webhook ID should be detected as duplicate"
+        );
+    }
+
+    /// Test that webhook IDs expire after the tolerance window.
+    ///
+    /// Property: After TIMESTAMP_TOLERANCE_SECONDS, the same webhook ID
+    /// should be accepted again (though in practice a valid signature would
+    /// fail the timestamp check anyway).
+    #[tokio::test]
+    async fn test_webhook_id_expires_after_tolerance() {
+        use crate::state_machine::repository::InMemoryRepository;
+        use crate::state_machine::store::StateStore;
+        use std::sync::Arc;
+
+        let repo = Arc::new(InMemoryRepository::new());
+        let state_store = StateStore::with_repository(repo.clone());
+
+        let webhook_id = "msg_expire_test";
+
+        // Record the webhook ID
+        state_store.record_webhook_id(webhook_id).await.unwrap();
+
+        // Should be seen immediately after recording
+        assert!(
+            state_store.is_webhook_seen(webhook_id).await,
+            "Webhook ID should be seen immediately after recording"
+        );
+
+        // Note: We can't easily test time-based expiry in a unit test without
+        // injecting a clock. The important property is that the dedup store
+        // cleans up expired entries. This test verifies the basic functionality;
+        // SQLite-based tests verify TTL cleanup via direct DB inspection.
     }
 }

@@ -222,4 +222,44 @@ pub trait StateRepository: Send + Sync {
         &self,
         batch_id: &str,
     ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    /// Check if a webhook ID has been seen recently.
+    ///
+    /// Used to prevent replay attacks where an attacker captures a valid
+    /// webhook and replays it within the timestamp tolerance window.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the webhook ID has been seen within the TTL window
+    /// - `Ok(false)` if the webhook ID has not been seen (or has expired)
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
+
+    /// Record a webhook ID to prevent replay attacks.
+    ///
+    /// The webhook ID should be stored with a timestamp so it can be cleaned
+    /// up after the TTL expires (typically matching the webhook timestamp
+    /// tolerance window).
+    ///
+    /// Returns:
+    /// - `Ok(())` on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError>;
+
+    /// Clean up expired webhook IDs.
+    ///
+    /// This is called periodically or opportunistically to remove webhook IDs
+    /// older than the TTL. Implementations may also clean up during other
+    /// operations if convenient.
+    ///
+    /// # Arguments
+    /// * `ttl_seconds` - Entries older than this are considered expired
+    ///
+    /// Returns:
+    /// - `Ok(count)` with the number of entries removed
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError>;
 }

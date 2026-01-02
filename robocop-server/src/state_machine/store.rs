@@ -401,6 +401,43 @@ impl StateStore {
         }
     }
 
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    /// Check if a webhook ID has been seen recently.
+    ///
+    /// Used by the webhook middleware to prevent replay attacks where an
+    /// attacker captures a valid webhook and replays it within the timestamp
+    /// tolerance window.
+    ///
+    /// Returns `true` if the webhook ID has been seen (i.e., it's a replay).
+    /// On repository errors, returns `false` to fail open (allowing the webhook)
+    /// rather than blocking legitimate traffic.
+    pub async fn is_webhook_seen(&self, webhook_id: &str) -> bool {
+        match self.repository.is_webhook_seen(webhook_id).await {
+            Ok(seen) => seen,
+            Err(e) => {
+                error!("Repository error checking webhook_id {}: {}", webhook_id, e);
+                // Fail open: allow the webhook through on storage errors.
+                // The signature check already validated the webhook is legitimate.
+                false
+            }
+        }
+    }
+
+    /// Record a webhook ID to prevent replay attacks.
+    ///
+    /// Should be called after successful webhook validation but before
+    /// processing the webhook payload.
+    ///
+    /// Returns `Ok(())` on success, `Err` on storage failure.
+    /// On storage failure, the caller should log but continue processing
+    /// (fail open) since the webhook was already validated.
+    pub async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        self.repository.record_webhook_id(webhook_id).await
+    }
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:
@@ -888,6 +925,21 @@ mod tests {
             batch_id: &str,
         ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_by_batch_id(batch_id).await
+        }
+
+        async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.is_webhook_seen(webhook_id).await
+        }
+
+        async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.record_webhook_id(webhook_id).await
+        }
+
+        async fn cleanup_expired_webhooks(
+            &self,
+            ttl_seconds: i64,
+        ) -> Result<usize, RepositoryError> {
+            self.inner.cleanup_expired_webhooks(ttl_seconds).await
         }
     }
 
@@ -1517,6 +1569,21 @@ mod tests {
             batch_id: &str,
         ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_by_batch_id(batch_id).await
+        }
+
+        async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.is_webhook_seen(webhook_id).await
+        }
+
+        async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.record_webhook_id(webhook_id).await
+        }
+
+        async fn cleanup_expired_webhooks(
+            &self,
+            ttl_seconds: i64,
+        ) -> Result<usize, RepositoryError> {
+            self.inner.cleanup_expired_webhooks(ttl_seconds).await
         }
     }
 
