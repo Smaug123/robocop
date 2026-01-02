@@ -702,6 +702,35 @@ impl StateRepository for SqliteRepository {
         .map_err(|e| RepositoryError::storage("record_webhook_id", e.to_string()))?
     }
 
+    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            // Use INSERT OR IGNORE to atomically try to insert.
+            // If the row already exists (webhook_id is PRIMARY KEY), no insert happens.
+            // We then check changes() to see if we successfully inserted.
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_webhook_ids (webhook_id, recorded_at) VALUES (?1, ?2)",
+                params![webhook_id, now_secs],
+            )
+            .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
+
+            // changes() returns the number of rows modified by the last statement.
+            // If 1, we successfully claimed it. If 0, it was already claimed.
+            let claimed = conn.changes() > 0;
+            Ok(claimed)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?
+    }
+
     async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError> {
         let conn = self.conn.clone();
         let now_secs = std::time::SystemTime::now()

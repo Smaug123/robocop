@@ -249,6 +249,18 @@ pub trait StateRepository: Send + Sync {
     /// - `Err(RepositoryError)` if storage operation failed
     async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError>;
 
+    /// Atomically try to claim a webhook ID for processing.
+    ///
+    /// This combines the check and record operations into a single atomic
+    /// operation to prevent race conditions where concurrent requests both
+    /// pass the "is_webhook_seen" check before either records.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if this caller successfully claimed the webhook (first to see it)
+    /// - `Ok(false)` if the webhook was already claimed by another caller (replay)
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
+
     /// Clean up expired webhook IDs.
     ///
     /// This is called periodically or opportunistically to remove webhook IDs

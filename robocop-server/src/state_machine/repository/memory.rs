@@ -123,6 +123,23 @@ impl StateRepository for InMemoryRepository {
         Ok(())
     }
 
+    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        use std::collections::hash_map::Entry;
+
+        let mut seen = self.seen_webhook_ids.write().await;
+        match seen.entry(webhook_id.to_string()) {
+            Entry::Occupied(_) => {
+                // Already claimed by another caller
+                Ok(false)
+            }
+            Entry::Vacant(entry) => {
+                // We're the first - claim it
+                entry.insert(Self::now_secs());
+                Ok(true)
+            }
+        }
+    }
+
     async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError> {
         let now = Self::now_secs();
         let cutoff = now - ttl_seconds;

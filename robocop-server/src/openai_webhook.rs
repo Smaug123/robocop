@@ -213,8 +213,10 @@ async fn verify_openai_webhook_signature(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Check for replay attack: reject if we've seen this webhook ID before
-    if state.state_store.is_webhook_seen(webhook_id).await {
+    // Atomically try to claim the webhook ID for processing.
+    // This prevents race conditions where concurrent retries both pass the check
+    // before either records, leading to double-processing.
+    if !state.state_store.try_claim_webhook_id(webhook_id).await {
         warn!("Rejecting replayed webhook: {}", webhook_id);
         // Return 200 OK to prevent the sender from retrying.
         // The webhook was valid but we've already processed it.
@@ -225,18 +227,6 @@ async fn verify_openai_webhook_signature(
                 "{\"message\":\"Already processed\"}",
             ))
             .unwrap());
-    }
-
-    // Record the webhook ID to prevent replay attacks.
-    // We do this before processing to ensure we don't process duplicates
-    // even if the original processing fails partway through.
-    if let Err(e) = state.state_store.record_webhook_id(webhook_id).await {
-        // Log but continue - the signature was valid, and failing to record
-        // is better than rejecting a legitimate webhook
-        warn!(
-            "Failed to record webhook ID {} for replay protection: {}",
-            webhook_id, e
-        );
     }
 
     // Pass through to handler
@@ -592,5 +582,54 @@ mod tests {
         // injecting a clock. The important property is that the dedup store
         // cleans up expired entries. This test verifies the basic functionality;
         // SQLite-based tests verify TTL cleanup via direct DB inspection.
+    }
+
+    /// Test that concurrent webhook claims are properly serialized.
+    ///
+    /// Property: When multiple concurrent callers try to claim the same webhook ID,
+    /// exactly one succeeds (returns true) and all others fail (return false).
+    ///
+    /// This is a regression test for the race condition where the non-atomic
+    /// is_webhook_seen + record_webhook_id pattern allowed concurrent requests
+    /// to both pass the check before either recorded.
+    #[tokio::test]
+    async fn test_concurrent_webhook_claims_only_one_succeeds() {
+        use crate::state_machine::repository::InMemoryRepository;
+        use crate::state_machine::store::StateStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = Arc::new(InMemoryRepository::new());
+        let state_store = Arc::new(StateStore::with_repository(repo));
+
+        let webhook_id = "msg_concurrent_test";
+        let successful_claims = Arc::new(AtomicUsize::new(0));
+
+        // Spawn 20 concurrent tasks all trying to claim the same webhook ID
+        let mut handles = vec![];
+        for _ in 0..20 {
+            let store = state_store.clone();
+            let claims = successful_claims.clone();
+            let id = webhook_id.to_string();
+            handles.push(tokio::spawn(async move {
+                if store.try_claim_webhook_id(&id).await {
+                    claims.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Property: Exactly one caller should have succeeded
+        let claims = successful_claims.load(Ordering::SeqCst);
+        assert_eq!(
+            claims, 1,
+            "Exactly one concurrent caller should succeed in claiming the webhook ID.\n\
+             Got {} successful claims, indicating a race condition.",
+            claims
+        );
     }
 }

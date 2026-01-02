@@ -438,6 +438,30 @@ impl StateStore {
         self.repository.record_webhook_id(webhook_id).await
     }
 
+    /// Atomically try to claim a webhook ID for processing.
+    ///
+    /// This combines the check and record operations into a single atomic
+    /// operation to prevent race conditions where concurrent requests both
+    /// pass the "is_webhook_seen" check before either records.
+    ///
+    /// Returns `true` if this caller successfully claimed the webhook (first
+    /// to see it), `false` if already claimed (replay).
+    ///
+    /// On storage error, returns `false` (fail open: allow through since the
+    /// signature already validated the webhook is legitimate).
+    pub async fn try_claim_webhook_id(&self, webhook_id: &str) -> bool {
+        match self.repository.try_claim_webhook_id(webhook_id).await {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                error!("Repository error claiming webhook_id {}: {}", webhook_id, e);
+                // Fail open: allow the webhook through on storage errors.
+                // The signature check already validated the webhook is legitimate.
+                // We return true (claimed) so the webhook proceeds.
+                true
+            }
+        }
+    }
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:
@@ -933,6 +957,10 @@ mod tests {
 
         async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
             self.inner.record_webhook_id(webhook_id).await
+        }
+
+        async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.try_claim_webhook_id(webhook_id).await
         }
 
         async fn cleanup_expired_webhooks(
@@ -1577,6 +1605,10 @@ mod tests {
 
         async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
             self.inner.record_webhook_id(webhook_id).await
+        }
+
+        async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+            self.inner.try_claim_webhook_id(webhook_id).await
         }
 
         async fn cleanup_expired_webhooks(
