@@ -7,6 +7,7 @@ pub mod openai;
 pub mod reconciliation;
 pub mod review_state;
 pub mod state_machine;
+pub mod status;
 pub mod webhook;
 
 use std::collections::HashMap;

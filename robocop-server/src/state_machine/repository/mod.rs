@@ -196,4 +196,14 @@ pub trait StateRepository: Send + Sync {
     /// - `Err(RepositoryError)` if storage operation failed
     async fn get_submitting(&self)
         -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    /// Get all stored states.
+    ///
+    /// Returns all PR states in the repository, regardless of their state.
+    /// Used by the status endpoint to display system state.
+    ///
+    /// Returns:
+    /// - `Ok(vec)` with all states on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
 }

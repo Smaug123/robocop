@@ -70,6 +70,14 @@ impl StateRepository for InMemoryRepository {
             .map(|(id, stored)| (id.clone(), stored.clone()))
             .collect())
     }
+
+    async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+        let states = self.states.read().await;
+        Ok(states
+            .iter()
+            .map(|(id, stored)| (id.clone(), stored.clone()))
+            .collect())
+    }
 }
 
 #[cfg(test)]

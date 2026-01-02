@@ -361,6 +361,20 @@ impl StateStore {
         }
     }
 
+    /// Get all PR states for status display.
+    ///
+    /// Returns all states with their PR IDs. Used by the status endpoint to
+    /// display the current state of all tracked PRs.
+    pub async fn get_all_states(&self) -> Vec<(StateMachinePrId, StoredState)> {
+        match self.repository.get_all().await {
+            Ok(states) => states,
+            Err(e) => {
+                error!("Repository error getting all states: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:
@@ -837,6 +851,10 @@ mod tests {
             &self,
         ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_submitting().await
+        }
+
+        async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_all().await
         }
     }
 
@@ -1455,6 +1473,10 @@ mod tests {
             &self,
         ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_submitting().await
+        }
+
+        async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_all().await
         }
     }
 

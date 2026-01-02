@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robocop Status Dashboard</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .version {
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .timestamp {
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .refresh-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 20px 0;
+            padding: 10px;
+            background: #ecf0f1;
+            border-radius: 5px;
+        }
+        .refresh-controls label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+        }
+        .refresh-controls select {
+            padding: 5px;
+            border-radius: 3px;
+            border: 1px solid #bdc3c7;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .summary-card {
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+            border-left: 4px solid #3498db;
+        }
+        .summary-card.active {
+            border-left-color: #f39c12;
+            background: #fef9e7;
+        }
+        .summary-card.success {
+            border-left-color: #27ae60;
+            background: #e8f6ef;
+        }
+        .summary-card.error {
+            border-left-color: #e74c3c;
+            background: #fdedec;
+        }
+        .summary-card .count {
+            font-size: 2em;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .summary-card .label {
+            font-size: 0.85em;
+            color: #7f8c8d;
+            text-transform: uppercase;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ecf0f1;
+        }
+        th {
+            background: #34495e;
+            color: white;
+            font-weight: 500;
+        }
+        tr:hover {
+            background: #f8f9fa;
+        }
+        .state-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            font-weight: 500;
+        }
+        .state-idle { background: #ecf0f1; color: #7f8c8d; }
+        .state-preparing, .state-batchsubmitting, .state-awaitingancestrycheck, .state-batchpending {
+            background: #fef9e7; color: #9a7b00;
+        }
+        .state-completed { background: #e8f6ef; color: #1e8449; }
+        .state-failed { background: #fdedec; color: #c0392b; }
+        .state-cancelled { background: #f5eef8; color: #7d3c98; }
+        .enabled-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.75em;
+        }
+        .enabled-yes { background: #d5f5e3; color: #1e8449; }
+        .enabled-no { background: #fadbd8; color: #c0392b; }
+        .sha {
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        .batch-id {
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .reason {
+            font-size: 0.85em;
+            color: #7f8c8d;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+        }
+        footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ecf0f1;
+            text-align: center;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header-row">
+            <div>
+                <h1>Robocop Status Dashboard</h1>
+                <p class="version">Version: {version}</p>
+            </div>
+            <p class="timestamp">Last updated: {timestamp}</p>
+        </div>
+
+        <div class="refresh-controls">
+            <label>
+                <input type="checkbox" id="auto-refresh">
+                Auto-refresh
+            </label>
+            <select id="refresh-interval">
+                <option value="30000">30 seconds</option>
+                <option value="60000" selected>1 minute</option>
+                <option value="300000">5 minutes</option>
+            </select>
+            <button id="refresh-now" onclick="refreshNow()">Refresh Now</button>
+        </div>
+
+        <div class="summary-grid" id="summary-grid">
+            <!-- Populated by JavaScript -->
+        </div>
+
+        <table id="pr-table">
+            <thead>
+                <tr>
+                    <th>Repository</th>
+                    <th>PR #</th>
+                    <th>State</th>
+                    <th>Commit</th>
+                    <th>Batch ID</th>
+                    <th>Model</th>
+                    <th>Reviews</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody id="pr-table-body">
+                <!-- Populated by JavaScript -->
+            </tbody>
+        </table>
+
+        <div id="empty-state" class="empty-state" style="display: none;">
+            No tracked PRs
+        </div>
+
+        <footer>
+            <p>Robocop Status Dashboard v{version}</p>
+        </footer>
+    </div>
+
+    <script>
+        // Data from server (injected via template)
+        const summaryData = {summary_json};
+        const prsData = {prs_json};
+
+        let refreshTimer = null;
+
+        function escapeHtml(text) {
+            if (text === null || text === undefined) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function renderSummary() {
+            const grid = document.getElementById('summary-grid');
+            const cards = [
+                { label: 'Total', count: summaryData.total_prs, class: '' },
+                { label: 'Idle', count: summaryData.idle, class: '' },
+                { label: 'Preparing', count: summaryData.preparing, class: 'active' },
+                { label: 'Submitting', count: summaryData.batch_submitting, class: 'active' },
+                { label: 'Ancestry Check', count: summaryData.awaiting_ancestry_check, class: 'active' },
+                { label: 'Pending', count: summaryData.batch_pending, class: 'active' },
+                { label: 'Completed', count: summaryData.completed, class: 'success' },
+                { label: 'Failed', count: summaryData.failed, class: 'error' },
+                { label: 'Cancelled', count: summaryData.cancelled, class: 'error' },
+            ];
+
+            grid.innerHTML = cards.map(card => `
+                <div class="summary-card ${card.class}">
+                    <div class="count">${card.count}</div>
+                    <div class="label">${escapeHtml(card.label)}</div>
+                </div>
+            `).join('');
+        }
+
+        function getStateClass(stateName) {
+            return 'state-' + stateName.toLowerCase().replace(/_/g, '');
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById('pr-table-body');
+            const emptyState = document.getElementById('empty-state');
+            const table = document.getElementById('pr-table');
+
+            if (prsData.length === 0) {
+                table.style.display = 'none';
+                emptyState.style.display = 'block';
+                return;
+            }
+
+            table.style.display = 'table';
+            emptyState.style.display = 'none';
+
+            tbody.innerHTML = prsData.map(pr => {
+                const details = pr.failure_reason || pr.cancellation_reason || '';
+                return `
+                    <tr>
+                        <td>${escapeHtml(pr.repo_owner)}/${escapeHtml(pr.repo_name)}</td>
+                        <td>#${pr.pr_number}</td>
+                        <td><span class="state-badge ${getStateClass(pr.state_name)}">${escapeHtml(pr.state_name)}</span></td>
+                        <td>${pr.head_sha ? `<span class="sha">${escapeHtml(pr.head_sha)}</span>` : '-'}</td>
+                        <td>${pr.batch_id ? `<span class="batch-id" title="${escapeHtml(pr.batch_id)}">${escapeHtml(pr.batch_id)}</span>` : '-'}</td>
+                        <td>${pr.model ? escapeHtml(pr.model) : '-'}</td>
+                        <td><span class="enabled-badge ${pr.reviews_enabled ? 'enabled-yes' : 'enabled-no'}">${pr.reviews_enabled ? 'Yes' : 'No'}</span></td>
+                        <td>${details ? `<span class="reason" title="${escapeHtml(details)}">${escapeHtml(details)}</span>` : '-'}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function refreshNow() {
+            window.location.reload();
+        }
+
+        function setupAutoRefresh() {
+            const checkbox = document.getElementById('auto-refresh');
+            const intervalSelect = document.getElementById('refresh-interval');
+
+            function updateRefresh() {
+                if (refreshTimer) {
+                    clearInterval(refreshTimer);
+                    refreshTimer = null;
+                }
+
+                if (checkbox.checked) {
+                    const interval = parseInt(intervalSelect.value, 10);
+                    refreshTimer = setInterval(refreshNow, interval);
+                }
+            }
+
+            checkbox.addEventListener('change', updateRefresh);
+            intervalSelect.addEventListener('change', updateRefresh);
+        }
+
+        // Initialize
+        renderSummary();
+        renderTable();
+        setupAutoRefresh();
+    </script>
+</body>
+</html>

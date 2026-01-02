@@ -1,5 +1,6 @@
 use anyhow::Result;
 use axum::{
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::get,
@@ -71,6 +72,13 @@ async fn help_handler(headers: HeaderMap) -> Response {
                 "description": "API documentation and service information",
                 "authentication": "None",
                 "response_format": "Supports content negotiation (JSON/HTML)"
+            },
+            {
+                "path": "/status",
+                "method": "GET",
+                "description": "Status dashboard showing all tracked PRs and their review states",
+                "authentication": "None",
+                "response_format": "Supports content negotiation (JSON/HTML)"
             }
         ],
         "features": [
@@ -108,6 +116,43 @@ fn generate_help_html() -> String {
     const HELP_HTML_TEMPLATE: &str = include_str!("help.html");
     let version = robocop_server::get_bot_version();
     HELP_HTML_TEMPLATE.replace("{version}", &version)
+}
+
+async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    let all_states = state.state_store.get_all_states().await;
+    let version = robocop_server::get_bot_version();
+    let status_data = robocop_server::status::StatusData::from_states(all_states, version);
+
+    // Check Accept header for content negotiation
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+
+    // If client prefers HTML, serve HTML
+    if accept.to_lowercase().contains("text/html") {
+        let html = generate_status_html(&status_data);
+        return Html(html).into_response();
+    }
+
+    // Default to JSON
+    Json(status_data).into_response()
+}
+
+fn generate_status_html(data: &robocop_server::status::StatusData) -> String {
+    const STATUS_HTML_TEMPLATE: &str = include_str!("status.html");
+
+    let summary_json = serde_json::to_string(&data.summary).unwrap_or_else(|_| "{}".to_string());
+    let prs_json = serde_json::to_string(&data.prs).unwrap_or_else(|_| "[]".to_string());
+    let timestamp = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+
+    STATUS_HTML_TEMPLATE
+        .replace("{version}", &data.version)
+        .replace("{timestamp}", &timestamp)
+        .replace("{summary_json}", &summary_json)
+        .replace("{prs_json}", &prs_json)
 }
 
 #[tokio::main]
@@ -175,6 +220,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/help", get(help_handler))
+        .route("/status", get(status_handler))
         .merge(webhook_router(app_state.clone()))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(app_state.clone());
