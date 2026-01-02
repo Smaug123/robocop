@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::get,
     Router,
@@ -166,6 +166,14 @@ fn validate_status_auth(
     }
 }
 
+/// Check if the status endpoint is enabled (i.e., a token is configured).
+///
+/// When no token is configured, the entire /status endpoint should be disabled
+/// and return 403 Forbidden for all requests (HTML and JSON).
+fn is_status_endpoint_enabled(token: &Option<String>) -> bool {
+    token.is_some()
+}
+
 /// Byte comparison that is constant-time for equal-length inputs.
 ///
 /// Note: Returns early on length mismatch, so an attacker can infer the expected
@@ -184,6 +192,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    // Check if endpoint is enabled first - applies to all request types
+    if !is_status_endpoint_enabled(&state.status_auth_token) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Status endpoint disabled"})),
+        )
+            .into_response();
+    }
+
     let version = robocop_server::get_bot_version();
 
     // Check Accept header for content negotiation
@@ -194,10 +211,25 @@ async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) 
 
     let prefers_html = accept.to_lowercase().contains("text/html");
 
-    // HTML requests get the static SPA page without authentication.
-    // The SPA fetches data via JSON API with the token stored in localStorage.
+    // HTML requests get the static SPA page.
+    // The SPA fetches data via JSON API with the token stored in sessionStorage.
     if prefers_html {
-        return Html(generate_status_html()).into_response();
+        // Add restrictive CSP to mitigate XSS attacks that could steal the token.
+        // 'unsafe-inline' is required for the embedded script and styles.
+        let csp = "default-src 'self'; \
+                   script-src 'self' 'unsafe-inline'; \
+                   style-src 'self' 'unsafe-inline'; \
+                   connect-src 'self'; \
+                   img-src 'self'; \
+                   font-src 'self'; \
+                   object-src 'none'; \
+                   base-uri 'self'; \
+                   form-action 'self'";
+        return (
+            [(header::CONTENT_SECURITY_POLICY, csp)],
+            Html(generate_status_html()),
+        )
+            .into_response();
     }
 
     // JSON requests require Bearer token authentication
@@ -453,6 +485,29 @@ mod tests {
         assert!(
             result.is_ok(),
             "Empty token matches empty bearer - config.rs must filter empty STATUS_AUTH_TOKEN"
+        );
+    }
+
+    // =========================================================================
+    // Status endpoint availability tests
+    // =========================================================================
+
+    #[test]
+    fn test_status_endpoint_disabled_when_no_token() {
+        // When STATUS_AUTH_TOKEN is not set, the entire endpoint should be disabled,
+        // including HTML responses. This ensures operators relying on 403 behavior
+        // get consistent responses regardless of Accept header.
+        assert!(
+            !is_status_endpoint_enabled(&None),
+            "Status endpoint should be disabled when no token is configured"
+        );
+    }
+
+    #[test]
+    fn test_status_endpoint_enabled_when_token_set() {
+        assert!(
+            is_status_endpoint_enabled(&Some("secret-token".to_string())),
+            "Status endpoint should be enabled when token is configured"
         );
     }
 }

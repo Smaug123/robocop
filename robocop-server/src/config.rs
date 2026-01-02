@@ -60,9 +60,14 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
 
-        let status_auth_token = env::var("STATUS_AUTH_TOKEN")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+        let status_auth_token = env::var("STATUS_AUTH_TOKEN").ok().and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
 
         Ok(Config {
             github_app_id,
@@ -82,9 +87,19 @@ impl Config {
 /// Parse STATUS_AUTH_TOKEN from an optional string value.
 ///
 /// Returns None if the value is missing, empty, or contains only whitespace.
+/// Trims leading/trailing whitespace from the token to match UI behavior
+/// (the UI trims input before sending, so tokens copied with accidental
+/// whitespace still authenticate correctly).
 /// This prevents security issues where an empty token would allow unauthenticated access.
 pub fn parse_status_auth_token(value: Option<String>) -> Option<String> {
-    value.filter(|s| !s.trim().is_empty())
+    value.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -120,11 +135,12 @@ mod tests {
 
     #[test]
     fn test_parse_status_auth_token_with_surrounding_whitespace() {
-        // Tokens with surrounding whitespace should be preserved (not trimmed)
-        // The filter only checks if there's non-whitespace content
+        // Tokens with surrounding whitespace should be trimmed to match UI behavior.
+        // The UI trims input before sending, so server must also trim to ensure
+        // tokens copied with accidental whitespace still authenticate correctly.
         assert_eq!(
             parse_status_auth_token(Some("  token  ".to_string())),
-            Some("  token  ".to_string())
+            Some("token".to_string())
         );
     }
 }
