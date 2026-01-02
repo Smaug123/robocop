@@ -203,16 +203,21 @@ async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) 
 
     let version = robocop_server::get_bot_version();
 
-    // Check Accept header for content negotiation
+    // Check Accept header for content negotiation.
+    // Serve HTML only if the client explicitly accepts text/html but not application/json.
+    // This ensures API clients (which typically send Accept: application/json) get JSON,
+    // while browsers (which typically send text/html without application/json) get HTML.
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
 
-    let prefers_html = accept.to_lowercase().contains("text/html");
+    let accept_lower = accept.to_lowercase();
+    let prefers_html =
+        accept_lower.contains("text/html") && !accept_lower.contains("application/json");
 
     // HTML requests get the static SPA page.
-    // The SPA fetches data via JSON API with the token stored in sessionStorage.
+    // The SPA fetches data via JSON API with the token stored in localStorage.
     if prefers_html {
         // Add restrictive CSP to mitigate XSS attacks that could steal the token.
         // 'unsafe-inline' is required for the embedded script and styles.
@@ -224,7 +229,8 @@ async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) 
                    font-src 'self'; \
                    object-src 'none'; \
                    base-uri 'self'; \
-                   form-action 'self'";
+                   form-action 'self'; \
+                   frame-ancestors 'none'";
         return (
             [(header::CONTENT_SECURITY_POLICY, csp)],
             Html(generate_status_html()),
