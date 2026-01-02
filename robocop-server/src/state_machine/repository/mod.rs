@@ -206,4 +206,20 @@ pub trait StateRepository: Send + Sync {
     /// - `Ok(vec)` with all states on success
     /// - `Err(RepositoryError)` if storage operation failed
     async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    /// Look up a PR by its pending batch ID.
+    ///
+    /// This is used by the OpenAI webhook handler to find which PR a batch
+    /// completion event belongs to. The lookup includes both active batches
+    /// (in `BatchPending` and `AwaitingAncestryCheck` states) and batches
+    /// that are being cancelled (in `Cancelled` state with `pending_cancel_batch_id`).
+    ///
+    /// Returns:
+    /// - `Ok(Some((id, state)))` if a PR with this batch_id is found
+    /// - `Ok(None)` if no PR has this batch_id
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn get_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError>;
 }

@@ -19,6 +19,11 @@ pub struct Config {
     /// If set, requests to /status must include `Authorization: Bearer <token>`.
     /// If not set, /status endpoint is disabled (returns 403 Forbidden).
     pub status_auth_token: Option<String>,
+    /// Optional signing secret for OpenAI webhook verification.
+    /// If set, enables the /openai-webhook endpoint for real-time batch completions.
+    /// If not set, /openai-webhook endpoint returns 503 Service Unavailable.
+    /// Secret is base64-encoded and may have "whsec_" prefix.
+    pub openai_webhook_secret: Option<String>,
 }
 
 impl Config {
@@ -69,6 +74,17 @@ impl Config {
             }
         });
 
+        // OpenAI webhook secret for real-time batch completion notifications.
+        // If not set, the /openai-webhook endpoint will return 503.
+        let openai_webhook_secret = env::var("OPENAI_WEBHOOK_SECRET").ok().and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
         Ok(Config {
             github_app_id,
             github_private_key,
@@ -80,6 +96,7 @@ impl Config {
             recording_log_path,
             state_dir,
             status_auth_token,
+            openai_webhook_secret,
         })
     }
 }

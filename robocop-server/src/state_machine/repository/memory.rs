@@ -78,6 +78,22 @@ impl StateRepository for InMemoryRepository {
             .map(|(id, stored)| (id.clone(), stored.clone()))
             .collect())
     }
+
+    async fn get_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+        let states = self.states.read().await;
+        Ok(states
+            .iter()
+            .find(|(_, stored)| {
+                stored
+                    .state
+                    .pending_batch_id()
+                    .is_some_and(|id| id.0 == batch_id)
+            })
+            .map(|(id, stored)| (id.clone(), stored.clone())))
+    }
 }
 
 #[cfg(test)]

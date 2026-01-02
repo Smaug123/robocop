@@ -87,7 +87,10 @@ async fn create_and_process_event(
     Ok(())
 }
 
-async fn process_single_batch(
+/// Process a single batch by checking its status and generating the appropriate event.
+///
+/// This is called by both the polling loop and the OpenAI webhook handler.
+pub async fn process_single_batch(
     state: &Arc<AppState>,
     pr_id: &crate::state_machine::StateMachinePrId,
     batch_id: &crate::state_machine::BatchId,

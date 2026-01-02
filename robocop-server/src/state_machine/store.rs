@@ -378,6 +378,29 @@ impl StateStore {
         })
     }
 
+    /// Look up a PR by its pending batch ID.
+    ///
+    /// This is used by the OpenAI webhook handler to find which PR a batch
+    /// completion event belongs to. Returns the PR ID and installation ID
+    /// needed to process the batch result.
+    ///
+    /// Returns `None` if no PR has this batch ID, or if the PR doesn't have
+    /// an installation ID (required for GitHub API authentication).
+    pub async fn get_pr_by_batch_id(&self, batch_id: &str) -> Option<(StateMachinePrId, u64)> {
+        match self.repository.get_by_batch_id(batch_id).await {
+            Ok(Some((pr_id, stored))) => {
+                // Filter out states without installation_id - we can't authenticate to GitHub
+                let installation_id = stored.installation_id?;
+                Some((pr_id, installation_id))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                error!("Repository error looking up batch_id {}: {}", batch_id, e);
+                None
+            }
+        }
+    }
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:
@@ -858,6 +881,13 @@ mod tests {
 
         async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_all().await
+        }
+
+        async fn get_by_batch_id(
+            &self,
+            batch_id: &str,
+        ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_by_batch_id(batch_id).await
         }
     }
 
@@ -1480,6 +1510,13 @@ mod tests {
 
         async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
             self.inner.get_all().await
+        }
+
+        async fn get_by_batch_id(
+            &self,
+            batch_id: &str,
+        ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+            self.inner.get_by_batch_id(batch_id).await
         }
     }
 
