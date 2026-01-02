@@ -120,7 +120,7 @@
         <div class="endpoint">
             <div><span class="method">GET</span><span class="endpoint-path">/status</span></div>
             <p>Status dashboard - shows all tracked PRs and their review states</p>
-            <p><strong>Authentication:</strong> None</p>
+            <p><strong>Authentication:</strong> Bearer token (<code>Authorization: Bearer &lt;STATUS_AUTH_TOKEN&gt;</code>)</p>
             <p><strong>Content Negotiation:</strong> Returns JSON for API clients, HTML for browsers</p>
         </div>
 
@@ -148,6 +148,7 @@
         <div class="env-var">PORT (default: 3000)</div>
         <div class="env-var">RECORDING_ENABLED (default: false)</div>
         <div class="env-var">RECORDING_LOG_PATH (default: recordings.jsonl)</div>
+        <div class="env-var">STATUS_AUTH_TOKEN (required to enable /status endpoint)</div>
 
         <h2>🔧 Usage</h2>
         <p><strong>Automatic Reviews:</strong> Configure the GitHub webhook to point to <code>/webhook</code>. Reviews will automatically trigger on PR open and new commits.</p>

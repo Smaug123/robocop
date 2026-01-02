@@ -365,14 +365,17 @@ impl StateStore {
     ///
     /// Returns all states with their PR IDs. Used by the status endpoint to
     /// display the current state of all tracked PRs.
-    pub async fn get_all_states(&self) -> Vec<(StateMachinePrId, StoredState)> {
-        match self.repository.get_all().await {
-            Ok(states) => states,
-            Err(e) => {
-                error!("Repository error getting all states: {}", e);
-                Vec::new()
-            }
-        }
+    ///
+    /// Returns `Err` if the repository fails to read states, allowing callers
+    /// to distinguish between "no tracked PRs" (empty `Ok`) and "storage error"
+    /// (an `Err`).
+    pub async fn get_all_states(
+        &self,
+    ) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError> {
+        self.repository.get_all().await.map_err(|e| {
+            error!("Repository error getting all states: {}", e);
+            e
+        })
     }
 
     /// Process an event for a PR: transition the state and execute effects.

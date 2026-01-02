@@ -103,7 +103,8 @@ async fn help_handler(headers: HeaderMap) -> Response {
                 "PORT (default: 3000)",
                 "STATE_DIR (default: current directory)",
                 "RECORDING_ENABLED (default: false)",
-                "RECORDING_LOG_PATH (default: recordings.jsonl)"
+                "RECORDING_LOG_PATH (default: recordings.jsonl)",
+                "STATUS_AUTH_TOKEN (required to enable /status endpoint)"
             ]
         },
         "documentation": "https://github.com/Smaug123/robocop"
@@ -118,10 +119,67 @@ fn generate_help_html() -> String {
     HELP_HTML_TEMPLATE.replace("{version}", &version)
 }
 
+/// Authentication error types for the /status endpoint.
+enum StatusAuthError {
+    /// Token not configured - endpoint is disabled
+    Disabled,
+    /// Token configured but request has invalid/missing auth
+    Unauthorized,
+}
+
+impl StatusAuthError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            StatusAuthError::Disabled => StatusCode::FORBIDDEN,
+            StatusAuthError::Unauthorized => StatusCode::UNAUTHORIZED,
+        }
+    }
+}
+
+/// Validate bearer token authentication for the /status endpoint.
+///
+/// Returns `Ok(())` if authentication is valid, or `Err(StatusAuthError)` if not.
+fn validate_status_auth(
+    headers: &HeaderMap,
+    expected_token: &Option<String>,
+) -> Result<(), StatusAuthError> {
+    let expected = match expected_token {
+        Some(token) => token,
+        None => return Err(StatusAuthError::Disabled),
+    };
+
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(value) if value.starts_with("Bearer ") => {
+            let provided_token = &value[7..]; // Skip "Bearer "
+                                              // Use constant-time comparison to prevent timing attacks
+            if constant_time_eq(provided_token.as_bytes(), expected.as_bytes()) {
+                Ok(())
+            } else {
+                Err(StatusAuthError::Unauthorized)
+            }
+        }
+        _ => Err(StatusAuthError::Unauthorized),
+    }
+}
+
+/// Constant-time byte comparison to prevent timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
 async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    let all_states = state.state_store.get_all_states().await;
     let version = robocop_server::get_bot_version();
-    let status_data = robocop_server::status::StatusData::from_states(all_states, version);
 
     // Check Accept header for content negotiation
     let accept = headers
@@ -129,14 +187,102 @@ async fn status_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
 
-    // If client prefers HTML, serve HTML
-    if accept.to_lowercase().contains("text/html") {
-        let html = generate_status_html(&status_data);
-        return Html(html).into_response();
+    let prefers_html = accept.to_lowercase().contains("text/html");
+
+    // Validate authentication
+    let auth_result = validate_status_auth(&headers, &state.status_auth_token);
+    if let Err(response) = auth_result {
+        return if prefers_html {
+            let error_html = match response {
+                StatusAuthError::Disabled => {
+                    r#"<!DOCTYPE html>
+<html>
+<head><title>Robocop Status - Disabled</title></head>
+<body>
+<h1>Status Endpoint Disabled</h1>
+<p>The /status endpoint is disabled. Set STATUS_AUTH_TOKEN to enable it.</p>
+</body>
+</html>"#
+                }
+                StatusAuthError::Unauthorized => {
+                    r#"<!DOCTYPE html>
+<html>
+<head><title>Robocop Status - Unauthorized</title></head>
+<body>
+<h1>Unauthorized</h1>
+<p>Valid Authorization header required. Use: Authorization: Bearer &lt;token&gt;</p>
+</body>
+</html>"#
+                }
+            };
+            (response.status_code(), Html(error_html.to_string())).into_response()
+        } else {
+            let error_json = match response {
+                StatusAuthError::Disabled => json!({"error": "Status endpoint disabled"}),
+                StatusAuthError::Unauthorized => json!({"error": "Unauthorized"}),
+            };
+            (response.status_code(), Json(error_json)).into_response()
+        };
     }
 
-    // Default to JSON
-    Json(status_data).into_response()
+    match state.state_store.get_all_states().await {
+        Ok(all_states) => {
+            let status_data = robocop_server::status::StatusData::from_states(all_states, version);
+            if prefers_html {
+                Html(generate_status_html(&status_data)).into_response()
+            } else {
+                Json(status_data).into_response()
+            }
+        }
+        Err(e) => {
+            error!("Failed to retrieve states for status endpoint: {}", e);
+            if prefers_html {
+                // Return an error page for HTML clients
+                let error_html = format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head><title>Robocop Status - Error</title></head>
+<body>
+<h1>Status Unavailable</h1>
+<p>Failed to retrieve PR states from the database. Please try again later.</p>
+<p>Version: {}</p>
+</body>
+</html>"#,
+                    version
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, Html(error_html)).into_response()
+            } else {
+                // Return a JSON error for API clients
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "Failed to retrieve states",
+                        "version": version
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+/// Escape JSON string for safe embedding in HTML `<script>` tags.
+///
+/// Standard JSON serialization doesn't escape characters that are safe in JSON
+/// but dangerous in HTML context. For example, `</script>` in a JSON string
+/// would close the enclosing script tag, enabling XSS attacks.
+///
+/// This function escapes:
+/// - `<` to `\u003c` (prevents `</script>` and `<!--` sequences)
+/// - `>` to `\u003e` (prevents `-->` and similar)
+/// - `&` to `\u0026` (prevents HTML entity interpretation)
+///
+/// These escape sequences are valid JSON, so the resulting string remains
+/// valid JSON that JavaScript can parse correctly.
+fn escape_json_for_script_tag(json: &str) -> String {
+    json.replace('&', r"\u0026")
+        .replace('<', r"\u003c")
+        .replace('>', r"\u003e")
 }
 
 fn generate_status_html(data: &robocop_server::status::StatusData) -> String {
@@ -147,6 +293,10 @@ fn generate_status_html(data: &robocop_server::status::StatusData) -> String {
     let timestamp = chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S UTC")
         .to_string();
+
+    // Escape JSON for safe embedding in <script> tags to prevent XSS
+    let summary_json = escape_json_for_script_tag(&summary_json);
+    let prs_json = escape_json_for_script_tag(&prs_json);
 
     STATUS_HTML_TEMPLATE
         .replace("{version}", &data.version)
@@ -203,6 +353,11 @@ async fn main() -> Result<()> {
     let sqlite_repo =
         SqliteRepository::new(&db_path).expect("Failed to initialize SQLite database");
 
+    // Log warning if status auth token is not configured
+    if config.status_auth_token.is_none() {
+        info!("STATUS_AUTH_TOKEN not set: /status endpoint is disabled");
+    }
+
     let app_state = Arc::new(AppState {
         github_client: Arc::new(github_client),
         openai_client: Arc::new(openai_client),
@@ -211,6 +366,7 @@ async fn main() -> Result<()> {
         review_states: Arc::new(RwLock::new(HashMap::new())),
         state_store: Arc::new(StateStore::with_repository(Arc::new(sqlite_repo))),
         recording_logger,
+        status_auth_token: config.status_auth_token,
     });
 
     // Run crash recovery reconciliation before accepting any requests
@@ -237,4 +393,182 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // XSS prevention: escape_json_for_script_tag tests
+    // =========================================================================
+
+    #[test]
+    fn test_escape_json_for_script_tag_basic() {
+        // Simple JSON without dangerous characters
+        let json = r#"{"name": "test", "value": 42}"#;
+        let escaped = escape_json_for_script_tag(json);
+        assert_eq!(escaped, json); // No changes needed
+    }
+
+    #[test]
+    fn test_escape_json_for_script_tag_closes_script_tag() {
+        // XSS payload: closing script tag
+        let json = r#"{"error": "</script><script>alert('xss')</script>"}"#;
+        let escaped = escape_json_for_script_tag(json);
+
+        // Must not contain literal </script>
+        assert!(
+            !escaped.contains("</script>"),
+            "Escaped JSON must not contain </script>: {}",
+            escaped
+        );
+        // Should contain escaped versions
+        assert!(escaped.contains(r"\u003c/script\u003e"));
+    }
+
+    #[test]
+    fn test_escape_json_for_script_tag_html_comment() {
+        // XSS payload: HTML comment that could break out
+        let json = r#"{"comment": "<!-- <script>alert('xss')</script> -->"}"#;
+        let escaped = escape_json_for_script_tag(json);
+
+        assert!(!escaped.contains("<!--"));
+        assert!(!escaped.contains("-->"));
+        assert!(escaped.contains(r"\u003c!--"));
+    }
+
+    #[test]
+    fn test_escape_json_for_script_tag_ampersand() {
+        // Ampersand that could be interpreted as HTML entity
+        let json = r#"{"text": "a & b"}"#;
+        let escaped = escape_json_for_script_tag(json);
+
+        assert!(!escaped.contains(" & "));
+        assert!(escaped.contains(r"\u0026"));
+    }
+
+    #[test]
+    fn test_escape_json_for_script_tag_preserves_json_validity() {
+        // The escaped output should still be valid JSON that parses to the same value
+        let original = r#"{"error": "</script>", "text": "a & b < c > d"}"#;
+        let escaped = escape_json_for_script_tag(original);
+
+        // The escaped version should be parseable
+        let parsed: serde_json::Value =
+            serde_json::from_str(&escaped).expect("Escaped JSON should still be valid JSON");
+
+        // The parsed values should contain the original text
+        assert_eq!(parsed["error"].as_str().unwrap(), "</script>");
+        assert_eq!(parsed["text"].as_str().unwrap(), "a & b < c > d");
+    }
+
+    // =========================================================================
+    // Authentication: validate_status_auth tests
+    // =========================================================================
+
+    fn make_headers_with_auth(auth_value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            auth_value.parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn test_auth_disabled_when_no_token_configured() {
+        let headers = HeaderMap::new();
+        let token: Option<String> = None;
+
+        let result = validate_status_auth(&headers, &token);
+        assert!(matches!(result, Err(StatusAuthError::Disabled)));
+    }
+
+    #[test]
+    fn test_auth_unauthorized_when_no_header() {
+        let headers = HeaderMap::new();
+        let token = Some("secret-token".to_string());
+
+        let result = validate_status_auth(&headers, &token);
+        assert!(matches!(result, Err(StatusAuthError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_auth_unauthorized_when_wrong_token() {
+        let headers = make_headers_with_auth("Bearer wrong-token");
+        let token = Some("secret-token".to_string());
+
+        let result = validate_status_auth(&headers, &token);
+        assert!(matches!(result, Err(StatusAuthError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_auth_unauthorized_when_not_bearer() {
+        let headers = make_headers_with_auth("Basic dXNlcjpwYXNz");
+        let token = Some("secret-token".to_string());
+
+        let result = validate_status_auth(&headers, &token);
+        assert!(matches!(result, Err(StatusAuthError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_auth_success_with_valid_token() {
+        let headers = make_headers_with_auth("Bearer secret-token");
+        let token = Some("secret-token".to_string());
+
+        let result = validate_status_auth(&headers, &token);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auth_case_sensitive() {
+        // Bearer prefix is case-sensitive per RFC 7235
+        let headers = make_headers_with_auth("bearer secret-token"); // lowercase
+        let token = Some("secret-token".to_string());
+
+        let result = validate_status_auth(&headers, &token);
+        assert!(matches!(result, Err(StatusAuthError::Unauthorized)));
+    }
+
+    // =========================================================================
+    // Constant time comparison tests
+    // =========================================================================
+
+    #[test]
+    fn test_constant_time_eq_equal() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"a", b"a"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"hello", b"hellO"));
+        assert!(!constant_time_eq(b"a", b"b"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"hello", b"hello!"));
+        assert!(!constant_time_eq(b"hello!", b"hello"));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    // =========================================================================
+    // StatusAuthError status codes
+    // =========================================================================
+
+    #[test]
+    fn test_status_auth_error_codes() {
+        assert_eq!(
+            StatusAuthError::Disabled.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            StatusAuthError::Unauthorized.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 }

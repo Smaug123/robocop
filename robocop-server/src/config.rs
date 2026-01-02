@@ -15,6 +15,10 @@ pub struct Config {
     /// Directory for persistent state (SQLite database).
     /// Defaults to current working directory.
     pub state_dir: PathBuf,
+    /// Optional bearer token for /status endpoint authentication.
+    /// If set, requests to /status must include `Authorization: Bearer <token>`.
+    /// If not set, /status endpoint is disabled (returns 403 Forbidden).
+    pub status_auth_token: Option<String>,
 }
 
 impl Config {
@@ -56,6 +60,8 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
 
+        let status_auth_token = env::var("STATUS_AUTH_TOKEN").ok();
+
         Ok(Config {
             github_app_id,
             github_private_key,
@@ -66,6 +72,7 @@ impl Config {
             recording_enabled,
             recording_log_path,
             state_dir,
+            status_auth_token,
         })
     }
 }
