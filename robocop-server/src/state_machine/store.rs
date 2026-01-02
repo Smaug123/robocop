@@ -384,19 +384,33 @@ impl StateStore {
     /// completion event belongs to. Returns the PR ID and installation ID
     /// needed to process the batch result.
     ///
-    /// Returns `None` if no PR has this batch ID, or if the PR doesn't have
-    /// an installation ID (required for GitHub API authentication).
-    pub async fn get_pr_by_batch_id(&self, batch_id: &str) -> Option<(StateMachinePrId, u64)> {
+    /// Returns:
+    /// - `Ok(Some((pr_id, installation_id)))` if found with a valid installation ID
+    /// - `Ok(None)` if no PR has this batch ID, or if it lacks an installation ID
+    /// - `Err(RepositoryError)` if the lookup failed due to a storage error
+    ///
+    /// IMPORTANT: Callers MUST handle `Err` differently from `Ok(None)`:
+    /// - `Ok(None)` means the batch isn't tracked (e.g., CLI batch) - safe to ignore
+    /// - `Err` means a transient failure - callers should retry or fail visibly
+    ///
+    /// For webhooks: `Ok(None)` → return 200, `Err` → return 500 (trigger retry)
+    pub async fn get_pr_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, u64)>, RepositoryError> {
         match self.repository.get_by_batch_id(batch_id).await {
             Ok(Some((pr_id, stored))) => {
                 // Filter out states without installation_id - we can't authenticate to GitHub
-                let installation_id = stored.installation_id?;
-                Some((pr_id, installation_id))
+                let installation_id = match stored.installation_id {
+                    Some(id) => id,
+                    None => return Ok(None),
+                };
+                Ok(Some((pr_id, installation_id)))
             }
-            Ok(None) => None,
+            Ok(None) => Ok(None),
             Err(e) => {
                 error!("Repository error looking up batch_id {}: {}", batch_id, e);
-                None
+                Err(e)
             }
         }
     }
@@ -1500,6 +1514,7 @@ mod tests {
         inner: InMemoryRepository,
         fail_gets: std::sync::atomic::AtomicBool,
         fail_puts: std::sync::atomic::AtomicBool,
+        fail_get_by_batch_id: std::sync::atomic::AtomicBool,
         /// Track number of successful puts (writes that went through)
         put_count: std::sync::atomic::AtomicUsize,
         /// Track the order of operations for atomicity testing
@@ -1516,6 +1531,7 @@ mod tests {
                 inner: InMemoryRepository::new(),
                 fail_gets: std::sync::atomic::AtomicBool::new(false),
                 fail_puts: std::sync::atomic::AtomicBool::new(false),
+                fail_get_by_batch_id: std::sync::atomic::AtomicBool::new(false),
                 put_count: std::sync::atomic::AtomicUsize::new(0),
                 operations: std::sync::Mutex::new(Vec::new()),
                 get_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1531,6 +1547,11 @@ mod tests {
 
         fn set_fail_puts(&self, fail: bool) {
             self.fail_puts
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_fail_get_by_batch_id(&self, fail: bool) {
+            self.fail_get_by_batch_id
                 .store(fail, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -1620,6 +1641,15 @@ mod tests {
             &self,
             batch_id: &str,
         ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError> {
+            if self
+                .fail_get_by_batch_id
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(RepositoryError::storage(
+                    "get_by_batch_id",
+                    "simulated lookup failure",
+                ));
+            }
             self.inner.get_by_batch_id(batch_id).await
         }
 
@@ -1915,6 +1945,62 @@ mod tests {
             "Generator produced too few Cancelled states: {} (expected >= {})",
             cancelled_count,
             min_expected
+        );
+    }
+
+    /// Regression test: get_pr_by_batch_id must return Err on repository errors.
+    ///
+    /// Bug: get_pr_by_batch_id returns None on errors, making it impossible for
+    /// callers (like the OpenAI webhook handler) to distinguish between:
+    /// - "batch not found" (legitimate, e.g., CLI batch) → return 200, mark seen
+    /// - "transient DB error" → return 500, DON'T mark seen, allow retry
+    ///
+    /// Impact: During DB hiccups, the webhook handler marks the webhook as seen
+    /// and returns 200, so OpenAI won't retry and the batch completion is lost.
+    #[tokio::test]
+    async fn test_get_pr_by_batch_id_must_return_err_on_repository_error() {
+        let repo = Arc::new(TrackingRepository::new());
+        let store = StateStore::with_repository(repo.clone());
+        let pr_id = StateMachinePrId::new("owner", "repo", 123);
+
+        // Set up a state with a pending batch
+        let batch_id = "batch_test123";
+        let state = ReviewMachineState::BatchPending {
+            reviews_enabled: true,
+            batch_id: BatchId::from(batch_id.to_string()),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            comment_id: Some(CommentId(1)),
+            check_run_id: Some(CheckRunId(2)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        store.set(pr_id.clone(), state, Some(12345)).await.unwrap();
+
+        // Verify lookup works when repository is healthy
+        let healthy_result = store.get_pr_by_batch_id(batch_id).await;
+        assert!(
+            healthy_result.is_ok(),
+            "Lookup should succeed when repository is healthy"
+        );
+        assert!(
+            healthy_result.unwrap().is_some(),
+            "Should find the batch when repository is healthy"
+        );
+
+        // Now make the repository fail on get_by_batch_id
+        repo.set_fail_get_by_batch_id(true);
+
+        // get_pr_by_batch_id MUST return Err, not None
+        let result = store.get_pr_by_batch_id(batch_id).await;
+
+        assert!(
+            result.is_err(),
+            "get_pr_by_batch_id MUST return Err on repository errors.\n\
+             Current behavior (BUG): Returns Ok(None), making it impossible for\n\
+             callers to distinguish 'not found' from 'transient error'.\n\
+             Got: {:?}",
+            result
         );
     }
 }

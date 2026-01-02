@@ -283,8 +283,8 @@ async fn openai_webhook_handler(
     let lookup_result = state.state_store.get_pr_by_batch_id(&batch_id).await;
 
     let (pr_id, installation_id) = match lookup_result {
-        Some(result) => result,
-        None => {
+        Ok(Some(result)) => result,
+        Ok(None) => {
             // Batch not found - may be from CLI or already completed.
             // Mark as seen so we don't process again (even though it's a no-op).
             if let Err(e) = state.state_store.record_webhook_id(&webhook_id.0).await {
@@ -297,6 +297,16 @@ async fn openai_webhook_handler(
             return Ok(Json(WebhookResponse {
                 message: "Batch not tracked".to_string(),
             }));
+        }
+        Err(e) => {
+            // Transient repository error - DON'T mark as seen, return 500 so OpenAI retries.
+            // This is critical: if we marked as seen and returned 200, the batch completion
+            // would be lost and OpenAI wouldn't retry.
+            error!(
+                "Repository error looking up batch {}: {} - returning 500 to trigger retry",
+                batch_id, e
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
