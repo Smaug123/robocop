@@ -282,24 +282,26 @@ pub async fn openai_webhook_handler(
         pr_id.pr_number, batch_id, installation_id
     );
 
-    // Spawn background task to process the batch result
-    let state_clone = state.clone();
-    let batch_id_clone = BatchId::from(batch_id.clone());
-    let pr_id_clone = pr_id.clone();
+    // Process the batch result synchronously.
+    // We must NOT return 200 until processing succeeds, otherwise OpenAI won't retry
+    // and transient failures (DB errors, API hiccups) will silently drop batch results.
+    // The polling loop provides a fallback, but if polling frequency is reduced (since
+    // webhooks are the primary notification), batches could be stuck for a long time.
+    let batch_id_typed = BatchId::from(batch_id.clone());
 
-    tokio::spawn(async move {
-        if let Err(e) =
-            process_single_batch(&state_clone, &pr_id_clone, &batch_id_clone, installation_id).await
-        {
-            error!(
-                "Failed to process OpenAI webhook for batch {}: {}",
-                batch_id_clone.0, e
-            );
-        }
-    });
+    if let Err(e) = process_single_batch(&state, &pr_id, &batch_id_typed, installation_id).await {
+        error!(
+            "Failed to process OpenAI webhook for batch {}: {}",
+            batch_id, e
+        );
+        // Return 500 so OpenAI retries the webhook.
+        // The webhook ID is already claimed, but that's fine - the retry will come with
+        // a new webhook ID (OpenAI generates a new event ID for each delivery attempt).
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     Ok(Json(WebhookResponse {
-        message: "Webhook received".to_string(),
+        message: "Webhook processed".to_string(),
     }))
 }
 

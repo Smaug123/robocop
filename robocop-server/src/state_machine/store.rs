@@ -462,6 +462,30 @@ impl StateStore {
         }
     }
 
+    /// Clean up expired webhook IDs from the replay protection cache.
+    ///
+    /// This should be called periodically (e.g., from the batch polling loop)
+    /// to prevent unbounded growth of the seen_webhook_ids store.
+    ///
+    /// # Arguments
+    /// * `ttl_seconds` - Entries older than this are considered expired
+    ///
+    /// Returns the number of entries removed, or 0 on error.
+    pub async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> usize {
+        match self.repository.cleanup_expired_webhooks(ttl_seconds).await {
+            Ok(count) => {
+                if count > 0 {
+                    info!("Cleaned up {} expired webhook IDs", count);
+                }
+                count
+            }
+            Err(e) => {
+                error!("Repository error cleaning up expired webhooks: {}", e);
+                0
+            }
+        }
+    }
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:

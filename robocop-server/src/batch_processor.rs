@@ -9,18 +9,37 @@ use crate::state_machine::{
 };
 use crate::AppState;
 
+/// TTL for webhook IDs in the replay protection cache (5 minutes).
+/// This matches `TIMESTAMP_TOLERANCE_SECONDS` in openai_webhook.rs.
+const WEBHOOK_ID_TTL_SECONDS: i64 = 300;
+
+/// How often to run webhook cleanup (in poll cycles).
+/// At 60 seconds per cycle, 10 = every 10 minutes.
+const WEBHOOK_CLEANUP_INTERVAL: u32 = 10;
+
 /// Main batch polling loop that runs in the background.
 ///
 /// This loop polls the state store for pending batches and generates
-/// appropriate events when batch status changes.
+/// appropriate events when batch status changes. It also periodically
+/// cleans up expired webhook IDs from the replay protection cache.
 pub async fn batch_polling_loop(state: Arc<AppState>) {
     let mut interval = interval(Duration::from_secs(60)); // Poll every minute
+    let mut poll_count: u32 = 0;
 
     loop {
         interval.tick().await;
+        poll_count = poll_count.wrapping_add(1);
 
         if let Err(e) = poll_pending_batches(&state).await {
             error!("Error polling batches: {}", e);
+        }
+
+        // Periodically clean up expired webhook IDs to prevent unbounded growth
+        if poll_count.is_multiple_of(WEBHOOK_CLEANUP_INTERVAL) {
+            state
+                .state_store
+                .cleanup_expired_webhooks(WEBHOOK_ID_TTL_SECONDS)
+                .await;
         }
     }
 }
