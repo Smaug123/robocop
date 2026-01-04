@@ -27,7 +27,13 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
         # Common source filtering for all builds
-        src = craneLib.cleanCargoSource ./.;
+        # Include standard Cargo sources plus prompt.txt (used by include_str!)
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (craneLib.filterCargoSources path type)
+            || (builtins.baseNameOf path == "prompt.txt");
+        };
 
         # Common build inputs
         commonBuildInputs = with pkgs; [
