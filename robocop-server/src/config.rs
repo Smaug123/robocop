@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn test_read_secret_trims_trailing_whitespace() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "secret-value\n\n").unwrap();
+        writeln!(file, "secret-value\n").unwrap();
 
         env::set_var("TEST_SECRET4_FILE", file.path());
 
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_read_secret_preserves_internal_newlines() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "line1\nline2\nline3\n").unwrap();
+        writeln!(file, "line1\nline2\nline3").unwrap();
 
         env::set_var("TEST_SECRET5_FILE", file.path());
 
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn test_read_secret_optional_none_when_empty() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "   \n").unwrap();
+        writeln!(file, "   ").unwrap();
 
         env::set_var("TEST_OPT_SECRET2_FILE", file.path());
 
