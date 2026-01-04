@@ -27,12 +27,16 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
         # Common source filtering for all builds
-        # Include standard Cargo sources plus prompt.txt (used by include_str!)
+        # Include standard Cargo sources plus files used by include_str!
         src = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter = path: type:
-            (craneLib.filterCargoSources path type)
-            || (builtins.baseNameOf path == "prompt.txt");
+            let
+              baseName = builtins.baseNameOf path;
+              isIncludeStrFile = pkgs.lib.hasSuffix ".txt" baseName
+                              || pkgs.lib.hasSuffix ".html" baseName;
+            in
+            (craneLib.filterCargoSources path type) || isIncludeStrFile;
         };
 
         # Common build inputs
@@ -58,6 +62,7 @@
         # Build *only* the dependencies - this derivation gets cached
         cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
           pname = "robocop-deps";
+          cargoExtraArgs = "--locked";
         });
 
         robocop-server = craneLib.buildPackage (commonArgs // {
