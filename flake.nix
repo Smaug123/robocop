@@ -60,9 +60,10 @@
         };
 
         # Build *only* the dependencies - this derivation gets cached
+        # Build all workspace members to ensure deps are complete for any package
         cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
           pname = "robocop-deps";
-          cargoExtraArgs = "--locked";
+          cargoExtraArgs = "--locked --workspace";
         });
 
         robocop-server = craneLib.buildPackage (commonArgs // {
