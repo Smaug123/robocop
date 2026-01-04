@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -26,25 +27,72 @@ pub struct Config {
     pub openai_webhook_secret: Option<String>,
 }
 
+/// Read a required config value.
+///
+/// For a key like "GITHUB_PRIVATE_KEY":
+/// 1. Check if GITHUB_PRIVATE_KEY_FILE is set - if so, read from that file path
+/// 2. Otherwise, check GITHUB_PRIVATE_KEY env var directly
+///
+/// When reading from env var, `\n` escape sequences are converted to actual newlines
+/// for backward compatibility (needed for PEM keys stored as single-line env vars).
+fn read_secret(key: &str) -> Result<String> {
+    let file_key = format!("{}_FILE", key);
+
+    if let Ok(path) = env::var(&file_key) {
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {} from file: {}", key, path))?;
+        // Trim trailing whitespace (files often have trailing newlines)
+        Ok(contents.trim_end().to_string())
+    } else {
+        let value = env::var(key)
+            .with_context(|| format!("{} or {} environment variable is required", key, file_key))?;
+        // Convert \n escape sequences to actual newlines for backward compatibility
+        // (needed for GITHUB_PRIVATE_KEY when stored as single-line env var)
+        Ok(value.replace("\\n", "\n"))
+    }
+}
+
+/// Read an optional config value.
+///
+/// For a key like "STATUS_AUTH_TOKEN":
+/// 1. Check if STATUS_AUTH_TOKEN_FILE is set - if so, read from that file path (errors if file unreadable)
+/// 2. Otherwise, check STATUS_AUTH_TOKEN env var directly
+/// 3. Returns None if neither is set, or if the value is empty/whitespace-only
+fn read_secret_optional(key: &str) -> Result<Option<String>> {
+    let file_key = format!("{}_FILE", key);
+
+    let value = if let Ok(path) = env::var(&file_key) {
+        // _FILE is explicitly set - error if we can't read it
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {} from file: {}", key, path))?;
+        Some(contents)
+    } else {
+        env::var(key).ok()
+    };
+
+    Ok(value.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }))
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let github_app_id = env::var("GITHUB_APP_ID")
-            .context("GITHUB_APP_ID environment variable is required")?
+        let github_app_id = read_secret("GITHUB_APP_ID")?
             .parse::<u64>()
             .context("GITHUB_APP_ID must be a valid number")?;
 
-        let github_private_key = env::var("GITHUB_PRIVATE_KEY")
-            .context("GITHUB_PRIVATE_KEY environment variable is required")?
-            .replace("\\n", "\n");
+        let github_private_key = read_secret("GITHUB_PRIVATE_KEY")?;
 
-        let github_webhook_secret = env::var("GITHUB_WEBHOOK_SECRET")
-            .context("GITHUB_WEBHOOK_SECRET environment variable is required")?;
+        let github_webhook_secret = read_secret("GITHUB_WEBHOOK_SECRET")?;
 
-        let openai_api_key = env::var("OPENAI_API_KEY")
-            .context("OPENAI_API_KEY environment variable is required")?;
+        let openai_api_key = read_secret("OPENAI_API_KEY")?;
 
-        let target_user_id = env::var("TARGET_GITHUB_USER_ID")
-            .context("TARGET_GITHUB_USER_ID environment variable is required")?
+        let target_user_id = read_secret("TARGET_GITHUB_USER_ID")?
             .parse::<u64>()
             .context("TARGET_GITHUB_USER_ID must be a valid number")?;
 
@@ -65,14 +113,7 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
 
-        let status_auth_token = env::var("STATUS_AUTH_TOKEN").ok().and_then(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
+        let status_auth_token = read_secret_optional("STATUS_AUTH_TOKEN")?;
 
         // OpenAI webhook secret for real-time batch completion notifications.
         // If not set, the /openai-webhook endpoint will return 503.
@@ -101,63 +142,138 @@ impl Config {
     }
 }
 
-/// Parse STATUS_AUTH_TOKEN from an optional string value.
-///
-/// Returns None if the value is missing, empty, or contains only whitespace.
-/// Trims leading/trailing whitespace from the token to match UI behavior
-/// (the UI trims input before sending, so tokens copied with accidental
-/// whitespace still authenticate correctly).
-/// This prevents security issues where an empty token would allow unauthenticated access.
-pub fn parse_status_auth_token(value: Option<String>) -> Option<String> {
-    value.and_then(|s| {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
-    fn test_parse_status_auth_token_none() {
-        assert_eq!(parse_status_auth_token(None), None);
+    fn test_read_secret_from_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "secret-value").unwrap();
+
+        env::set_var("TEST_SECRET_FILE", file.path());
+        env::remove_var("TEST_SECRET");
+
+        let result = read_secret("TEST_SECRET").unwrap();
+        assert_eq!(result, "secret-value");
+
+        env::remove_var("TEST_SECRET_FILE");
     }
 
     #[test]
-    fn test_parse_status_auth_token_empty_string() {
-        // Empty string should be treated as unset (None)
-        assert_eq!(parse_status_auth_token(Some("".to_string())), None);
+    fn test_read_secret_from_env() {
+        env::remove_var("TEST_SECRET2_FILE");
+        env::set_var("TEST_SECRET2", "env-value");
+
+        let result = read_secret("TEST_SECRET2").unwrap();
+        assert_eq!(result, "env-value");
+
+        env::remove_var("TEST_SECRET2");
     }
 
     #[test]
-    fn test_parse_status_auth_token_whitespace_only() {
-        // Whitespace-only should be treated as unset (None)
-        assert_eq!(parse_status_auth_token(Some("   ".to_string())), None);
-        assert_eq!(parse_status_auth_token(Some("\t\n".to_string())), None);
+    fn test_read_secret_from_env_converts_escaped_newlines() {
+        // Backward compatibility: \n escape sequences in env vars are converted to real newlines
+        // (needed for PEM keys stored as single-line env vars)
+        env::remove_var("TEST_SECRET_NEWLINE_FILE");
+        env::set_var("TEST_SECRET_NEWLINE", "line1\\nline2\\nline3");
+
+        let result = read_secret("TEST_SECRET_NEWLINE").unwrap();
+        assert_eq!(result, "line1\nline2\nline3");
+
+        env::remove_var("TEST_SECRET_NEWLINE");
     }
 
     #[test]
-    fn test_parse_status_auth_token_valid() {
-        // Valid tokens should be preserved
-        assert_eq!(
-            parse_status_auth_token(Some("secret-token".to_string())),
-            Some("secret-token".to_string())
-        );
+    fn test_read_secret_file_takes_precedence() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "file-value").unwrap();
+
+        env::set_var("TEST_SECRET3_FILE", file.path());
+        env::set_var("TEST_SECRET3", "env-value");
+
+        let result = read_secret("TEST_SECRET3").unwrap();
+        assert_eq!(result, "file-value");
+
+        env::remove_var("TEST_SECRET3_FILE");
+        env::remove_var("TEST_SECRET3");
     }
 
     #[test]
-    fn test_parse_status_auth_token_with_surrounding_whitespace() {
-        // Tokens with surrounding whitespace should be trimmed to match UI behavior.
-        // The UI trims input before sending, so server must also trim to ensure
-        // tokens copied with accidental whitespace still authenticate correctly.
-        assert_eq!(
-            parse_status_auth_token(Some("  token  ".to_string())),
-            Some("token".to_string())
-        );
+    fn test_read_secret_trims_trailing_whitespace() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "secret-value\n").unwrap();
+
+        env::set_var("TEST_SECRET4_FILE", file.path());
+
+        let result = read_secret("TEST_SECRET4").unwrap();
+        assert_eq!(result, "secret-value");
+
+        env::remove_var("TEST_SECRET4_FILE");
+    }
+
+    #[test]
+    fn test_read_secret_preserves_internal_newlines() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "line1\nline2\nline3").unwrap();
+
+        env::set_var("TEST_SECRET5_FILE", file.path());
+
+        let result = read_secret("TEST_SECRET5").unwrap();
+        assert_eq!(result, "line1\nline2\nline3");
+
+        env::remove_var("TEST_SECRET5_FILE");
+    }
+
+    #[test]
+    fn test_read_secret_optional_none_when_missing() {
+        env::remove_var("TEST_OPT_SECRET_FILE");
+        env::remove_var("TEST_OPT_SECRET");
+
+        let result = read_secret_optional("TEST_OPT_SECRET").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_read_secret_optional_none_when_empty() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "   ").unwrap();
+
+        env::set_var("TEST_OPT_SECRET2_FILE", file.path());
+
+        let result = read_secret_optional("TEST_OPT_SECRET2").unwrap();
+        assert_eq!(result, None);
+
+        env::remove_var("TEST_OPT_SECRET2_FILE");
+    }
+
+    #[test]
+    fn test_read_secret_optional_returns_value() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "optional-secret").unwrap();
+
+        env::set_var("TEST_OPT_SECRET3_FILE", file.path());
+
+        let result = read_secret_optional("TEST_OPT_SECRET3").unwrap();
+        assert_eq!(result, Some("optional-secret".to_string()));
+
+        env::remove_var("TEST_OPT_SECRET3_FILE");
+    }
+
+    #[test]
+    fn test_read_secret_optional_errors_when_file_unreadable() {
+        // If _FILE is explicitly set but the file doesn't exist, that's an error
+        // (not a silent fallback to None)
+        env::set_var("TEST_OPT_SECRET4_FILE", "/nonexistent/path/to/secret");
+        env::remove_var("TEST_OPT_SECRET4");
+
+        let result = read_secret_optional("TEST_OPT_SECRET4");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to read TEST_OPT_SECRET4 from file"));
+
+        env::remove_var("TEST_OPT_SECRET4_FILE");
     }
 }

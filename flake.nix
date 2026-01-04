@@ -4,13 +4,14 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, crane, rust-overlay }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -18,35 +19,62 @@
           inherit system overlays;
           config.allowUnfree = true;
         };
-        
+
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "clippy" ];
         };
-        
-        robocop-server = pkgs.rustPlatform.buildRustPackage {
-          pname = "robocop-server";
-          version = "0.1.0";
 
+        craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
+
+        # Common source filtering for all builds
+        # Include standard Cargo sources plus files used by include_str!
+        src = pkgs.lib.cleanSourceWith {
           src = ./.;
+          filter = path: type:
+            let
+              baseName = builtins.baseNameOf path;
+              isIncludeStrFile = pkgs.lib.hasSuffix ".txt" baseName
+                              || pkgs.lib.hasSuffix ".html" baseName;
+            in
+            (craneLib.filterCargoSources path type) || isIncludeStrFile;
+        };
 
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
+        # Common build inputs
+        commonBuildInputs = with pkgs; [
+          openssl
+          libiconv
+        ];
 
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
+        commonNativeBuildInputs = with pkgs; [
+          pkg-config
+        ];
 
-          buildInputs = with pkgs; [
-            openssl
-            libiconv
-          ];
+        # Common arguments shared between buildDepsOnly and buildPackage
+        commonArgs = {
+          inherit src;
+          strictDeps = true;
+          buildInputs = commonBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs;
+          # Workspace doesn't have a package version; set explicitly
+          version = "0.1.0";
+        };
+
+        # Build *only* the dependencies - this derivation gets cached
+        # Build all workspace members to ensure deps are complete for any package
+        cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+          pname = "robocop-deps";
+          cargoExtraArgs = "--locked --workspace";
+        });
+
+        robocop-server = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "robocop-server";
 
           # Pass git revision to the build
           ROBOCOP_GIT_HASH = if (self ? rev) && (self.rev != null) then self.rev else "dirty";
 
           # Build only the server binary
-          buildAndTestSubdir = "robocop-server";
+          cargoExtraArgs = "--locked -p robocop-server";
 
           meta = with pkgs.lib; {
             description = "Robocop GitHub Code Review Server";
@@ -54,29 +82,14 @@
             license = licenses.mit;
             maintainers = [ ];
           };
-        };
+        });
 
-        robocop-cli = pkgs.rustPlatform.buildRustPackage {
-          pname = "robocop";
-          version = "0.1.0";
-
-          src = ./.;
-
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          buildInputs = with pkgs; [
-            openssl
-            libiconv
-          ];
+        robocop-cli = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "robocop-cli";
 
           # Build only the CLI binary
-          buildAndTestSubdir = "robocop-cli";
+          cargoExtraArgs = "--locked -p robocop-cli";
 
           meta = with pkgs.lib; {
             description = "Robocop Code Review CLI";
@@ -84,7 +97,7 @@
             license = licenses.mit;
             maintainers = [ ];
           };
-        };
+        });
       in
       {
         packages = {
@@ -94,11 +107,9 @@
           # Alias for backwards compatibility
           github-bot = robocop-server;
         };
-        
-        devShells.default = pkgs.mkShell {
-          buildInputs = [
-            rustToolchain
-            pkgs.cargo
+
+        devShells.default = craneLib.devShell {
+          packages = [
             pkgs.pkg-config
             pkgs.openssl
             pkgs.libiconv
