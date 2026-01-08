@@ -730,34 +730,32 @@ impl StateRepository for SqliteRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            // First, check if the webhook already exists and get its state
-            let existing: Option<i64> = conn
+            // Use atomic INSERT OR IGNORE to avoid the read-then-insert race condition.
+            // If two processes both see "missing" and try to insert, the loser's insert
+            // is silently ignored (no error), and we detect this via changes() == 0.
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_webhook_ids (webhook_id, recorded_at, claim_state) VALUES (?1, ?2, 0)",
+                params![webhook_id, now_secs],
+            )
+            .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
+
+            if conn.changes() > 0 {
+                // Insert succeeded - we claimed it
+                return Ok(WebhookClaimResult::Claimed);
+            }
+
+            // Insert was ignored (row already exists) - check the existing state
+            let existing: i64 = conn
                 .query_row(
                     "SELECT claim_state FROM seen_webhook_ids WHERE webhook_id = ?1",
                     params![webhook_id],
                     |row| row.get(0),
                 )
-                .optional()
                 .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
 
             match existing {
-                Some(0) => {
-                    // claim_state 0 = in_progress
-                    Ok(WebhookClaimResult::InProgress)
-                }
-                Some(_) => {
-                    // claim_state 1 = completed (or any other value)
-                    Ok(WebhookClaimResult::Completed)
-                }
-                None => {
-                    // Not found - claim it with state 0 (in_progress)
-                    conn.execute(
-                        "INSERT INTO seen_webhook_ids (webhook_id, recorded_at, claim_state) VALUES (?1, ?2, 0)",
-                        params![webhook_id, now_secs],
-                    )
-                    .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
-                    Ok(WebhookClaimResult::Claimed)
-                }
+                0 => Ok(WebhookClaimResult::InProgress),
+                _ => Ok(WebhookClaimResult::Completed),
             }
         })
         .await
@@ -814,9 +812,13 @@ impl StateRepository for SqliteRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
+            // Only delete completed claims (claim_state=1), not in-progress claims (claim_state=0).
+            // A long-running handler could be cleaned up and re-claimed, causing duplicate
+            // processing if a retry lands late. In-progress claims will be released by the
+            // handler on failure, or eventually expire on their own.
             let deleted = conn
                 .execute(
-                    "DELETE FROM seen_webhook_ids WHERE recorded_at <= ?1",
+                    "DELETE FROM seen_webhook_ids WHERE recorded_at <= ?1 AND claim_state = 1",
                     params![cutoff],
                 )
                 .map_err(|e| RepositoryError::storage("cleanup_expired_webhooks", e.to_string()))?;

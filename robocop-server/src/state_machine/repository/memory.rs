@@ -178,7 +178,13 @@ impl StateRepository for InMemoryRepository {
 
         let mut claims = self.webhook_claims.write().await;
         let initial_len = claims.len();
-        claims.retain(|_, (_, timestamp)| *timestamp > cutoff);
+        // Only delete completed claims, not in-progress claims.
+        // A long-running handler could be cleaned up and re-claimed, causing duplicate
+        // processing if a retry lands late. In-progress claims will be released by the
+        // handler on failure, or eventually expire on their own.
+        claims.retain(|_, (state, timestamp)| {
+            *state == WebhookClaimState::InProgress || *timestamp > cutoff
+        });
         Ok(initial_len - claims.len())
     }
 }

@@ -298,6 +298,19 @@ async fn openai_webhook_handler(
         payload.event_type, payload.data.id
     );
 
+    // Only process batch.* events. Non-batch events (if the subscription isn't filtered)
+    // should be early-acked to avoid wasted API calls and potential error loops.
+    if !payload.event_type.starts_with("batch.") {
+        info!("Ignoring non-batch event type: {}", payload.event_type);
+        state
+            .state_store
+            .complete_webhook_claim(&webhook_id.0)
+            .await;
+        return Ok(Json(WebhookResponse {
+            message: format!("Ignored non-batch event: {}", payload.event_type),
+        }));
+    }
+
     // Look up which PR owns this batch
     let batch_id = payload.data.id.clone();
 
