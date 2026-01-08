@@ -140,6 +140,12 @@ impl StateRepository for InMemoryRepository {
         }
     }
 
+    async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        let mut seen = self.seen_webhook_ids.write().await;
+        seen.remove(webhook_id);
+        Ok(())
+    }
+
     async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError> {
         let now = Self::now_secs();
         let cutoff = now - ttl_seconds;

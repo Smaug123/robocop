@@ -476,6 +476,23 @@ impl StateStore {
         }
     }
 
+    /// Release a claimed webhook ID to allow retries.
+    ///
+    /// This should be called when processing fails after successfully claiming
+    /// the webhook. Releasing allows OpenAI's retry mechanism to work: the same
+    /// webhook ID will be accepted on the next attempt.
+    ///
+    /// Errors are logged but not returned - callers should proceed regardless
+    /// since the main processing already failed.
+    pub async fn release_webhook_claim(&self, webhook_id: &str) {
+        if let Err(e) = self.repository.release_webhook_claim(webhook_id).await {
+            error!(
+                "Repository error releasing webhook claim {}: {}",
+                webhook_id, e
+            );
+        }
+    }
+
     /// Clean up expired webhook IDs from the replay protection cache.
     ///
     /// This should be called periodically (e.g., from the batch polling loop)
@@ -999,6 +1016,10 @@ mod tests {
 
         async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
             self.inner.try_claim_webhook_id(webhook_id).await
+        }
+
+        async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.release_webhook_claim(webhook_id).await
         }
 
         async fn cleanup_expired_webhooks(
@@ -1663,6 +1684,10 @@ mod tests {
 
         async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
             self.inner.try_claim_webhook_id(webhook_id).await
+        }
+
+        async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.release_webhook_claim(webhook_id).await
         }
 
         async fn cleanup_expired_webhooks(

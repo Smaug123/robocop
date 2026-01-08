@@ -731,6 +731,25 @@ impl StateRepository for SqliteRepository {
         .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?
     }
 
+    async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            conn.execute(
+                "DELETE FROM seen_webhook_ids WHERE webhook_id = ?1",
+                params![webhook_id],
+            )
+            .map_err(|e| RepositoryError::storage("release_webhook_claim", e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("release_webhook_claim", e.to_string()))?
+    }
+
     async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError> {
         let conn = self.conn.clone();
         let now_secs = std::time::SystemTime::now()

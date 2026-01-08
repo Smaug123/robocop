@@ -261,6 +261,17 @@ pub trait StateRepository: Send + Sync {
     /// - `Err(RepositoryError)` if storage operation failed
     async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
 
+    /// Release a claimed webhook ID to allow retries.
+    ///
+    /// This should be called when processing fails after successfully claiming
+    /// the webhook. Releasing allows OpenAI's retry mechanism to work: the same
+    /// webhook ID will be accepted on the next attempt.
+    ///
+    /// Returns:
+    /// - `Ok(())` on success (whether or not the ID existed)
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError>;
+
     /// Clean up expired webhook IDs.
     ///
     /// This is called periodically or opportunistically to remove webhook IDs

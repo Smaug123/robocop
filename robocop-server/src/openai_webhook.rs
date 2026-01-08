@@ -227,26 +227,25 @@ async fn verify_openai_webhook_signature(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Check if this webhook was already successfully processed.
-    // We only mark webhooks as "seen" after successful processing, so:
-    // - If seen → already processed successfully, return 200
-    // - If not seen → proceed to handler (may be first attempt or a retry after failure)
+    // Atomically claim this webhook ID for processing.
+    // This prevents the race condition where concurrent requests both pass
+    // an is_webhook_seen check before either records, causing duplicate processing.
     //
-    // This approach is safe for concurrent duplicates because:
-    // 1. The state machine's per-PR locking serializes state transitions
-    // 2. Terminal state handlers ignore stale batch events
-    // 3. Worst case: both process, but second is a safe no-op
-    if state.state_store.is_webhook_seen(&webhook_id).await {
-        info!("Rejecting already-processed webhook: {}", webhook_id);
+    // - If we claim it (true) → we own processing, continue to handler
+    // - If already claimed (false) → another request is handling it, return 200
+    //
+    // If processing fails, the handler releases the claim so OpenAI can retry.
+    if !state.state_store.try_claim_webhook_id(&webhook_id).await {
+        info!("Rejecting already-claimed webhook: {}", webhook_id);
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .body(axum::body::Body::from(
-                "{\"message\":\"Already processed\"}",
+                "{\"message\":\"Already processing\"}",
             ))
             .unwrap());
     }
 
-    // Pass through to handler with webhook_id for recording on success
+    // Pass through to handler with webhook_id for releasing on failure
     let mut new_request = Request::from_parts(parts, axum::body::Body::from(bytes));
     new_request.extensions_mut().insert(WebhookId(webhook_id));
 
@@ -286,10 +285,7 @@ async fn openai_webhook_handler(
         Ok(Some(result)) => result,
         Ok(None) => {
             // Batch not found - may be from CLI or already completed.
-            // Mark as seen so we don't process again (even though it's a no-op).
-            if let Err(e) = state.state_store.record_webhook_id(&webhook_id.0).await {
-                warn!("Failed to record webhook ID for untracked batch: {}", e);
-            }
+            // The claim stays in place (prevents unnecessary retries for this no-op).
             info!(
                 "Batch {} not found in state store, ignoring webhook",
                 batch_id
@@ -299,13 +295,14 @@ async fn openai_webhook_handler(
             }));
         }
         Err(e) => {
-            // Transient repository error - DON'T mark as seen, return 500 so OpenAI retries.
-            // This is critical: if we marked as seen and returned 200, the batch completion
+            // Transient repository error - release the claim and return 500 so OpenAI retries.
+            // This is critical: if we kept the claim and returned 200, the batch completion
             // would be lost and OpenAI wouldn't retry.
             error!(
                 "Repository error looking up batch {}: {} - returning 500 to trigger retry",
                 batch_id, e
             );
+            state.state_store.release_webhook_claim(&webhook_id.0).await;
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -327,22 +324,14 @@ async fn openai_webhook_handler(
             "Failed to process OpenAI webhook for batch {}: {}",
             batch_id, e
         );
-        // Don't mark as seen - return 500 so OpenAI retries.
+        // Release the claim so OpenAI can retry with the same webhook-id.
         // Per Standard Webhooks spec, retries reuse the same webhook-id.
-        // Since we only mark as seen on success, the retry will be allowed through.
+        state.state_store.release_webhook_claim(&webhook_id.0).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Success! Mark the webhook as processed so future retries are rejected.
-    if let Err(e) = state.state_store.record_webhook_id(&webhook_id.0).await {
-        // Log but don't fail - the batch was processed successfully.
-        // Worst case: a late retry arrives and is a no-op (state machine handles it).
-        warn!(
-            "Failed to record webhook ID after successful processing: {}",
-            e
-        );
-    }
-
+    // Success! The claim was already made in middleware, so we're done.
+    // The claim stays in place, preventing future retries from re-processing.
     Ok(Json(WebhookResponse {
         message: "Webhook processed".to_string(),
     }))
