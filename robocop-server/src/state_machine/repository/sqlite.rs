@@ -31,6 +31,19 @@ use crate::state_machine::store::StateMachinePrId;
 /// corresponding migration logic in `run_migrations()`.
 const CURRENT_SCHEMA_VERSION: i64 = 4;
 
+/// TTL for stale InProgress claims (30 minutes).
+///
+/// If a webhook claim is still InProgress after this duration, it's considered
+/// abandoned (e.g., due to a crash or panic) and can be reclaimed. This prevents
+/// permanent blocking of webhook IDs while being long enough that legitimate
+/// slow handlers won't be interrupted.
+///
+/// 30 minutes is chosen because:
+/// - Normal webhook processing should complete in seconds to minutes
+/// - OpenAI's retry interval is likely several minutes
+/// - Long enough to avoid race conditions with legitimate slow handlers
+const STALE_IN_PROGRESS_TTL_SECONDS: i64 = 30 * 60;
+
 /// SQLite-backed state repository.
 ///
 /// Stores PR states in a SQLite database for persistence across restarts.
@@ -726,6 +739,7 @@ impl StateRepository for SqliteRepository {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let stale_cutoff = now_secs - STALE_IN_PROGRESS_TTL_SECONDS;
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
@@ -745,16 +759,29 @@ impl StateRepository for SqliteRepository {
             }
 
             // Insert was ignored (row already exists) - check the existing state
-            let existing: i64 = conn
+            let (existing_state, recorded_at): (i64, i64) = conn
                 .query_row(
-                    "SELECT claim_state FROM seen_webhook_ids WHERE webhook_id = ?1",
+                    "SELECT claim_state, recorded_at FROM seen_webhook_ids WHERE webhook_id = ?1",
                     params![webhook_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
 
-            match existing {
-                0 => Ok(WebhookClaimResult::InProgress),
+            match existing_state {
+                0 => {
+                    // InProgress - check if stale (abandoned due to crash/panic)
+                    if recorded_at <= stale_cutoff {
+                        // Reclaim the stale entry
+                        conn.execute(
+                            "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
+                            params![now_secs, webhook_id],
+                        )
+                        .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
+                        Ok(WebhookClaimResult::Claimed)
+                    } else {
+                        Ok(WebhookClaimResult::InProgress)
+                    }
+                }
                 _ => Ok(WebhookClaimResult::Completed),
             }
         })
@@ -1963,6 +1990,179 @@ mod tests {
                 result,
                 WebhookClaimResult::Completed,
                 "Pre-existing webhooks from v3 should default to Completed after migration"
+            );
+        }
+    }
+
+    /// Test that stale InProgress claims can be reclaimed.
+    ///
+    /// Scenario:
+    /// 1. Request A claims webhook and starts processing
+    /// 2. Server crashes (claim stays InProgress forever)
+    /// 3. Server restarts, OpenAI retries after 30+ minutes
+    /// 4. The retry should be able to reclaim the stale claim
+    ///
+    /// This prevents permanent blocking of webhook IDs due to crashes.
+    #[tokio::test]
+    async fn test_stale_in_progress_claim_can_be_reclaimed() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Claim the webhook
+        let claim_a = repo.try_claim_webhook_id("webhook_stale").await.unwrap();
+        assert_eq!(claim_a, WebhookClaimResult::Claimed);
+
+        // Simulate the claim being old (older than STALE_IN_PROGRESS_TTL_SECONDS)
+        // by directly manipulating the database
+        {
+            let conn = repo.conn.lock().unwrap();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Set timestamp to 31 minutes ago (stale threshold is 30 minutes)
+            let stale_timestamp = now_secs - (31 * 60);
+            conn.execute(
+                "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
+                params![stale_timestamp, "webhook_stale"],
+            )
+            .unwrap();
+        }
+
+        // A retry should be able to reclaim the stale entry
+        let claim_b = repo.try_claim_webhook_id("webhook_stale").await.unwrap();
+        assert_eq!(
+            claim_b,
+            WebhookClaimResult::Claimed,
+            "Stale InProgress claims should be reclaimable"
+        );
+    }
+
+    /// Test that fresh InProgress claims cannot be reclaimed.
+    ///
+    /// Even if the claim is recent, retries should return InProgress,
+    /// not reclaim. Only stale claims (older than 30 minutes) can be reclaimed.
+    #[tokio::test]
+    async fn test_fresh_in_progress_claim_cannot_be_reclaimed() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Claim the webhook
+        let claim_a = repo.try_claim_webhook_id("webhook_fresh").await.unwrap();
+        assert_eq!(claim_a, WebhookClaimResult::Claimed);
+
+        // Simulate the claim being recent (within STALE_IN_PROGRESS_TTL_SECONDS)
+        // by directly manipulating the database
+        {
+            let conn = repo.conn.lock().unwrap();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Set timestamp to 5 minutes ago (well within the 30 minute threshold)
+            let fresh_timestamp = now_secs - (5 * 60);
+            conn.execute(
+                "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
+                params![fresh_timestamp, "webhook_fresh"],
+            )
+            .unwrap();
+        }
+
+        // A retry should NOT be able to reclaim the fresh entry
+        let claim_b = repo.try_claim_webhook_id("webhook_fresh").await.unwrap();
+        assert_eq!(
+            claim_b,
+            WebhookClaimResult::InProgress,
+            "Fresh InProgress claims should NOT be reclaimable"
+        );
+    }
+
+    /// Test that Completed claims are not affected by the stale reclaim logic.
+    ///
+    /// Even if a Completed claim is very old, it should never be reclaimed.
+    /// The stale reclaim logic only applies to InProgress claims.
+    #[tokio::test]
+    async fn test_completed_claims_are_not_reclaimable() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Claim and complete the webhook
+        let claim_a = repo
+            .try_claim_webhook_id("webhook_completed")
+            .await
+            .unwrap();
+        assert_eq!(claim_a, WebhookClaimResult::Claimed);
+        repo.complete_webhook_claim("webhook_completed")
+            .await
+            .unwrap();
+
+        // Simulate the claim being very old (older than stale threshold)
+        // by directly manipulating the database
+        {
+            let conn = repo.conn.lock().unwrap();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Set timestamp to 2 hours ago
+            let old_timestamp = now_secs - (2 * 60 * 60);
+            conn.execute(
+                "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
+                params![old_timestamp, "webhook_completed"],
+            )
+            .unwrap();
+        }
+
+        // A retry should still see Completed, not reclaim
+        let claim_b = repo
+            .try_claim_webhook_id("webhook_completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_b,
+            WebhookClaimResult::Completed,
+            "Completed claims should never be reclaimable, even if old"
+        );
+    }
+
+    /// Test that stale InProgress claims persist and can be reclaimed across database reopen.
+    ///
+    /// This tests the real-world crash recovery scenario where:
+    /// 1. Server crashes while processing a webhook
+    /// 2. Server restarts (new database connection)
+    /// 3. OpenAI retries after 30+ minutes
+    /// 4. The retry should be able to reclaim the stale claim
+    #[tokio::test]
+    async fn test_stale_claim_reclaim_across_reopen() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Claim the webhook in first connection
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let claim = repo.try_claim_webhook_id("webhook_crash").await.unwrap();
+            assert_eq!(claim, WebhookClaimResult::Claimed);
+
+            // Make the claim stale by manipulating timestamp directly
+            let conn = repo.conn.lock().unwrap();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let stale_timestamp = now_secs - (31 * 60); // 31 minutes ago
+            conn.execute(
+                "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
+                params![stale_timestamp, "webhook_crash"],
+            )
+            .unwrap();
+        }
+        // First connection dropped here (simulating crash)
+
+        // Reopen and verify stale claim can be reclaimed
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let claim = repo.try_claim_webhook_id("webhook_crash").await.unwrap();
+            assert_eq!(
+                claim,
+                WebhookClaimResult::Claimed,
+                "Stale InProgress claims should be reclaimable after database reopen"
             );
         }
     }

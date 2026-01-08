@@ -284,14 +284,25 @@ async fn openai_webhook_handler(
 
     // Parse body (size already validated by middleware, but apply limit for safety)
     let (_parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_WEBHOOK_BODY_SIZE)
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let bytes = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_SIZE).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to read OpenAI webhook body: {}", e);
+            // Release claim so OpenAI can retry with the same webhook-id
+            state.state_store.release_webhook_claim(&webhook_id.0).await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
 
-    let payload: OpenAIWebhookPayload = serde_json::from_slice(&bytes).map_err(|e| {
-        error!("Failed to parse OpenAI webhook payload: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
+    let payload: OpenAIWebhookPayload = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to parse OpenAI webhook payload: {}", e);
+            // Release claim so OpenAI can retry with the same webhook-id
+            state.state_store.release_webhook_claim(&webhook_id.0).await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
 
     info!(
         "OpenAI webhook: type={}, batch_id={}",
