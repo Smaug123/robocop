@@ -117,14 +117,8 @@ impl Config {
 
         // OpenAI webhook secret for real-time batch completion notifications.
         // If not set, the /openai-webhook endpoint will return 503.
-        let openai_webhook_secret = env::var("OPENAI_WEBHOOK_SECRET").ok().and_then(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
+        // Supports OPENAI_WEBHOOK_SECRET_FILE for file-based secret deployments.
+        let openai_webhook_secret = read_secret_optional("OPENAI_WEBHOOK_SECRET")?;
 
         Ok(Config {
             github_app_id,
@@ -275,5 +269,29 @@ mod tests {
         assert!(err_msg.contains("Failed to read TEST_OPT_SECRET4 from file"));
 
         env::remove_var("TEST_OPT_SECRET4_FILE");
+    }
+
+    /// Regression test: OPENAI_WEBHOOK_SECRET must support the _FILE pattern.
+    ///
+    /// File-based secret deployments (e.g., Kubernetes secrets mounted as files)
+    /// should be able to configure the OpenAI webhook secret using
+    /// OPENAI_WEBHOOK_SECRET_FILE. Without this support, the /openai-webhook
+    /// endpoint silently returns 503, which is a likely misconfiguration.
+    #[test]
+    fn test_openai_webhook_secret_supports_file_pattern() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "whsec_test_secret_from_file").unwrap();
+
+        env::set_var("OPENAI_WEBHOOK_SECRET_FILE", file.path());
+        env::remove_var("OPENAI_WEBHOOK_SECRET");
+
+        let result = read_secret_optional("OPENAI_WEBHOOK_SECRET").unwrap();
+        assert_eq!(
+            result,
+            Some("whsec_test_secret_from_file".to_string()),
+            "OPENAI_WEBHOOK_SECRET should be readable from OPENAI_WEBHOOK_SECRET_FILE"
+        );
+
+        env::remove_var("OPENAI_WEBHOOK_SECRET_FILE");
     }
 }

@@ -10,6 +10,26 @@ mod sqlite;
 pub use memory::InMemoryRepository;
 pub use sqlite::SqliteRepository;
 
+/// Result of attempting to claim a webhook ID for processing.
+///
+/// This three-state result allows callers to distinguish between:
+/// - First claim (proceed to process)
+/// - Already being processed (return retryable error)
+/// - Already completed (return success, skip processing)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookClaimResult {
+    /// Successfully claimed the webhook for processing.
+    /// The caller should proceed with processing.
+    Claimed,
+    /// Another request is currently processing this webhook.
+    /// The caller should return a retryable error (e.g., 409 Conflict)
+    /// so OpenAI will retry later.
+    InProgress,
+    /// This webhook was already successfully processed.
+    /// The caller should return success (200 OK) without reprocessing.
+    Completed,
+}
+
 use async_trait::async_trait;
 use std::fmt;
 
@@ -255,11 +275,29 @@ pub trait StateRepository: Send + Sync {
     /// operation to prevent race conditions where concurrent requests both
     /// pass the "is_webhook_seen" check before either records.
     ///
+    /// The claim is initially in "in_progress" state. Call `complete_webhook_claim`
+    /// after successful processing to mark it as completed.
+    ///
     /// Returns:
-    /// - `Ok(true)` if this caller successfully claimed the webhook (first to see it)
-    /// - `Ok(false)` if the webhook was already claimed by another caller (replay)
+    /// - `Ok(Claimed)` if this caller successfully claimed the webhook (first to see it)
+    /// - `Ok(InProgress)` if the webhook is currently being processed by another caller
+    /// - `Ok(Completed)` if the webhook was already successfully processed
     /// - `Err(RepositoryError)` if storage operation failed
-    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
+    async fn try_claim_webhook_id(
+        &self,
+        webhook_id: &str,
+    ) -> Result<WebhookClaimResult, RepositoryError>;
+
+    /// Mark a claimed webhook as successfully completed.
+    ///
+    /// This transitions a webhook from "in_progress" to "completed" state.
+    /// Should be called after successful processing to prevent future retries
+    /// from reprocessing the same webhook.
+    ///
+    /// Returns:
+    /// - `Ok(())` on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn complete_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError>;
 
     /// Release a claimed webhook ID to allow retries.
     ///

@@ -23,13 +23,13 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{error, warn};
 
-use super::{RepositoryError, StateRepository, StoredState};
+use super::{RepositoryError, StateRepository, StoredState, WebhookClaimResult};
 use crate::state_machine::state::ReviewMachineState;
 use crate::state_machine::store::StateMachinePrId;
 
 /// Current schema version. Increment this when making schema changes and add
 /// corresponding migration logic in `run_migrations()`.
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// SQLite-backed state repository.
 ///
@@ -262,8 +262,21 @@ impl SqliteRepository {
             .map_err(|e| RepositoryError::storage("migration v3", e.to_string()))?;
         }
 
+        // Migration from version 3 to version 4: Add claim_state column for tracking
+        // in-progress vs completed webhooks. This allows returning 409 for in-progress
+        // claims so OpenAI can retry, preventing dropped batch completions.
+        // Values: 0 = in_progress, 1 = completed
+        if from_version < 4 {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE seen_webhook_ids ADD COLUMN claim_state INTEGER NOT NULL DEFAULT 1;
+                "#,
+            )
+            .map_err(|e| RepositoryError::storage("migration v4", e.to_string()))?;
+        }
+
         // Future migrations would go here:
-        // if from_version < 4 { ... }
+        // if from_version < 5 { ... }
 
         // Update schema version
         conn.execute(
@@ -690,8 +703,9 @@ impl StateRepository for SqliteRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
+            // claim_state: 1 = completed
             conn.execute(
-                "INSERT OR REPLACE INTO seen_webhook_ids (webhook_id, recorded_at) VALUES (?1, ?2)",
+                "INSERT OR REPLACE INTO seen_webhook_ids (webhook_id, recorded_at, claim_state) VALUES (?1, ?2, 1)",
                 params![webhook_id, now_secs],
             )
             .map_err(|e| RepositoryError::storage("record_webhook_id", e.to_string()))?;
@@ -702,7 +716,10 @@ impl StateRepository for SqliteRepository {
         .map_err(|e| RepositoryError::storage("record_webhook_id", e.to_string()))?
     }
 
-    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+    async fn try_claim_webhook_id(
+        &self,
+        webhook_id: &str,
+    ) -> Result<WebhookClaimResult, RepositoryError> {
         let conn = self.conn.clone();
         let webhook_id = webhook_id.to_string();
         let now_secs = std::time::SystemTime::now()
@@ -713,22 +730,58 @@ impl StateRepository for SqliteRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
 
-            // Use INSERT OR IGNORE to atomically try to insert.
-            // If the row already exists (webhook_id is PRIMARY KEY), no insert happens.
-            // We then check changes() to see if we successfully inserted.
-            conn.execute(
-                "INSERT OR IGNORE INTO seen_webhook_ids (webhook_id, recorded_at) VALUES (?1, ?2)",
-                params![webhook_id, now_secs],
-            )
-            .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
+            // First, check if the webhook already exists and get its state
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT claim_state FROM seen_webhook_ids WHERE webhook_id = ?1",
+                    params![webhook_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
 
-            // changes() returns the number of rows modified by the last statement.
-            // If 1, we successfully claimed it. If 0, it was already claimed.
-            let claimed = conn.changes() > 0;
-            Ok(claimed)
+            match existing {
+                Some(0) => {
+                    // claim_state 0 = in_progress
+                    Ok(WebhookClaimResult::InProgress)
+                }
+                Some(_) => {
+                    // claim_state 1 = completed (or any other value)
+                    Ok(WebhookClaimResult::Completed)
+                }
+                None => {
+                    // Not found - claim it with state 0 (in_progress)
+                    conn.execute(
+                        "INSERT INTO seen_webhook_ids (webhook_id, recorded_at, claim_state) VALUES (?1, ?2, 0)",
+                        params![webhook_id, now_secs],
+                    )
+                    .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
+                    Ok(WebhookClaimResult::Claimed)
+                }
+            }
         })
         .await
         .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?
+    }
+
+    async fn complete_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        let conn = self.conn.clone();
+        let webhook_id = webhook_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            // Update claim_state to 1 (completed)
+            conn.execute(
+                "UPDATE seen_webhook_ids SET claim_state = 1 WHERE webhook_id = ?1",
+                params![webhook_id],
+            )
+            .map_err(|e| RepositoryError::storage("complete_webhook_claim", e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("complete_webhook_claim", e.to_string()))?
     }
 
     async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
@@ -1712,6 +1765,202 @@ mod tests {
                 mode, 0o600,
                 "SHM file should have 0600 permissions, got {:o}",
                 mode
+            );
+        }
+    }
+
+    // =========================================================================
+    // Webhook claim state tests
+    // =========================================================================
+
+    /// Test that try_claim_webhook_id returns Claimed for first claim.
+    #[tokio::test]
+    async fn test_try_claim_returns_claimed_for_first_attempt() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        let result = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result, WebhookClaimResult::Claimed);
+    }
+
+    /// Test that try_claim_webhook_id returns InProgress for second claim
+    /// before completion.
+    #[tokio::test]
+    async fn test_try_claim_returns_in_progress_for_concurrent_claim() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // First claim
+        let result1 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result1, WebhookClaimResult::Claimed);
+
+        // Second claim before completion should return InProgress
+        let result2 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result2, WebhookClaimResult::InProgress);
+    }
+
+    /// Test that try_claim_webhook_id returns Completed after
+    /// complete_webhook_claim is called.
+    #[tokio::test]
+    async fn test_try_claim_returns_completed_after_completion() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Claim
+        let result1 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result1, WebhookClaimResult::Claimed);
+
+        // Complete
+        repo.complete_webhook_claim("webhook_1").await.unwrap();
+
+        // Next claim should return Completed
+        let result2 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result2, WebhookClaimResult::Completed);
+    }
+
+    /// Test that release_webhook_claim allows re-claiming.
+    #[tokio::test]
+    async fn test_release_allows_reclaim() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Claim
+        let result1 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result1, WebhookClaimResult::Claimed);
+
+        // Release (simulating processing failure)
+        repo.release_webhook_claim("webhook_1").await.unwrap();
+
+        // Should be able to claim again
+        let result2 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result2, WebhookClaimResult::Claimed);
+    }
+
+    /// Regression test: The bug where returning 200 for in-progress claims
+    /// causes dropped batch completions if the first request later fails.
+    ///
+    /// Scenario:
+    /// 1. Request A claims webhook-123 and starts processing
+    /// 2. Request A times out (from OpenAI's perspective)
+    /// 3. Request B (retry) arrives with the same webhook-123
+    /// 4. OLD BEHAVIOR: Returns 200 - OpenAI thinks it's done
+    /// 5. Request A later fails and releases the claim
+    /// 6. Result: Batch completion is lost forever (no more retries)
+    ///
+    /// NEW BEHAVIOR: Request B should see InProgress and get a retryable
+    /// error (409), so OpenAI will retry again later.
+    #[tokio::test]
+    async fn test_in_progress_claim_is_retryable_not_terminal() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Request A claims
+        let claim_a = repo.try_claim_webhook_id("webhook_123").await.unwrap();
+        assert_eq!(claim_a, WebhookClaimResult::Claimed);
+
+        // Request B (retry) arrives while A is still processing
+        // This MUST return InProgress (retryable) NOT Completed (terminal)
+        let claim_b = repo.try_claim_webhook_id("webhook_123").await.unwrap();
+        assert_eq!(
+            claim_b,
+            WebhookClaimResult::InProgress,
+            "Retry during processing must return InProgress, not Completed"
+        );
+
+        // Request A fails and releases
+        repo.release_webhook_claim("webhook_123").await.unwrap();
+
+        // Request C (another retry) should now be able to claim
+        let claim_c = repo.try_claim_webhook_id("webhook_123").await.unwrap();
+        assert_eq!(
+            claim_c,
+            WebhookClaimResult::Claimed,
+            "After release, retry should be able to claim"
+        );
+    }
+
+    /// Test that claim state persists across database close/reopen.
+    #[tokio::test]
+    async fn test_claim_state_persists_across_reopen() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Claim and complete
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let result = repo
+                .try_claim_webhook_id("webhook_persistent")
+                .await
+                .unwrap();
+            assert_eq!(result, WebhookClaimResult::Claimed);
+            repo.complete_webhook_claim("webhook_persistent")
+                .await
+                .unwrap();
+        }
+
+        // Reopen and verify Completed state persists
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+            let result = repo
+                .try_claim_webhook_id("webhook_persistent")
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                WebhookClaimResult::Completed,
+                "Completed state should persist across database reopen"
+            );
+        }
+    }
+
+    /// Test migration from v3 to v4: existing webhook IDs should default to Completed.
+    /// This is the correct behavior because any webhook in the v3 table was already
+    /// successfully processed (the old code only recorded on success).
+    #[tokio::test]
+    async fn test_v3_to_v4_migration_defaults_to_completed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create a v3 database manually
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+            // Set up v3 schema
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_version (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_version (id, version) VALUES (1, 3);
+
+                CREATE TABLE pr_states (
+                    repo_owner TEXT NOT NULL,
+                    repo_name TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    state_json TEXT NOT NULL,
+                    installation_id INTEGER,
+                    has_pending_batch INTEGER NOT NULL DEFAULT 0,
+                    is_batch_submitting INTEGER NOT NULL DEFAULT 0,
+                    batch_id TEXT,
+                    PRIMARY KEY (repo_owner, repo_name, pr_number)
+                );
+
+                CREATE TABLE seen_webhook_ids (
+                    webhook_id TEXT PRIMARY KEY,
+                    recorded_at INTEGER NOT NULL
+                );
+                INSERT INTO seen_webhook_ids (webhook_id, recorded_at) VALUES ('old_webhook', 1234567890);
+                "#,
+            )
+            .unwrap();
+        }
+
+        // Open with SqliteRepository (triggers migration to v4)
+        {
+            let repo = SqliteRepository::new(&db_path).unwrap();
+
+            // The old webhook should be seen as Completed (default from migration)
+            let result = repo.try_claim_webhook_id("old_webhook").await.unwrap();
+            assert_eq!(
+                result,
+                WebhookClaimResult::Completed,
+                "Pre-existing webhooks from v3 should default to Completed after migration"
             );
         }
     }

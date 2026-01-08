@@ -25,6 +25,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::batch_processor::process_single_batch;
+use crate::state_machine::repository::WebhookClaimResult;
 use crate::state_machine::state::BatchId;
 use crate::AppState;
 
@@ -231,25 +232,46 @@ async fn verify_openai_webhook_signature(
     // This prevents the race condition where concurrent requests both pass
     // an is_webhook_seen check before either records, causing duplicate processing.
     //
-    // - If we claim it (true) → we own processing, continue to handler
-    // - If already claimed (false) → another request is handling it, return 200
+    // Three possible outcomes:
+    // - Claimed → we own processing, continue to handler
+    // - InProgress → another request is processing, return 409 so OpenAI retries later
+    // - Completed → already successfully processed, return 200 (no-op)
     //
     // If processing fails, the handler releases the claim so OpenAI can retry.
-    if !state.state_store.try_claim_webhook_id(&webhook_id).await {
-        info!("Rejecting already-claimed webhook: {}", webhook_id);
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(axum::body::Body::from(
-                "{\"message\":\"Already processing\"}",
-            ))
-            .unwrap());
+    match state.state_store.try_claim_webhook_id(&webhook_id).await {
+        WebhookClaimResult::Claimed => {
+            // We own this webhook - pass through to handler
+            let mut new_request = Request::from_parts(parts, axum::body::Body::from(bytes));
+            new_request.extensions_mut().insert(WebhookId(webhook_id));
+            Ok(next.run(new_request).await)
+        }
+        WebhookClaimResult::InProgress => {
+            // Another request is currently processing this webhook.
+            // Return 409 Conflict so OpenAI will retry later.
+            // This prevents the bug where returning 200 for in-progress requests
+            // causes dropped batch completions if the first request later fails.
+            info!(
+                "Webhook {} in progress by another request, returning 409 for retry",
+                webhook_id
+            );
+            Ok(Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(axum::body::Body::from(
+                    "{\"message\":\"Processing in progress, please retry\"}",
+                ))
+                .unwrap())
+        }
+        WebhookClaimResult::Completed => {
+            // Already successfully processed - return 200 to acknowledge
+            info!("Webhook {} already completed, returning 200", webhook_id);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(axum::body::Body::from(
+                    "{\"message\":\"Already processed\"}",
+                ))
+                .unwrap())
+        }
     }
-
-    // Pass through to handler with webhook_id for releasing on failure
-    let mut new_request = Request::from_parts(parts, axum::body::Body::from(bytes));
-    new_request.extensions_mut().insert(WebhookId(webhook_id));
-
-    Ok(next.run(new_request).await)
 }
 
 /// Handler for OpenAI webhook events.
@@ -285,11 +307,15 @@ async fn openai_webhook_handler(
         Ok(Some(result)) => result,
         Ok(None) => {
             // Batch not found - may be from CLI or already completed.
-            // The claim stays in place (prevents unnecessary retries for this no-op).
+            // Mark the claim as completed so future retries are no-ops.
             info!(
                 "Batch {} not found in state store, ignoring webhook",
                 batch_id
             );
+            state
+                .state_store
+                .complete_webhook_claim(&webhook_id.0)
+                .await;
             return Ok(Json(WebhookResponse {
                 message: "Batch not tracked".to_string(),
             }));
@@ -330,8 +356,12 @@ async fn openai_webhook_handler(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Success! The claim was already made in middleware, so we're done.
-    // The claim stays in place, preventing future retries from re-processing.
+    // Success! Mark the claim as completed so future retries see Completed instead
+    // of InProgress, and return 200 immediately (no reprocessing needed).
+    state
+        .state_store
+        .complete_webhook_claim(&webhook_id.0)
+        .await;
     Ok(Json(WebhookResponse {
         message: "Webhook processed".to_string(),
     }))
@@ -646,7 +676,7 @@ mod tests {
             let claims = successful_claims.clone();
             let id = webhook_id.to_string();
             handles.push(tokio::spawn(async move {
-                if store.try_claim_webhook_id(&id).await {
+                if store.try_claim_webhook_id(&id).await == WebhookClaimResult::Claimed {
                     claims.fetch_add(1, Ordering::SeqCst);
                 }
             }));

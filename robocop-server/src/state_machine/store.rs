@@ -12,7 +12,9 @@ use tracing::info;
 
 use super::event::Event;
 use super::interpreter::{execute_effects, InterpreterContext};
-use super::repository::{InMemoryRepository, RepositoryError, StateRepository, StoredState};
+use super::repository::{
+    InMemoryRepository, RepositoryError, StateRepository, StoredState, WebhookClaimResult,
+};
 use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
 use crate::github::GitHubClient;
@@ -458,21 +460,41 @@ impl StateStore {
     /// operation to prevent race conditions where concurrent requests both
     /// pass the "is_webhook_seen" check before either records.
     ///
-    /// Returns `true` if this caller successfully claimed the webhook (first
-    /// to see it), `false` if already claimed (replay).
+    /// Returns:
+    /// - `Claimed` if this caller successfully claimed the webhook (first to see it)
+    /// - `InProgress` if another request is currently processing this webhook
+    /// - `Completed` if this webhook was already successfully processed
     ///
-    /// On storage error, returns `true` (fail open: allow through since the
+    /// On storage error, returns `Claimed` (fail open: allow through since the
     /// signature already validated the webhook is legitimate).
-    pub async fn try_claim_webhook_id(&self, webhook_id: &str) -> bool {
+    pub async fn try_claim_webhook_id(&self, webhook_id: &str) -> WebhookClaimResult {
         match self.repository.try_claim_webhook_id(webhook_id).await {
-            Ok(claimed) => claimed,
+            Ok(result) => result,
             Err(e) => {
                 error!("Repository error claiming webhook_id {}: {}", webhook_id, e);
                 // Fail open: allow the webhook through on storage errors.
                 // The signature check already validated the webhook is legitimate.
-                // We return true (claimed) so the webhook proceeds.
-                true
+                // We return Claimed so the webhook proceeds.
+                WebhookClaimResult::Claimed
             }
+        }
+    }
+
+    /// Mark a claimed webhook as successfully completed.
+    ///
+    /// This transitions a webhook from "in_progress" to "completed" state.
+    /// Should be called after successful processing to prevent future retries
+    /// from reprocessing the same webhook.
+    ///
+    /// Errors are logged but not returned - the processing already succeeded,
+    /// so we don't want to fail the request. Worst case: a future retry will
+    /// see InProgress instead of Completed, but that's still safe.
+    pub async fn complete_webhook_claim(&self, webhook_id: &str) {
+        if let Err(e) = self.repository.complete_webhook_claim(webhook_id).await {
+            error!(
+                "Repository error completing webhook claim {}: {}",
+                webhook_id, e
+            );
         }
     }
 
@@ -1014,8 +1036,15 @@ mod tests {
             self.inner.record_webhook_id(webhook_id).await
         }
 
-        async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        async fn try_claim_webhook_id(
+            &self,
+            webhook_id: &str,
+        ) -> Result<WebhookClaimResult, RepositoryError> {
             self.inner.try_claim_webhook_id(webhook_id).await
+        }
+
+        async fn complete_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.complete_webhook_claim(webhook_id).await
         }
 
         async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
@@ -1682,8 +1711,15 @@ mod tests {
             self.inner.record_webhook_id(webhook_id).await
         }
 
-        async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+        async fn try_claim_webhook_id(
+            &self,
+            webhook_id: &str,
+        ) -> Result<WebhookClaimResult, RepositoryError> {
             self.inner.try_claim_webhook_id(webhook_id).await
+        }
+
+        async fn complete_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+            self.inner.complete_webhook_claim(webhook_id).await
         }
 
         async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {

@@ -9,8 +9,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::{RepositoryError, StateRepository, StoredState};
+use super::{RepositoryError, StateRepository, StoredState, WebhookClaimResult};
 use crate::state_machine::store::StateMachinePrId;
+
+/// State of a webhook claim for idempotent processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebhookClaimState {
+    /// Webhook is currently being processed.
+    InProgress,
+    /// Webhook was successfully processed.
+    Completed,
+}
 
 /// In-memory state repository.
 ///
@@ -18,16 +27,16 @@ use crate::state_machine::store::StateMachinePrId;
 /// All state is lost on restart.
 pub struct InMemoryRepository {
     states: RwLock<HashMap<StateMachinePrId, StoredState>>,
-    /// Seen webhook IDs with their recording timestamp (unix seconds).
-    /// Used for replay attack prevention.
-    seen_webhook_ids: RwLock<HashMap<String, i64>>,
+    /// Webhook IDs with their claim state and recording timestamp (unix seconds).
+    /// Used for replay attack prevention and idempotent processing.
+    webhook_claims: RwLock<HashMap<String, (WebhookClaimState, i64)>>,
 }
 
 impl InMemoryRepository {
     pub fn new() -> Self {
         Self {
             states: RwLock::new(HashMap::new()),
-            seen_webhook_ids: RwLock::new(HashMap::new()),
+            webhook_claims: RwLock::new(HashMap::new()),
         }
     }
 
@@ -113,36 +122,53 @@ impl StateRepository for InMemoryRepository {
     // =========================================================================
 
     async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
-        let seen = self.seen_webhook_ids.read().await;
-        Ok(seen.contains_key(webhook_id))
+        let claims = self.webhook_claims.read().await;
+        Ok(claims.contains_key(webhook_id))
     }
 
     async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
-        let mut seen = self.seen_webhook_ids.write().await;
-        seen.insert(webhook_id.to_string(), Self::now_secs());
+        let mut claims = self.webhook_claims.write().await;
+        claims.insert(
+            webhook_id.to_string(),
+            (WebhookClaimState::Completed, Self::now_secs()),
+        );
         Ok(())
     }
 
-    async fn try_claim_webhook_id(&self, webhook_id: &str) -> Result<bool, RepositoryError> {
+    async fn try_claim_webhook_id(
+        &self,
+        webhook_id: &str,
+    ) -> Result<WebhookClaimResult, RepositoryError> {
         use std::collections::hash_map::Entry;
 
-        let mut seen = self.seen_webhook_ids.write().await;
-        match seen.entry(webhook_id.to_string()) {
-            Entry::Occupied(_) => {
-                // Already claimed by another caller
-                Ok(false)
+        let mut claims = self.webhook_claims.write().await;
+        match claims.entry(webhook_id.to_string()) {
+            Entry::Occupied(entry) => {
+                // Already claimed - check state
+                match entry.get().0 {
+                    WebhookClaimState::InProgress => Ok(WebhookClaimResult::InProgress),
+                    WebhookClaimState::Completed => Ok(WebhookClaimResult::Completed),
+                }
             }
             Entry::Vacant(entry) => {
-                // We're the first - claim it
-                entry.insert(Self::now_secs());
-                Ok(true)
+                // We're the first - claim it as in_progress
+                entry.insert((WebhookClaimState::InProgress, Self::now_secs()));
+                Ok(WebhookClaimResult::Claimed)
             }
         }
     }
 
+    async fn complete_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
+        let mut claims = self.webhook_claims.write().await;
+        if let Some(entry) = claims.get_mut(webhook_id) {
+            entry.0 = WebhookClaimState::Completed;
+        }
+        Ok(())
+    }
+
     async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError> {
-        let mut seen = self.seen_webhook_ids.write().await;
-        seen.remove(webhook_id);
+        let mut claims = self.webhook_claims.write().await;
+        claims.remove(webhook_id);
         Ok(())
     }
 
@@ -150,10 +176,10 @@ impl StateRepository for InMemoryRepository {
         let now = Self::now_secs();
         let cutoff = now - ttl_seconds;
 
-        let mut seen = self.seen_webhook_ids.write().await;
-        let initial_len = seen.len();
-        seen.retain(|_, timestamp| *timestamp > cutoff);
-        Ok(initial_len - seen.len())
+        let mut claims = self.webhook_claims.write().await;
+        let initial_len = claims.len();
+        claims.retain(|_, (_, timestamp)| *timestamp > cutoff);
+        Ok(initial_len - claims.len())
     }
 }
 
@@ -683,6 +709,111 @@ mod tests {
             without_pending_pct,
             without_pending,
             total
+        );
+    }
+
+    // =========================================================================
+    // Webhook claim state tests
+    // =========================================================================
+
+    /// Test that try_claim_webhook_id returns Claimed for first claim.
+    #[tokio::test]
+    async fn test_try_claim_returns_claimed_for_first_attempt() {
+        let repo = InMemoryRepository::new();
+
+        let result = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result, WebhookClaimResult::Claimed);
+    }
+
+    /// Test that try_claim_webhook_id returns InProgress for second claim
+    /// before completion.
+    #[tokio::test]
+    async fn test_try_claim_returns_in_progress_for_concurrent_claim() {
+        let repo = InMemoryRepository::new();
+
+        // First claim
+        let result1 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result1, WebhookClaimResult::Claimed);
+
+        // Second claim before completion should return InProgress
+        let result2 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result2, WebhookClaimResult::InProgress);
+    }
+
+    /// Test that try_claim_webhook_id returns Completed after
+    /// complete_webhook_claim is called.
+    #[tokio::test]
+    async fn test_try_claim_returns_completed_after_completion() {
+        let repo = InMemoryRepository::new();
+
+        // Claim
+        let result1 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result1, WebhookClaimResult::Claimed);
+
+        // Complete
+        repo.complete_webhook_claim("webhook_1").await.unwrap();
+
+        // Next claim should return Completed
+        let result2 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result2, WebhookClaimResult::Completed);
+    }
+
+    /// Test that release_webhook_claim allows re-claiming.
+    #[tokio::test]
+    async fn test_release_allows_reclaim() {
+        let repo = InMemoryRepository::new();
+
+        // Claim
+        let result1 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result1, WebhookClaimResult::Claimed);
+
+        // Release (simulating processing failure)
+        repo.release_webhook_claim("webhook_1").await.unwrap();
+
+        // Should be able to claim again
+        let result2 = repo.try_claim_webhook_id("webhook_1").await.unwrap();
+        assert_eq!(result2, WebhookClaimResult::Claimed);
+    }
+
+    /// Regression test: The bug where returning 200 for in-progress claims
+    /// causes dropped batch completions if the first request later fails.
+    ///
+    /// Scenario:
+    /// 1. Request A claims webhook-123 and starts processing
+    /// 2. Request A times out (from OpenAI's perspective)
+    /// 3. Request B (retry) arrives with the same webhook-123
+    /// 4. OLD BEHAVIOR: Returns 200 - OpenAI thinks it's done
+    /// 5. Request A later fails and releases the claim
+    /// 6. Result: Batch completion is lost forever (no more retries)
+    ///
+    /// NEW BEHAVIOR: Request B should see InProgress and get a retryable
+    /// error (409), so OpenAI will retry again later.
+    #[tokio::test]
+    async fn test_in_progress_claim_is_retryable_not_terminal() {
+        let repo = InMemoryRepository::new();
+
+        // Request A claims
+        let claim_a = repo.try_claim_webhook_id("webhook_123").await.unwrap();
+        assert_eq!(claim_a, WebhookClaimResult::Claimed);
+
+        // Request B (retry) arrives while A is still processing
+        // This MUST return InProgress (retryable) NOT Completed (terminal)
+        let claim_b = repo.try_claim_webhook_id("webhook_123").await.unwrap();
+        assert_eq!(
+            claim_b,
+            WebhookClaimResult::InProgress,
+            "Retry during processing must return InProgress, not Completed"
+        );
+
+        // Request A fails and releases
+        repo.release_webhook_claim("webhook_123").await.unwrap();
+
+        // Request C (another retry) should now be able to claim
+        let claim_c = repo.try_claim_webhook_id("webhook_123").await.unwrap();
+        assert_eq!(
+            claim_c,
+            WebhookClaimResult::Claimed,
+            "After release, retry should be able to claim"
         );
     }
 }
