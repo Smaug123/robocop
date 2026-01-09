@@ -10,6 +10,26 @@ mod sqlite;
 pub use memory::InMemoryRepository;
 pub use sqlite::SqliteRepository;
 
+/// Result of attempting to claim a webhook ID for processing.
+///
+/// This three-state result allows callers to distinguish between:
+/// - First claim (proceed to process)
+/// - Already being processed (return retryable error)
+/// - Already completed (return success, skip processing)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookClaimResult {
+    /// Successfully claimed the webhook for processing.
+    /// The caller should proceed with processing.
+    Claimed,
+    /// Another request is currently processing this webhook.
+    /// The caller should return a retryable error (e.g., 409 Conflict)
+    /// so OpenAI will retry later.
+    InProgress,
+    /// This webhook was already successfully processed.
+    /// The caller should return success (200 OK) without reprocessing.
+    Completed,
+}
+
 use async_trait::async_trait;
 use std::fmt;
 
@@ -206,4 +226,101 @@ pub trait StateRepository: Send + Sync {
     /// - `Ok(vec)` with all states on success
     /// - `Err(RepositoryError)` if storage operation failed
     async fn get_all(&self) -> Result<Vec<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    /// Look up a PR by its pending batch ID.
+    ///
+    /// This is used by the OpenAI webhook handler to find which PR a batch
+    /// completion event belongs to. The lookup includes both active batches
+    /// (in `BatchPending` and `AwaitingAncestryCheck` states) and batches
+    /// that are being cancelled (in `Cancelled` state with `pending_cancel_batch_id`).
+    ///
+    /// Returns:
+    /// - `Ok(Some((id, state)))` if a PR with this batch_id is found
+    /// - `Ok(None)` if no PR has this batch_id
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn get_by_batch_id(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<(StateMachinePrId, StoredState)>, RepositoryError>;
+
+    // =========================================================================
+    // Webhook replay protection
+    // =========================================================================
+
+    /// Check if a webhook ID has been seen recently.
+    ///
+    /// Used to prevent replay attacks where an attacker captures a valid
+    /// webhook and replays it within the timestamp tolerance window.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the webhook ID has been seen within the TTL window
+    /// - `Ok(false)` if the webhook ID has not been seen (or has expired)
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
+
+    /// Record a webhook ID to prevent replay attacks.
+    ///
+    /// The webhook ID should be stored with a timestamp so it can be cleaned
+    /// up after the TTL expires (typically matching the webhook timestamp
+    /// tolerance window).
+    ///
+    /// Returns:
+    /// - `Ok(())` on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError>;
+
+    /// Atomically try to claim a webhook ID for processing.
+    ///
+    /// This combines the check and record operations into a single atomic
+    /// operation to prevent race conditions where concurrent requests both
+    /// pass the "is_webhook_seen" check before either records.
+    ///
+    /// The claim is initially in "in_progress" state. Call `complete_webhook_claim`
+    /// after successful processing to mark it as completed.
+    ///
+    /// Returns:
+    /// - `Ok(Claimed)` if this caller successfully claimed the webhook (first to see it)
+    /// - `Ok(InProgress)` if the webhook is currently being processed by another caller
+    /// - `Ok(Completed)` if the webhook was already successfully processed
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn try_claim_webhook_id(
+        &self,
+        webhook_id: &str,
+    ) -> Result<WebhookClaimResult, RepositoryError>;
+
+    /// Mark a claimed webhook as successfully completed.
+    ///
+    /// This transitions a webhook from "in_progress" to "completed" state.
+    /// Should be called after successful processing to prevent future retries
+    /// from reprocessing the same webhook.
+    ///
+    /// Returns:
+    /// - `Ok(())` on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn complete_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError>;
+
+    /// Release a claimed webhook ID to allow retries.
+    ///
+    /// This should be called when processing fails after successfully claiming
+    /// the webhook. Releasing allows OpenAI's retry mechanism to work: the same
+    /// webhook ID will be accepted on the next attempt.
+    ///
+    /// Returns:
+    /// - `Ok(())` on success (whether or not the ID existed)
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn release_webhook_claim(&self, webhook_id: &str) -> Result<(), RepositoryError>;
+
+    /// Clean up expired webhook IDs.
+    ///
+    /// This is called periodically or opportunistically to remove webhook IDs
+    /// older than the TTL. Implementations may also clean up during other
+    /// operations if convenient.
+    ///
+    /// # Arguments
+    /// * `ttl_seconds` - Entries older than this are considered expired
+    ///
+    /// Returns:
+    /// - `Ok(count)` with the number of entries removed
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError>;
 }

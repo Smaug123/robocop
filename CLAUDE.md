@@ -113,6 +113,7 @@ Environment variables required:
 - `RECORDING_ENABLED`: Enable HTTP recording (default: false)
 - `RECORDING_LOG_PATH`: Recording log file path (default: recordings.jsonl)
 - `STATUS_AUTH_TOKEN`: Bearer token for /status endpoint authentication (if not set, endpoint is disabled)
+- `OPENAI_WEBHOOK_SECRET`: Signing secret for OpenAI webhook verification (if not set, `/openai-webhook` endpoint returns 503). Configure webhooks in the OpenAI dashboard to receive real-time batch completion notifications instead of polling.
 
 
 ### Review Dashboard
