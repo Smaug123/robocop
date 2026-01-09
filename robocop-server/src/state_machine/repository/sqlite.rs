@@ -771,13 +771,22 @@ impl StateRepository for SqliteRepository {
                 0 => {
                     // InProgress - check if stale (abandoned due to crash/panic)
                     if recorded_at <= stale_cutoff {
-                        // Reclaim the stale entry
+                        // Atomically reclaim only if still stale. The conditional UPDATE
+                        // guards against a TOCTOU race where multiple servers could both
+                        // see the entry as stale and both claim it.
                         conn.execute(
-                            "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
-                            params![now_secs, webhook_id],
+                            "UPDATE seen_webhook_ids SET recorded_at = ?1 \
+                             WHERE webhook_id = ?2 AND claim_state = 0 AND recorded_at <= ?3",
+                            params![now_secs, webhook_id, stale_cutoff],
                         )
                         .map_err(|e| RepositoryError::storage("try_claim_webhook_id", e.to_string()))?;
-                        Ok(WebhookClaimResult::Claimed)
+
+                        if conn.changes() > 0 {
+                            Ok(WebhookClaimResult::Claimed)
+                        } else {
+                            // Another server won the race - return InProgress to trigger retry
+                            Ok(WebhookClaimResult::InProgress)
+                        }
                     } else {
                         Ok(WebhookClaimResult::InProgress)
                     }

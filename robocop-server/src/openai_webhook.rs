@@ -48,10 +48,14 @@ pub struct OpenAIWebhookPayload {
 }
 
 /// Data field of the webhook event.
+///
+/// Note: `id` is optional because non-batch events or verification events may not
+/// include it. We validate its presence after filtering to batch events only.
 #[derive(Debug, Deserialize)]
 pub struct OpenAIWebhookData {
-    /// The batch ID, e.g., "batch_abc123"
-    pub id: String,
+    /// The batch ID, e.g., "batch_abc123". Optional because non-batch events
+    /// may not include this field.
+    pub id: Option<String>,
 }
 
 /// Response returned by the webhook handler.
@@ -305,7 +309,7 @@ async fn openai_webhook_handler(
     };
 
     info!(
-        "OpenAI webhook: type={}, batch_id={}",
+        "OpenAI webhook: type={}, batch_id={:?}",
         payload.event_type, payload.data.id
     );
 
@@ -322,8 +326,24 @@ async fn openai_webhook_handler(
         }));
     }
 
-    // Look up which PR owns this batch
-    let batch_id = payload.data.id.clone();
+    // For batch events, data.id is required. If missing, acknowledge to prevent retries
+    // but log as unexpected (all batch events should have a batch ID).
+    let batch_id = match payload.data.id {
+        Some(id) => id,
+        None => {
+            warn!(
+                "Batch event {} missing data.id field, acknowledging without processing",
+                payload.event_type
+            );
+            state
+                .state_store
+                .complete_webhook_claim(&webhook_id.0)
+                .await;
+            return Ok(Json(WebhookResponse {
+                message: "Batch event missing data.id".to_string(),
+            }));
+        }
+    };
 
     let lookup_result = state.state_store.get_pr_by_batch_id(&batch_id).await;
 
@@ -546,7 +566,24 @@ mod tests {
         assert_eq!(payload.object, "event");
         assert_eq!(payload.id, "evt_123");
         assert_eq!(payload.event_type, "batch.completed");
-        assert_eq!(payload.data.id, "batch_abc123");
+        assert_eq!(payload.data.id, Some("batch_abc123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_webhook_payload_without_data_id() {
+        // Non-batch events or verification events may not include data.id
+        let json = r#"{
+            "object": "event",
+            "id": "evt_456",
+            "type": "fine_tuning.job.succeeded",
+            "data": {}
+        }"#;
+
+        let payload: OpenAIWebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.object, "event");
+        assert_eq!(payload.id, "evt_456");
+        assert_eq!(payload.event_type, "fine_tuning.job.succeeded");
+        assert_eq!(payload.data.id, None);
     }
 
     #[test]
