@@ -18,6 +18,7 @@ use tracing::{error, info, Level};
 
 use robocop_server::batch_processor::batch_polling_loop;
 use robocop_server::config::Config;
+use robocop_server::dashboard::handlers as dashboard_handlers;
 use robocop_server::github::GitHubClient;
 use robocop_server::openai::OpenAIClient;
 use robocop_server::openai_webhook::openai_webhook_router;
@@ -84,9 +85,30 @@ async fn help_handler(headers: HeaderMap) -> Response {
             {
                 "path": "/status",
                 "method": "GET",
-                "description": "Status dashboard showing all tracked PRs and their review states",
+                "description": "Status dashboard showing all tracked PRs and their review states (legacy)",
                 "authentication": "HTML: none (prompts for token, stores in localStorage); JSON: Bearer token required",
                 "response_format": "Supports content negotiation (JSON/HTML)"
+            },
+            {
+                "path": "/dashboard",
+                "method": "GET",
+                "description": "Dashboard with per-PR event timelines (TRON-styled UI)",
+                "authentication": "HTML page prompts for token, stores in localStorage",
+                "response_format": "HTML"
+            },
+            {
+                "path": "/dashboard/api/prs",
+                "method": "GET",
+                "description": "List PRs with recent activity (last 7 days)",
+                "authentication": "Bearer token required (STATUS_AUTH_TOKEN)",
+                "response_format": "application/json"
+            },
+            {
+                "path": "/dashboard/api/prs/:owner/:repo/:pr_number/events",
+                "method": "GET",
+                "description": "Get event timeline for a specific PR",
+                "authentication": "Bearer token required (STATUS_AUTH_TOKEN)",
+                "response_format": "application/json"
             }
         ],
         "features": [
@@ -363,6 +385,12 @@ async fn main() -> Result<()> {
         .route("/health", get(health_check))
         .route("/help", get(help_handler))
         .route("/status", get(status_handler))
+        .route("/dashboard", get(dashboard_handlers::get_dashboard_html))
+        .route("/dashboard/api/prs", get(dashboard_handlers::get_prs_api))
+        .route(
+            "/dashboard/api/prs/:owner/:repo/:pr_number/events",
+            get(dashboard_handlers::get_pr_events_api),
+        )
         .merge(webhook_router(app_state.clone()))
         .merge(openai_webhook_router(app_state.clone()))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))

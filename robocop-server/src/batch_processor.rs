@@ -17,6 +17,13 @@ const WEBHOOK_ID_TTL_SECONDS: i64 = 300;
 /// At 60 seconds per cycle, 10 = every 10 minutes.
 const WEBHOOK_CLEANUP_INTERVAL: u32 = 10;
 
+/// How often to run dashboard event cleanup (in poll cycles).
+/// At 60 seconds per cycle, 60 = every hour.
+const EVENT_CLEANUP_INTERVAL: u32 = 60;
+
+/// Dashboard event retention period in seconds (7 days).
+const EVENT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 /// Main batch polling loop that runs in the background.
 ///
 /// This loop polls the state store for pending batches and generates
@@ -40,6 +47,17 @@ pub async fn batch_polling_loop(state: Arc<AppState>) {
                 .state_store
                 .cleanup_expired_webhooks(WEBHOOK_ID_TTL_SECONDS)
                 .await;
+        }
+
+        // Periodically clean up old dashboard events (every hour)
+        if poll_count.is_multiple_of(EVENT_CLEANUP_INTERVAL) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let cutoff = now - EVENT_RETENTION_SECONDS;
+            // cleanup_old_events handles errors internally and logs the result
+            state.state_store.cleanup_old_events(cutoff).await;
         }
     }
 }
