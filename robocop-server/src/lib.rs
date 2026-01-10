@@ -1,6 +1,7 @@
 pub mod batch_processor;
 pub mod command;
 pub mod config;
+pub mod dashboard;
 pub mod git;
 pub mod github;
 pub mod openai;

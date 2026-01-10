@@ -10,6 +10,9 @@ mod sqlite;
 pub use memory::InMemoryRepository;
 pub use sqlite::SqliteRepository;
 
+// Re-export dashboard types for convenience
+pub use crate::dashboard::types::{DashboardEventType, PrEvent, PrSummary};
+
 /// Result of attempting to claim a webhook ID for processing.
 ///
 /// This three-state result allows callers to distinguish between:

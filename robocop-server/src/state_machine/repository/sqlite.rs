@@ -29,7 +29,7 @@ use crate::state_machine::store::StateMachinePrId;
 
 /// Current schema version. Increment this when making schema changes and add
 /// corresponding migration logic in `run_migrations()`.
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// TTL for stale InProgress claims (30 minutes).
 ///
@@ -288,8 +288,29 @@ impl SqliteRepository {
             .map_err(|e| RepositoryError::storage("migration v4", e.to_string()))?;
         }
 
-        // Future migrations would go here:
-        // if from_version < 5 { ... }
+        // Migration from version 4 to version 5: Add pr_events table for dashboard
+        // event logging. This enables per-PR timeline display in the dashboard.
+        if from_version < 5 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS pr_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo_owner TEXT NOT NULL,
+                    repo_name TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_data TEXT,
+                    recorded_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pr_events_lookup
+                    ON pr_events(repo_owner, repo_name, pr_number, recorded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_pr_events_recent
+                    ON pr_events(recorded_at DESC);
+                "#,
+            )
+            .map_err(|e| RepositoryError::storage("migration v5", e.to_string()))?;
+        }
 
         // Update schema version
         conn.execute(
