@@ -539,6 +539,81 @@ impl StateStore {
         }
     }
 
+    // =========================================================================
+    // Dashboard event logging
+    // =========================================================================
+
+    /// Get events for a specific PR.
+    ///
+    /// Returns events in reverse chronological order (most recent first).
+    /// On repository errors, returns an error that the caller should handle.
+    pub async fn get_pr_events(
+        &self,
+        pr_id: &StateMachinePrId,
+        limit: usize,
+    ) -> Result<Vec<crate::dashboard::types::PrEvent>, RepositoryError> {
+        self.repository
+            .get_pr_events(pr_id, limit)
+            .await
+            .map_err(|e| {
+                error!("Repository error getting PR events for {:?}: {}", pr_id, e);
+                e
+            })
+    }
+
+    /// Get PRs with recent activity.
+    ///
+    /// Returns summaries of PRs that have events recorded after the given timestamp.
+    /// Results are ordered by most recent activity first.
+    pub async fn get_prs_with_recent_activity(
+        &self,
+        since_timestamp: i64,
+    ) -> Result<Vec<crate::dashboard::types::PrSummary>, RepositoryError> {
+        self.repository
+            .get_prs_with_recent_activity(since_timestamp)
+            .await
+            .map_err(|e| {
+                error!("Repository error getting PRs with recent activity: {}", e);
+                e
+            })
+    }
+
+    /// Clean up old events.
+    ///
+    /// Removes events older than the specified timestamp to bound database size.
+    /// Returns the number of events deleted.
+    pub async fn cleanup_old_events(&self, older_than: i64) -> usize {
+        match self.repository.cleanup_old_events(older_than).await {
+            Ok(count) => {
+                if count > 0 {
+                    info!("Cleaned up {} old dashboard events", count);
+                }
+                count
+            }
+            Err(e) => {
+                error!("Repository error cleaning up old events: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Log an event for a PR.
+    ///
+    /// Events are used to build a timeline view in the dashboard.
+    /// On repository errors, logs the error and continues (best-effort logging).
+    pub async fn log_event(&self, event: &crate::dashboard::types::PrEvent) {
+        if let Err(e) = self.repository.log_event(event).await {
+            error!(
+                "Repository error logging event for PR {}/{} #{}: {}",
+                event.repo_owner, event.repo_name, event.pr_number, e
+            );
+        }
+    }
+
+    // =========================================================================
+    // Event processing
+    // =========================================================================
+
     /// Process an event for a PR: transition the state and execute effects.
     ///
     /// This is the main entry point for handling events. It:

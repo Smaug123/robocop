@@ -5,4 +5,5 @@
 //! - API endpoints for querying PR states and events
 //! - An embedded HTML dashboard with TRON styling
 
+pub mod handlers;
 pub mod types;
