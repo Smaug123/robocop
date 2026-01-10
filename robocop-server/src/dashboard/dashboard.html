@@ -4,31 +4,822 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Robocop Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --cyan: #00d4ff;
+            --magenta: #ff00ff;
+            --green: #00ff88;
+            --orange: #ff8800;
+            --red: #ff4444;
+            --yellow: #ffff00;
+            --bg-deep: #050508;
+            --bg-panel: #0a0a12;
+            --bg-hover: #12121a;
+            --border-glow: rgba(0, 212, 255, 0.3);
+            --text-dim: #667788;
+            --text-primary: #00d4ff;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: monospace;
-            background: #0a0a0f;
-            color: #00ffff;
-            padding: 20px;
+            font-family: 'Share Tech Mono', monospace;
+            background: var(--bg-deep);
+            color: var(--cyan);
+            min-height: 100vh;
+            overflow: hidden;
         }
-        .placeholder {
-            text-align: center;
-            margin-top: 100px;
+
+        /* Scan line overlay */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0, 0, 0, 0.1) 2px,
+                rgba(0, 0, 0, 0.1) 4px
+            );
+            pointer-events: none;
+            z-index: 1000;
         }
-        h1 {
-            color: #ff00ff;
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            padding: 16px;
+            gap: 16px;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 20px;
+            background: var(--bg-panel);
+            border: 1px solid var(--border-glow);
+            border-radius: 4px;
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.1);
+        }
+
+        .logo {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--magenta);
+            text-shadow: 0 0 10px var(--magenta), 0 0 20px var(--magenta);
+            letter-spacing: 4px;
+        }
+
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .version {
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        button {
+            font-family: 'Share Tech Mono', monospace;
+            background: transparent;
+            border: 1px solid var(--cyan);
+            color: var(--cyan);
+            padding: 8px 16px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 14px;
+        }
+
+        button:hover {
+            background: var(--cyan);
+            color: var(--bg-deep);
+            box-shadow: 0 0 10px var(--cyan);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        select {
+            font-family: 'Share Tech Mono', monospace;
+            background: var(--bg-panel);
+            border: 1px solid var(--cyan);
+            color: var(--cyan);
+            padding: 8px 12px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        select:focus {
+            outline: none;
+            box-shadow: 0 0 10px var(--cyan);
+        }
+
+        /* Main content */
+        .main-content {
+            display: flex;
+            flex: 1;
+            gap: 16px;
+            overflow: hidden;
+        }
+
+        /* PR List Panel */
+        .pr-list-panel {
+            width: 35%;
+            min-width: 300px;
+            background: var(--bg-panel);
+            border: 1px solid var(--border-glow);
+            border-radius: 4px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel-header {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 14px;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-glow);
+            color: var(--cyan);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .pr-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .pr-item {
+            padding: 12px;
+            margin-bottom: 8px;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .pr-item:hover {
+            background: var(--bg-hover);
+            border-color: var(--border-glow);
+        }
+
+        .pr-item.selected {
+            background: var(--bg-hover);
+            border-color: var(--cyan);
+            box-shadow: 0 0 10px rgba(0, 212, 255, 0.2);
+        }
+
+        .pr-title {
+            font-size: 14px;
+            margin-bottom: 8px;
+            color: var(--cyan);
+        }
+
+        .pr-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        /* State badges */
+        .state-badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 2px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .state-idle { background: var(--text-dim); color: var(--bg-deep); }
+        .state-preparing { background: var(--yellow); color: var(--bg-deep); }
+        .state-batchsubmitting { background: var(--yellow); color: var(--bg-deep); }
+        .state-awaitingancestrycheck { background: var(--yellow); color: var(--bg-deep); }
+        .state-batchpending { background: var(--orange); color: var(--bg-deep); }
+        .state-completed { background: var(--green); color: var(--bg-deep); }
+        .state-failed { background: var(--red); color: var(--bg-deep); }
+        .state-cancelled { background: var(--text-dim); color: var(--bg-deep); }
+        .state-unknown { background: var(--text-dim); color: var(--bg-deep); }
+
+        /* Reviews disabled badge */
+        .reviews-disabled {
+            font-size: 10px;
+            padding: 1px 6px;
+            border-radius: 2px;
+            background: var(--text-dim);
+            color: var(--bg-deep);
+            margin-left: 8px;
+        }
+
+        /* Event Timeline Panel */
+        .timeline-panel {
+            flex: 1;
+            background: var(--bg-panel);
+            border: 1px solid var(--border-glow);
+            border-radius: 4px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .timeline-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        .timeline-empty {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-dim);
+            font-size: 14px;
+        }
+
+        .event-item {
+            display: flex;
+            gap: 16px;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(0, 212, 255, 0.1);
+        }
+
+        .event-item:last-child {
+            border-bottom: none;
+        }
+
+        .event-icon {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-top: 4px;
+            flex-shrink: 0;
+        }
+
+        .event-icon.webhook { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+        .event-icon.command { background: var(--magenta); box-shadow: 0 0 8px var(--magenta); }
+        .event-icon.transition { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+        .event-icon.batch-submitted { background: var(--orange); box-shadow: 0 0 8px var(--orange); }
+        .event-icon.batch-completed { background: var(--green); box-shadow: 0 0 8px var(--green); }
+        .event-icon.batch-failed { background: var(--red); box-shadow: 0 0 8px var(--red); }
+        .event-icon.batch-cancelled { background: var(--text-dim); box-shadow: 0 0 8px var(--text-dim); }
+        .event-icon.comment { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+        .event-icon.check-run { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+        .event-details {
+            flex: 1;
+        }
+
+        .event-type {
+            font-size: 14px;
+            color: var(--cyan);
+            margin-bottom: 4px;
+        }
+
+        .event-data {
+            font-size: 12px;
+            color: var(--text-dim);
+            margin-bottom: 4px;
+        }
+
+        .event-time {
+            font-size: 11px;
+            color: var(--text-dim);
+            opacity: 0.7;
+        }
+
+        /* Auth modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+        }
+
+        .modal {
+            background: var(--bg-panel);
+            border: 1px solid var(--cyan);
+            border-radius: 4px;
+            padding: 32px;
+            width: 400px;
+            box-shadow: 0 0 40px rgba(0, 212, 255, 0.3);
+        }
+
+        .modal h2 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 18px;
+            color: var(--magenta);
+            margin-bottom: 24px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .modal input {
+            width: 100%;
+            font-family: 'Share Tech Mono', monospace;
+            background: var(--bg-deep);
+            border: 1px solid var(--cyan);
+            color: var(--cyan);
+            padding: 12px;
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+
+        .modal input:focus {
+            outline: none;
+            box-shadow: 0 0 10px var(--cyan);
+        }
+
+        .modal .error {
+            color: var(--red);
+            font-size: 12px;
+            margin-bottom: 16px;
+        }
+
+        .modal-buttons {
+            display: flex;
+            gap: 12px;
+        }
+
+        .modal-buttons button {
+            flex: 1;
+        }
+
+        /* Loading state */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 32px;
+            color: var(--text-dim);
+        }
+
+        .spinner {
+            width: 24px;
+            height: 24px;
+            border: 2px solid var(--border-glow);
+            border-top-color: var(--cyan);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 12px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Status indicator */
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .status-dot.connected {
+            background: var(--green);
+            box-shadow: 0 0 8px var(--green);
+        }
+
+        .status-dot.error {
+            background: var(--red);
+            box-shadow: 0 0 8px var(--red);
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-deep);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-glow);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--cyan);
         }
     </style>
 </head>
 <body>
-    <div class="placeholder">
-        <h1>ROBOCOP DASHBOARD</h1>
-        <p>Dashboard UI will be implemented in Stage 4.</p>
-        <p>API endpoints are available at:</p>
-        <ul style="list-style: none; padding: 0;">
-            <li>GET /dashboard/api/prs</li>
-            <li>GET /dashboard/api/prs/:owner/:repo/:pr_number/events</li>
-        </ul>
+    <div class="container">
+        <header>
+            <div class="logo">ROBOCOP</div>
+            <div class="header-controls">
+                <span class="version" id="version"></span>
+                <div class="status-indicator">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Connecting...</span>
+                </div>
+                <select id="refreshInterval">
+                    <option value="30000">30s</option>
+                    <option value="60000">1m</option>
+                    <option value="120000">2m</option>
+                    <option value="300000">5m</option>
+                    <option value="0">Manual</option>
+                </select>
+                <button id="refreshBtn">Refresh</button>
+                <button id="logoutBtn">Logout</button>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <div class="pr-list-panel">
+                <div class="panel-header">Pull Requests</div>
+                <div class="pr-list" id="prList">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        Loading...
+                    </div>
+                </div>
+            </div>
+
+            <div class="timeline-panel">
+                <div class="panel-header">Event Timeline</div>
+                <div class="timeline-content" id="timeline">
+                    <div class="timeline-empty">Select a PR to view its event timeline</div>
+                </div>
+            </div>
+        </div>
     </div>
+
+    <!-- Auth Modal -->
+    <div class="modal-overlay" id="authModal" style="display: none;">
+        <div class="modal">
+            <h2>Authentication Required</h2>
+            <input type="password" id="tokenInput" placeholder="Enter STATUS_AUTH_TOKEN">
+            <div class="error" id="authError" style="display: none;"></div>
+            <div class="modal-buttons">
+                <button id="authSubmitBtn">Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // State
+        let authToken = localStorage.getItem('robocop_auth_token') || '';
+        let selectedPr = null;
+        let refreshTimer = null;
+        let prs = [];
+
+        // DOM elements
+        const authModal = document.getElementById('authModal');
+        const tokenInput = document.getElementById('tokenInput');
+        const authError = document.getElementById('authError');
+        const authSubmitBtn = document.getElementById('authSubmitBtn');
+        const prList = document.getElementById('prList');
+        const timeline = document.getElementById('timeline');
+        const refreshBtn = document.getElementById('refreshBtn');
+        const logoutBtn = document.getElementById('logoutBtn');
+        const refreshInterval = document.getElementById('refreshInterval');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const versionEl = document.getElementById('version');
+
+        // Utilities
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatRelativeTime(timestamp) {
+            const now = Math.floor(Date.now() / 1000);
+            const diff = now - timestamp;
+
+            if (diff < 60) return 'just now';
+            if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+            if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+            return `${Math.floor(diff / 86400)}d ago`;
+        }
+
+        function formatTime(timestamp) {
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleTimeString('en-US', { hour12: false });
+        }
+
+        function formatDateTime(timestamp) {
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            });
+        }
+
+        // API calls
+        async function fetchApi(endpoint) {
+            const response = await fetch(endpoint, {
+                headers: {
+                    'Authorization': `Bearer ${authToken}`
+                }
+            });
+
+            if (response.status === 401 || response.status === 403) {
+                throw new Error('Unauthorized');
+            }
+
+            if (!response.ok) {
+                throw new Error(`API error: ${response.status}`);
+            }
+
+            return response.json();
+        }
+
+        async function fetchPrs() {
+            return fetchApi('/dashboard/api/prs');
+        }
+
+        async function fetchPrEvents(owner, repo, prNumber) {
+            return fetchApi(`/dashboard/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${prNumber}/events`);
+        }
+
+        // Auth handling
+        function showAuthModal() {
+            authModal.style.display = 'flex';
+            tokenInput.value = '';
+            authError.style.display = 'none';
+            tokenInput.focus();
+        }
+
+        function hideAuthModal() {
+            authModal.style.display = 'none';
+        }
+
+        async function authenticate() {
+            const token = tokenInput.value.trim();
+            if (!token) {
+                authError.textContent = 'Please enter a token';
+                authError.style.display = 'block';
+                return;
+            }
+
+            authToken = token;
+
+            try {
+                await fetchPrs();
+                localStorage.setItem('robocop_auth_token', token);
+                hideAuthModal();
+                loadData();
+            } catch (e) {
+                if (e.message === 'Unauthorized') {
+                    authError.textContent = 'Invalid token';
+                } else {
+                    authError.textContent = 'Connection failed';
+                }
+                authError.style.display = 'block';
+                authToken = '';
+            }
+        }
+
+        function logout() {
+            localStorage.removeItem('robocop_auth_token');
+            authToken = '';
+            selectedPr = null;
+            prs = [];
+            renderPrList();
+            renderTimeline();
+            showAuthModal();
+        }
+
+        // Rendering
+        function getStateClass(state) {
+            return 'state-' + state.toLowerCase().replace(/\s+/g, '');
+        }
+
+        function renderPrList() {
+            if (prs.length === 0) {
+                prList.innerHTML = '<div class="timeline-empty">No PRs with recent activity</div>';
+                return;
+            }
+
+            prList.innerHTML = prs.map(pr => {
+                const isSelected = selectedPr &&
+                    selectedPr.repoOwner === pr.repoOwner &&
+                    selectedPr.repoName === pr.repoName &&
+                    selectedPr.prNumber === pr.prNumber;
+
+                const reviewsDisabledBadge = !pr.reviewsEnabled
+                    ? '<span class="reviews-disabled">REVIEWS OFF</span>'
+                    : '';
+
+                return `
+                    <div class="pr-item ${isSelected ? 'selected' : ''}"
+                         data-owner="${escapeHtml(pr.repoOwner)}"
+                         data-repo="${escapeHtml(pr.repoName)}"
+                         data-number="${pr.prNumber}">
+                        <div class="pr-title">
+                            ${escapeHtml(pr.repoOwner)}/${escapeHtml(pr.repoName)} #${pr.prNumber}
+                        </div>
+                        <div class="pr-meta">
+                            <span>
+                                <span class="state-badge ${getStateClass(pr.currentState)}">${escapeHtml(pr.currentState)}</span>
+                                ${reviewsDisabledBadge}
+                            </span>
+                            <span>${formatRelativeTime(pr.latestEventAt)}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            // Add click handlers
+            prList.querySelectorAll('.pr-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    selectPr(
+                        item.dataset.owner,
+                        item.dataset.repo,
+                        parseInt(item.dataset.number)
+                    );
+                });
+            });
+        }
+
+        function getEventIconClass(eventType) {
+            const type = eventType.type || eventType;
+            switch (type) {
+                case 'WebhookReceived': return 'webhook';
+                case 'CommandReceived': return 'command';
+                case 'StateTransition': return 'transition';
+                case 'BatchSubmitted': return 'batch-submitted';
+                case 'BatchCompleted': return 'batch-completed';
+                case 'BatchFailed': return 'batch-failed';
+                case 'BatchCancelled': return 'batch-cancelled';
+                case 'CommentPosted': return 'comment';
+                case 'CheckRunCreated': return 'check-run';
+                default: return 'webhook';
+            }
+        }
+
+        function formatEventData(eventType) {
+            const type = eventType.type;
+            const data = eventType.data;
+
+            if (!data) return '';
+
+            switch (type) {
+                case 'WebhookReceived':
+                    return `Action: ${escapeHtml(data.action)}, SHA: ${escapeHtml(data.head_sha?.substring(0, 7) || 'unknown')}`;
+                case 'CommandReceived':
+                    return `Command: ${escapeHtml(data.command)}, User: ${escapeHtml(data.user)}`;
+                case 'StateTransition':
+                    return `${escapeHtml(data.from_state)} → ${escapeHtml(data.to_state)} (${escapeHtml(data.trigger)})`;
+                case 'BatchSubmitted':
+                    return `Batch: ${escapeHtml(data.batch_id?.substring(0, 12) || 'unknown')}, Model: ${escapeHtml(data.model)}`;
+                case 'BatchCompleted':
+                    return `Batch: ${escapeHtml(data.batch_id?.substring(0, 12) || 'unknown')}, Issues: ${data.has_issues ? 'Yes' : 'No'}`;
+                case 'BatchFailed':
+                    return `Batch: ${escapeHtml(data.batch_id?.substring(0, 12) || 'unknown')}, Reason: ${escapeHtml(data.reason)}`;
+                case 'BatchCancelled':
+                    const batchInfo = data.batch_id ? `Batch: ${escapeHtml(data.batch_id.substring(0, 12))}, ` : '';
+                    return `${batchInfo}Reason: ${escapeHtml(data.reason)}`;
+                case 'CommentPosted':
+                    return `Comment ID: ${data.comment_id}`;
+                case 'CheckRunCreated':
+                    return `Check Run ID: ${data.check_run_id}`;
+                default:
+                    return JSON.stringify(data);
+            }
+        }
+
+        function renderTimeline(events) {
+            if (!events || events.length === 0) {
+                timeline.innerHTML = '<div class="timeline-empty">No events recorded for this PR</div>';
+                return;
+            }
+
+            timeline.innerHTML = events.map(event => `
+                <div class="event-item">
+                    <div class="event-icon ${getEventIconClass(event.eventType)}"></div>
+                    <div class="event-details">
+                        <div class="event-type">${escapeHtml(event.eventType.type || 'Unknown')}</div>
+                        <div class="event-data">${formatEventData(event.eventType)}</div>
+                        <div class="event-time">${formatDateTime(event.recordedAt)}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function setStatus(connected, message) {
+            statusDot.className = 'status-dot ' + (connected ? 'connected' : 'error');
+            statusText.textContent = message;
+        }
+
+        // Data loading
+        async function loadData() {
+            try {
+                setStatus(true, 'Loading...');
+                const data = await fetchPrs();
+                prs = data.prs || [];
+                versionEl.textContent = `v${data.version || '?'}`;
+                renderPrList();
+                setStatus(true, `${prs.length} PRs`);
+
+                // If we have a selected PR, refresh its events too
+                if (selectedPr) {
+                    await loadPrEvents(selectedPr.repoOwner, selectedPr.repoName, selectedPr.prNumber);
+                }
+            } catch (e) {
+                if (e.message === 'Unauthorized') {
+                    setStatus(false, 'Unauthorized');
+                    showAuthModal();
+                } else {
+                    setStatus(false, 'Error');
+                    console.error('Failed to load PRs:', e);
+                }
+            }
+        }
+
+        async function loadPrEvents(owner, repo, prNumber) {
+            try {
+                timeline.innerHTML = '<div class="loading"><div class="spinner"></div>Loading events...</div>';
+                const data = await fetchPrEvents(owner, repo, prNumber);
+                renderTimeline(data.events || []);
+            } catch (e) {
+                timeline.innerHTML = `<div class="timeline-empty">Failed to load events: ${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        function selectPr(owner, repo, prNumber) {
+            selectedPr = { repoOwner: owner, repoName: repo, prNumber };
+            renderPrList();
+            loadPrEvents(owner, repo, prNumber);
+        }
+
+        // Refresh handling
+        function startRefreshTimer() {
+            stopRefreshTimer();
+            const interval = parseInt(refreshInterval.value);
+            if (interval > 0) {
+                refreshTimer = setInterval(loadData, interval);
+            }
+        }
+
+        function stopRefreshTimer() {
+            if (refreshTimer) {
+                clearInterval(refreshTimer);
+                refreshTimer = null;
+            }
+        }
+
+        // Event listeners
+        authSubmitBtn.addEventListener('click', authenticate);
+        tokenInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') authenticate();
+        });
+
+        refreshBtn.addEventListener('click', loadData);
+        logoutBtn.addEventListener('click', logout);
+
+        refreshInterval.addEventListener('change', startRefreshTimer);
+
+        // Initialize
+        if (authToken) {
+            loadData();
+            startRefreshTimer();
+        } else {
+            showAuthModal();
+        }
+    </script>
 </body>
 </html>
