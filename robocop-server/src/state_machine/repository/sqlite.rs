@@ -23,7 +23,10 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{error, warn};
 
-use super::{RepositoryError, StateRepository, StoredState, WebhookClaimResult};
+use super::{
+    DashboardEventType, PrEvent, PrSummary, RepositoryError, StateRepository, StoredState,
+    WebhookClaimResult,
+};
 use crate::state_machine::state::ReviewMachineState;
 use crate::state_machine::store::StateMachinePrId;
 
@@ -884,6 +887,239 @@ impl StateRepository for SqliteRepository {
         })
         .await
         .map_err(|e| RepositoryError::storage("cleanup_expired_webhooks", e.to_string()))?
+    }
+
+    // =========================================================================
+    // Dashboard event logging
+    // =========================================================================
+
+    async fn log_event(&self, event: &PrEvent) -> Result<(), RepositoryError> {
+        let conn = self.conn.clone();
+        let repo_owner = event.repo_owner.clone();
+        let repo_name = event.repo_name.clone();
+        let pr_number = event.pr_number;
+        let recorded_at = event.recorded_at;
+
+        // Serialize event_type to JSON for the event_data column
+        let event_json = serde_json::to_string(&event.event_type)
+            .map_err(|e| RepositoryError::storage("log_event serialize", e.to_string()))?;
+
+        // Extract the variant name for the event_type column (for easier querying)
+        let event_type_name = event_type_variant_name(&event.event_type);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            conn.execute(
+                "INSERT INTO pr_events (repo_owner, repo_name, pr_number, event_type, event_data, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    repo_owner,
+                    repo_name,
+                    pr_number as i64,
+                    event_type_name,
+                    event_json,
+                    recorded_at
+                ],
+            )
+            .map_err(|e| RepositoryError::storage("log_event", e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("log_event", e.to_string()))?
+    }
+
+    async fn get_pr_events(
+        &self,
+        pr_id: &StateMachinePrId,
+        limit: usize,
+    ) -> Result<Vec<PrEvent>, RepositoryError> {
+        let conn = self.conn.clone();
+        let repo_owner = pr_id.repo_owner.clone();
+        let repo_name = pr_id.repo_name.clone();
+        let pr_number = pr_id.pr_number;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, repo_owner, repo_name, pr_number, event_data, recorded_at
+                     FROM pr_events
+                     WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3
+                     ORDER BY recorded_at DESC, id DESC
+                     LIMIT ?4",
+                )
+                .map_err(|e| RepositoryError::storage("get_pr_events", e.to_string()))?;
+
+            let rows = stmt
+                .query_map(
+                    params![repo_owner, repo_name, pr_number as i64, limit as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|e| RepositoryError::storage("get_pr_events", e.to_string()))?;
+
+            let mut events = Vec::new();
+            for row in rows {
+                let (id, owner, name, pr_num, event_data, recorded_at) =
+                    row.map_err(|e| RepositoryError::storage("get_pr_events row", e.to_string()))?;
+
+                let event_type: DashboardEventType = serde_json::from_str(&event_data)
+                    .map_err(|_| RepositoryError::corruption("event_data JSON"))?;
+
+                events.push(PrEvent {
+                    id,
+                    repo_owner: owner,
+                    repo_name: name,
+                    pr_number: pr_num as u64,
+                    event_type,
+                    recorded_at,
+                });
+            }
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("get_pr_events", e.to_string()))?
+    }
+
+    async fn get_prs_with_recent_activity(
+        &self,
+        since_timestamp: i64,
+    ) -> Result<Vec<PrSummary>, RepositoryError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            // Query to get PR summaries with recent events, joined with pr_states for current state
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        e.repo_owner,
+                        e.repo_name,
+                        e.pr_number,
+                        COALESCE(s.state_json, '{}') as state_json,
+                        MAX(e.recorded_at) as latest_event_at,
+                        COUNT(*) as event_count
+                     FROM pr_events e
+                     LEFT JOIN pr_states s ON
+                        e.repo_owner = s.repo_owner AND
+                        e.repo_name = s.repo_name AND
+                        e.pr_number = s.pr_number
+                     WHERE e.recorded_at >= ?1
+                     GROUP BY e.repo_owner, e.repo_name, e.pr_number
+                     ORDER BY latest_event_at DESC",
+                )
+                .map_err(|e| {
+                    RepositoryError::storage("get_prs_with_recent_activity", e.to_string())
+                })?;
+
+            let rows = stmt
+                .query_map(params![since_timestamp], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .map_err(|e| {
+                    RepositoryError::storage("get_prs_with_recent_activity", e.to_string())
+                })?;
+
+            let mut summaries = Vec::new();
+            for row in rows {
+                let (owner, name, pr_num, state_json, latest_event_at, event_count) =
+                    row.map_err(|e| {
+                        RepositoryError::storage("get_prs_with_recent_activity row", e.to_string())
+                    })?;
+
+                // Parse state to extract current_state name and reviews_enabled
+                let (current_state, reviews_enabled) = if state_json == "{}" {
+                    ("Unknown".to_string(), true)
+                } else {
+                    match serde_json::from_str::<ReviewMachineState>(&state_json) {
+                        Ok(state) => (state_variant_name(&state), state.reviews_enabled()),
+                        Err(_) => ("Unknown".to_string(), true),
+                    }
+                };
+
+                summaries.push(PrSummary {
+                    repo_owner: owner,
+                    repo_name: name,
+                    pr_number: pr_num as u64,
+                    current_state,
+                    latest_event_at,
+                    event_count: event_count as usize,
+                    reviews_enabled,
+                });
+            }
+
+            Ok(summaries)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("get_prs_with_recent_activity", e.to_string()))?
+    }
+
+    async fn cleanup_old_events(&self, older_than: i64) -> Result<usize, RepositoryError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let deleted = conn
+                .execute(
+                    "DELETE FROM pr_events WHERE recorded_at < ?1",
+                    params![older_than],
+                )
+                .map_err(|e| RepositoryError::storage("cleanup_old_events", e.to_string()))?;
+
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("cleanup_old_events", e.to_string()))?
+    }
+}
+
+/// Extract the variant name from a DashboardEventType for storage.
+fn event_type_variant_name(event_type: &DashboardEventType) -> &'static str {
+    match event_type {
+        DashboardEventType::WebhookReceived { .. } => "WebhookReceived",
+        DashboardEventType::CommandReceived { .. } => "CommandReceived",
+        DashboardEventType::StateTransition { .. } => "StateTransition",
+        DashboardEventType::BatchSubmitted { .. } => "BatchSubmitted",
+        DashboardEventType::BatchCompleted { .. } => "BatchCompleted",
+        DashboardEventType::BatchFailed { .. } => "BatchFailed",
+        DashboardEventType::BatchCancelled { .. } => "BatchCancelled",
+        DashboardEventType::CommentPosted { .. } => "CommentPosted",
+        DashboardEventType::CheckRunCreated { .. } => "CheckRunCreated",
+    }
+}
+
+/// Extract the variant name from a ReviewMachineState for display.
+fn state_variant_name(state: &ReviewMachineState) -> String {
+    match state {
+        ReviewMachineState::Idle { .. } => "Idle".to_string(),
+        ReviewMachineState::Preparing { .. } => "Preparing".to_string(),
+        ReviewMachineState::BatchSubmitting { .. } => "BatchSubmitting".to_string(),
+        ReviewMachineState::AwaitingAncestryCheck { .. } => "AwaitingAncestryCheck".to_string(),
+        ReviewMachineState::BatchPending { .. } => "BatchPending".to_string(),
+        ReviewMachineState::Completed { .. } => "Completed".to_string(),
+        ReviewMachineState::Failed { .. } => "Failed".to_string(),
+        ReviewMachineState::Cancelled { .. } => "Cancelled".to_string(),
     }
 }
 
@@ -2193,6 +2429,314 @@ mod tests {
                 claim,
                 WebhookClaimResult::Claimed,
                 "Stale InProgress claims should be reclaimable after database reopen"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Dashboard event logging tests
+    // =========================================================================
+
+    fn make_test_event(
+        pr_number: u64,
+        event_type: DashboardEventType,
+        recorded_at: i64,
+    ) -> PrEvent {
+        PrEvent {
+            id: 0, // Will be assigned by DB
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number,
+            event_type,
+            recorded_at,
+        }
+    }
+
+    /// Test: log_event followed by get_pr_events returns the event.
+    #[tokio::test]
+    async fn test_log_event_then_get() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        let event = make_test_event(
+            1,
+            DashboardEventType::StateTransition {
+                from_state: "Idle".to_string(),
+                to_state: "Preparing".to_string(),
+                trigger: "PrUpdated".to_string(),
+            },
+            1000,
+        );
+
+        repo.log_event(&event).await.unwrap();
+
+        let events = repo.get_pr_events(&pr_id, 100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].pr_number, 1);
+        assert_eq!(events[0].recorded_at, 1000);
+
+        match &events[0].event_type {
+            DashboardEventType::StateTransition {
+                from_state,
+                to_state,
+                trigger,
+            } => {
+                assert_eq!(from_state, "Idle");
+                assert_eq!(to_state, "Preparing");
+                assert_eq!(trigger, "PrUpdated");
+            }
+            _ => panic!("Expected StateTransition event"),
+        }
+    }
+
+    /// Test: get_pr_events returns events in reverse chronological order.
+    #[tokio::test]
+    async fn test_get_pr_events_order() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        // Log events with different timestamps
+        for (i, ts) in [100, 300, 200].iter().enumerate() {
+            let event = make_test_event(
+                1,
+                DashboardEventType::StateTransition {
+                    from_state: format!("State{}", i),
+                    to_state: format!("State{}", i + 1),
+                    trigger: format!("Event{}", i),
+                },
+                *ts,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let events = repo.get_pr_events(&pr_id, 100).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Should be ordered by recorded_at DESC
+        assert_eq!(events[0].recorded_at, 300);
+        assert_eq!(events[1].recorded_at, 200);
+        assert_eq!(events[2].recorded_at, 100);
+    }
+
+    /// Test: get_pr_events respects limit.
+    #[tokio::test]
+    async fn test_get_pr_events_limit() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        // Log 10 events
+        for i in 0..10 {
+            let event = make_test_event(
+                1,
+                DashboardEventType::StateTransition {
+                    from_state: format!("State{}", i),
+                    to_state: format!("State{}", i + 1),
+                    trigger: format!("Event{}", i),
+                },
+                i as i64,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let events = repo.get_pr_events(&pr_id, 3).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Should get the 3 most recent (highest timestamps)
+        assert_eq!(events[0].recorded_at, 9);
+        assert_eq!(events[1].recorded_at, 8);
+        assert_eq!(events[2].recorded_at, 7);
+    }
+
+    /// Test: get_pr_events only returns events for the requested PR.
+    #[tokio::test]
+    async fn test_get_pr_events_filters_by_pr() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Log events for different PRs
+        for pr_num in [1, 2, 1, 3, 1] {
+            let event = make_test_event(
+                pr_num,
+                DashboardEventType::WebhookReceived {
+                    action: "opened".to_string(),
+                    head_sha: format!("sha{}", pr_num),
+                },
+                pr_num as i64 * 100,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let events = repo.get_pr_events(&test_pr_id(1), 100).await.unwrap();
+        assert_eq!(events.len(), 3);
+        for event in events {
+            assert_eq!(event.pr_number, 1);
+        }
+    }
+
+    /// Test: cleanup_old_events removes only old events.
+    #[tokio::test]
+    async fn test_cleanup_old_events() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Log events with different timestamps
+        let old_event = make_test_event(
+            1,
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "old".to_string(),
+            },
+            100, // Old
+        );
+        let new_event = make_test_event(
+            1,
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "new".to_string(),
+            },
+            300, // New
+        );
+
+        repo.log_event(&old_event).await.unwrap();
+        repo.log_event(&new_event).await.unwrap();
+
+        // Cleanup events older than 200
+        let deleted = repo.cleanup_old_events(200).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        // Only the new event should remain
+        let events = repo.get_pr_events(&test_pr_id(1), 100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].recorded_at, 300);
+    }
+
+    /// Test: get_prs_with_recent_activity returns PRs with events after threshold.
+    #[tokio::test]
+    async fn test_get_prs_with_recent_activity() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Add a PR state for reference
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+        repo.put(&test_pr_id(2), pending_state(222)).await.unwrap();
+
+        // Log old events for PR#1
+        let old_event = make_test_event(
+            1,
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "abc".to_string(),
+            },
+            100,
+        );
+        repo.log_event(&old_event).await.unwrap();
+
+        // Log recent events for PR#2
+        let recent_event = make_test_event(
+            2,
+            DashboardEventType::StateTransition {
+                from_state: "Idle".to_string(),
+                to_state: "BatchPending".to_string(),
+                trigger: "PrUpdated".to_string(),
+            },
+            300,
+        );
+        repo.log_event(&recent_event).await.unwrap();
+
+        // Get PRs with activity after timestamp 200
+        let summaries = repo.get_prs_with_recent_activity(200).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].pr_number, 2);
+        assert_eq!(summaries[0].current_state, "BatchPending");
+        assert_eq!(summaries[0].latest_event_at, 300);
+        assert_eq!(summaries[0].event_count, 1);
+    }
+
+    /// Test: get_prs_with_recent_activity counts all events for a PR.
+    #[tokio::test]
+    async fn test_get_prs_with_recent_activity_event_count() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+
+        // Log multiple events for the same PR
+        for i in 0..5 {
+            let event = make_test_event(
+                1,
+                DashboardEventType::StateTransition {
+                    from_state: format!("State{}", i),
+                    to_state: format!("State{}", i + 1),
+                    trigger: "Event".to_string(),
+                },
+                100 + i as i64,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let summaries = repo.get_prs_with_recent_activity(0).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].event_count, 5);
+        assert_eq!(summaries[0].latest_event_at, 104); // Most recent
+    }
+
+    /// Test: all DashboardEventType variants serialize and deserialize correctly.
+    #[tokio::test]
+    async fn test_all_event_types_roundtrip() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        let event_types = vec![
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "abc123".to_string(),
+            },
+            DashboardEventType::CommandReceived {
+                command: "review".to_string(),
+                user: "testuser".to_string(),
+            },
+            DashboardEventType::StateTransition {
+                from_state: "Idle".to_string(),
+                to_state: "Preparing".to_string(),
+                trigger: "PrUpdated".to_string(),
+            },
+            DashboardEventType::BatchSubmitted {
+                batch_id: "batch_123".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            DashboardEventType::BatchCompleted {
+                batch_id: "batch_123".to_string(),
+                has_issues: true,
+            },
+            DashboardEventType::BatchFailed {
+                batch_id: "batch_123".to_string(),
+                reason: "rate limited".to_string(),
+            },
+            DashboardEventType::BatchCancelled {
+                batch_id: Some("batch_123".to_string()),
+                reason: "superseded".to_string(),
+            },
+            DashboardEventType::BatchCancelled {
+                batch_id: None,
+                reason: "user requested".to_string(),
+            },
+            DashboardEventType::CommentPosted { comment_id: 12345 },
+            DashboardEventType::CheckRunCreated {
+                check_run_id: 67890,
+            },
+        ];
+
+        // Log all event types
+        for (i, event_type) in event_types.iter().enumerate() {
+            let event = make_test_event(1, event_type.clone(), i as i64);
+            repo.log_event(&event).await.unwrap();
+        }
+
+        // Retrieve and verify all events roundtrip correctly
+        let events = repo.get_pr_events(&pr_id, 100).await.unwrap();
+        assert_eq!(events.len(), event_types.len());
+
+        // Events are returned in reverse order
+        for (i, event) in events.iter().rev().enumerate() {
+            assert_eq!(
+                &event.event_type, &event_types[i],
+                "Event type mismatch at index {}: expected {:?}, got {:?}",
+                i, event_types[i], event.event_type
             );
         }
     }

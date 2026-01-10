@@ -326,4 +326,63 @@ pub trait StateRepository: Send + Sync {
     /// - `Ok(count)` with the number of entries removed
     /// - `Err(RepositoryError)` if storage operation failed
     async fn cleanup_expired_webhooks(&self, ttl_seconds: i64) -> Result<usize, RepositoryError>;
+
+    // =========================================================================
+    // Dashboard event logging
+    // =========================================================================
+
+    /// Log an event for a PR.
+    ///
+    /// Events are used to build a timeline view in the dashboard.
+    /// The `id` field of the event is ignored; it will be assigned by the database.
+    ///
+    /// Returns:
+    /// - `Ok(())` on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn log_event(&self, event: &PrEvent) -> Result<(), RepositoryError>;
+
+    /// Get events for a specific PR.
+    ///
+    /// Returns events in reverse chronological order (most recent first).
+    ///
+    /// # Arguments
+    /// * `pr_id` - The PR to get events for
+    /// * `limit` - Maximum number of events to return
+    ///
+    /// Returns:
+    /// - `Ok(vec)` with events on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn get_pr_events(
+        &self,
+        pr_id: &StateMachinePrId,
+        limit: usize,
+    ) -> Result<Vec<PrEvent>, RepositoryError>;
+
+    /// Get PRs with recent activity.
+    ///
+    /// Returns summaries of PRs that have events recorded after the given timestamp.
+    /// Results are ordered by most recent activity first.
+    ///
+    /// # Arguments
+    /// * `since_timestamp` - Unix timestamp; only include PRs with events after this time
+    ///
+    /// Returns:
+    /// - `Ok(vec)` with PR summaries on success
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn get_prs_with_recent_activity(
+        &self,
+        since_timestamp: i64,
+    ) -> Result<Vec<PrSummary>, RepositoryError>;
+
+    /// Clean up old events.
+    ///
+    /// Removes events older than the specified timestamp to bound database size.
+    ///
+    /// # Arguments
+    /// * `older_than` - Unix timestamp; delete events with recorded_at < this value
+    ///
+    /// Returns:
+    /// - `Ok(count)` with the number of events deleted
+    /// - `Err(RepositoryError)` if storage operation failed
+    async fn cleanup_old_events(&self, older_than: i64) -> Result<usize, RepositoryError>;
 }

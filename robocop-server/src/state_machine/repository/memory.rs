@@ -9,7 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::{RepositoryError, StateRepository, StoredState, WebhookClaimResult};
+use super::{
+    PrEvent, PrSummary, RepositoryError, StateRepository, StoredState, WebhookClaimResult,
+};
 use crate::state_machine::store::StateMachinePrId;
 
 /// TTL for stale InProgress claims (30 minutes).
@@ -211,6 +213,37 @@ impl StateRepository for InMemoryRepository {
             *state == WebhookClaimState::InProgress || *timestamp > cutoff
         });
         Ok(initial_len - claims.len())
+    }
+
+    // =========================================================================
+    // Dashboard event logging (stub implementations for in-memory testing)
+    // =========================================================================
+
+    async fn log_event(&self, _event: &PrEvent) -> Result<(), RepositoryError> {
+        // In-memory repository doesn't persist events - this is a no-op for testing
+        Ok(())
+    }
+
+    async fn get_pr_events(
+        &self,
+        _pr_id: &StateMachinePrId,
+        _limit: usize,
+    ) -> Result<Vec<PrEvent>, RepositoryError> {
+        // In-memory repository doesn't persist events - return empty for testing
+        Ok(Vec::new())
+    }
+
+    async fn get_prs_with_recent_activity(
+        &self,
+        _since_timestamp: i64,
+    ) -> Result<Vec<PrSummary>, RepositoryError> {
+        // In-memory repository doesn't persist events - return empty for testing
+        Ok(Vec::new())
+    }
+
+    async fn cleanup_old_events(&self, _older_than: i64) -> Result<usize, RepositoryError> {
+        // In-memory repository doesn't persist events - nothing to clean up
+        Ok(0)
     }
 }
 

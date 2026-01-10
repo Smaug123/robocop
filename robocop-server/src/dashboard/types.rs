@@ -167,7 +167,9 @@ mod tests {
                 reason: "user requested".to_string(),
             },
             DashboardEventType::CommentPosted { comment_id: 12345 },
-            DashboardEventType::CheckRunCreated { check_run_id: 67890 },
+            DashboardEventType::CheckRunCreated {
+                check_run_id: 67890,
+            },
         ];
 
         for event in events {
@@ -194,8 +196,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&event).expect("serialization should succeed");
-        let parsed: PrEvent =
-            serde_json::from_str(&json).expect("deserialization should succeed");
+        let parsed: PrEvent = serde_json::from_str(&json).expect("deserialization should succeed");
         assert_eq!(event, parsed);
     }
 
