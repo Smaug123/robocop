@@ -17,6 +17,7 @@ use super::repository::{
 };
 use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
+use crate::dashboard::types::{DashboardEventType, PrEvent};
 use crate::github::GitHubClient;
 use crate::openai::OpenAIClient;
 use tracing::error;
@@ -610,6 +611,41 @@ impl StateStore {
         }
     }
 
+    /// Log a state transition event (internal helper).
+    ///
+    /// Only logs if the state variant actually changed. This is called from
+    /// process_event after each transition.
+    async fn log_state_transition(
+        &self,
+        pr_id: &StateMachinePrId,
+        from_state: &ReviewMachineState,
+        to_state: &ReviewMachineState,
+        event: &Event,
+    ) {
+        // Only log if state variant actually changed
+        if std::mem::discriminant(from_state) == std::mem::discriminant(to_state) {
+            return;
+        }
+
+        let pr_event = PrEvent {
+            id: 0, // Assigned by DB
+            repo_owner: pr_id.repo_owner.clone(),
+            repo_name: pr_id.repo_name.clone(),
+            pr_number: pr_id.pr_number,
+            event_type: DashboardEventType::StateTransition {
+                from_state: state_variant_name(from_state),
+                to_state: state_variant_name(to_state),
+                trigger: event.log_summary(),
+            },
+            recorded_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        };
+
+        self.log_event(&pr_event).await;
+    }
+
     // =========================================================================
     // Event processing
     // =========================================================================
@@ -661,15 +697,20 @@ impl StateStore {
         let mut events_to_process = vec![event];
 
         while let Some(event) = events_to_process.pop() {
+            let from_state = current_state.clone();
             info!(
                 "Processing event {} for PR #{} in state {:?}",
                 event.log_summary(),
                 pr_id.pr_number,
-                current_state
+                from_state
             );
 
-            let TransitionResult { state, effects } = transition(current_state, event);
+            let TransitionResult { state, effects } = transition(from_state.clone(), event.clone());
             current_state = state;
+
+            // Log state transition if state actually changed
+            self.log_state_transition(pr_id, &from_state, &current_state, &event)
+                .await;
 
             // Persist state BEFORE executing effects.
             // This ensures crash recovery finds the correct state even if effects fail.
@@ -706,6 +747,24 @@ impl StateStore {
         );
 
         Ok(current_state)
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Extract the variant name from a ReviewMachineState for display.
+fn state_variant_name(state: &ReviewMachineState) -> String {
+    match state {
+        ReviewMachineState::Idle { .. } => "Idle".to_string(),
+        ReviewMachineState::Preparing { .. } => "Preparing".to_string(),
+        ReviewMachineState::BatchSubmitting { .. } => "BatchSubmitting".to_string(),
+        ReviewMachineState::AwaitingAncestryCheck { .. } => "AwaitingAncestryCheck".to_string(),
+        ReviewMachineState::BatchPending { .. } => "BatchPending".to_string(),
+        ReviewMachineState::Completed { .. } => "Completed".to_string(),
+        ReviewMachineState::Failed { .. } => "Failed".to_string(),
+        ReviewMachineState::Cancelled { .. } => "Cancelled".to_string(),
     }
 }
 
