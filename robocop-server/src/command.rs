@@ -111,6 +111,33 @@ impl fmt::Display for RobocopCommand {
     }
 }
 
+/// Normalize a model name by inserting a hyphen after "gpt" if missing.
+///
+/// OpenAI's naming convention uses "gpt-" prefix (e.g., "gpt-4", "gpt-5.2").
+/// This autocorrects common mistakes like "gpt4" or "gpt5.2" to "gpt-4" or "gpt-5.2".
+fn normalize_model_name(model: &str) -> String {
+    // Use .get() for safe UTF-8 slicing - returns None if byte 3 is not a valid char boundary
+    let Some(prefix) = model.get(..3) else {
+        // Model is less than 3 bytes or byte 3 is not a valid UTF-8 boundary
+        return model.to_string();
+    };
+
+    if !prefix.eq_ignore_ascii_case("gpt") {
+        return model.to_string();
+    }
+
+    // If prefix matched "gpt" (ASCII), then byte 3 is a valid UTF-8 boundary,
+    // so slicing from byte 3 onwards is safe
+    let rest = &model[3..];
+    if rest.is_empty() || rest.starts_with('-') {
+        // Just "gpt" alone or already has hyphen - no change needed
+        return model.to_string();
+    }
+
+    // Insert hyphen after "gpt", preserving original case of the prefix
+    format!("{}-{}", prefix, rest)
+}
+
 /// Parse key:value options from a space-separated string
 ///
 /// Returns ReviewOptions with any recognized options filled in.
@@ -128,7 +155,7 @@ fn parse_review_options(options_str: &str) -> ReviewOptions {
             }
             // Only lowercase the key for comparison, preserve value case
             match key.to_lowercase().as_str() {
-                "model" => opts.model = Some(value.to_string()),
+                "model" => opts.model = Some(normalize_model_name(value)),
                 "reasoning" => opts.reasoning_effort = Some(value.to_string()),
                 _ => {} // Ignore unrecognized keys for forward compatibility
             }
@@ -601,6 +628,56 @@ mod tests {
             review_with(None, Some("XHIGH")),
             "Reasoning values should preserve their original case"
         );
+    }
+
+    #[test]
+    fn test_model_name_autocorrects_missing_hyphen() {
+        // OpenAI models use "gpt-" prefix with hyphen; autocorrect if user omits it
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:gpt5.2"),
+            review_with(Some("gpt-5.2"), None),
+            "gpt5.2 should be autocorrected to gpt-5.2"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:GPT4"),
+            review_with(Some("GPT-4"), None),
+            "GPT4 should be autocorrected to GPT-4"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:gpt4o"),
+            review_with(Some("gpt-4o"), None),
+            "gpt4o should be autocorrected to gpt-4o"
+        );
+        // Already correct - should not be modified
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:gpt-5.2"),
+            review_with(Some("gpt-5.2"), None),
+            "gpt-5.2 should remain unchanged"
+        );
+        // Non-gpt models should not be modified
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:o1"),
+            review_with(Some("o1"), None),
+            "o1 should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn test_normalize_model_name_non_ascii_does_not_panic() {
+        // Regression test: non-ASCII model values should not panic due to UTF-8 slicing
+        // The fire emoji is 4 bytes, so byte index 3 is in the middle of it
+        assert_eq!(normalize_model_name("🔥"), "🔥");
+        assert_eq!(normalize_model_name("日本語"), "日本語");
+        // CJK character followed by digits - 日 is 3 bytes, so byte 3 is valid
+        assert_eq!(normalize_model_name("日42"), "日42");
+        // gpt followed by non-ASCII should still insert hyphen
+        assert_eq!(normalize_model_name("gpt🔥"), "gpt-🔥");
+        // Non-ASCII at start means no gpt prefix, no change
+        assert_eq!(normalize_model_name("🔥gpt5"), "🔥gpt5");
+        // Short strings
+        assert_eq!(normalize_model_name(""), "");
+        assert_eq!(normalize_model_name("a"), "a");
+        assert_eq!(normalize_model_name("ab"), "ab");
     }
 
     #[test]
