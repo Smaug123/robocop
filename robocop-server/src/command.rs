@@ -116,16 +116,26 @@ impl fmt::Display for RobocopCommand {
 /// OpenAI's naming convention uses "gpt-" prefix (e.g., "gpt-4", "gpt-5.2").
 /// This autocorrects common mistakes like "gpt4" or "gpt5.2" to "gpt-4" or "gpt-5.2".
 fn normalize_model_name(model: &str) -> String {
-    // Check if it starts with "gpt" (case-insensitive) but not "gpt-"
-    if model.len() > 3 {
-        let prefix = &model[..3];
-        let after_prefix = model.chars().nth(3).unwrap();
-        if prefix.eq_ignore_ascii_case("gpt") && after_prefix != '-' {
-            // Insert hyphen after "gpt"
-            return format!("{}-{}", &model[..3], &model[3..]);
-        }
+    // Use .get() for safe UTF-8 slicing - returns None if byte 3 is not a valid char boundary
+    let Some(prefix) = model.get(..3) else {
+        // Model is less than 3 bytes or byte 3 is not a valid UTF-8 boundary
+        return model.to_string();
+    };
+
+    if !prefix.eq_ignore_ascii_case("gpt") {
+        return model.to_string();
     }
-    model.to_string()
+
+    // If prefix matched "gpt" (ASCII), then byte 3 is a valid UTF-8 boundary,
+    // so slicing from byte 3 onwards is safe
+    let rest = &model[3..];
+    if rest.is_empty() || rest.starts_with('-') {
+        // Just "gpt" alone or already has hyphen - no change needed
+        return model.to_string();
+    }
+
+    // Insert hyphen after "gpt", preserving original case of the prefix
+    format!("{}-{}", prefix, rest)
 }
 
 /// Parse key:value options from a space-separated string
@@ -650,6 +660,24 @@ mod tests {
             review_with(Some("o1"), None),
             "o1 should remain unchanged"
         );
+    }
+
+    #[test]
+    fn test_normalize_model_name_non_ascii_does_not_panic() {
+        // Regression test: non-ASCII model values should not panic due to UTF-8 slicing
+        // The fire emoji is 4 bytes, so byte index 3 is in the middle of it
+        assert_eq!(normalize_model_name("🔥"), "🔥");
+        assert_eq!(normalize_model_name("日本語"), "日本語");
+        // CJK character followed by digits - 日 is 3 bytes, so byte 3 is valid
+        assert_eq!(normalize_model_name("日42"), "日42");
+        // gpt followed by non-ASCII should still insert hyphen
+        assert_eq!(normalize_model_name("gpt🔥"), "gpt-🔥");
+        // Non-ASCII at start means no gpt prefix, no change
+        assert_eq!(normalize_model_name("🔥gpt5"), "🔥gpt5");
+        // Short strings
+        assert_eq!(normalize_model_name(""), "");
+        assert_eq!(normalize_model_name("a"), "a");
+        assert_eq!(normalize_model_name("ab"), "ab");
     }
 
     #[test]
