@@ -12,9 +12,9 @@ use tracing::info;
 
 use super::event::Event;
 use super::interpreter::{execute_effects, InterpreterContext};
-use super::repository::{
-    RepositoryError, SqliteRepository, StateRepository, StoredState, WebhookClaimResult,
-};
+#[cfg(test)]
+use super::repository::SqliteRepository;
+use super::repository::{RepositoryError, StateRepository, StoredState, WebhookClaimResult};
 use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
 use crate::github::GitHubClient;
@@ -61,18 +61,16 @@ pub struct StateStore {
     pr_locks: RwLock<HashMap<StateMachinePrId, Arc<Mutex<()>>>>,
 }
 
-impl Default for StateStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl StateStore {
-    /// Create a new StateStore with an in-memory SQLite repository.
+    /// Create a new StateStore with an in-memory SQLite repository for testing.
     ///
-    /// This is primarily for testing. Production code should use
-    /// `with_repository` with a file-backed `SqliteRepository`.
-    pub fn new() -> Self {
+    /// This creates an ephemeral in-memory database that does not persist
+    /// across restarts. Use only in tests.
+    ///
+    /// Production code should use `with_repository` with a file-backed
+    /// `SqliteRepository` for durability.
+    #[cfg(test)]
+    pub fn new_for_testing() -> Self {
         Self::with_repository(Arc::new(
             SqliteRepository::new_in_memory().expect("Failed to create in-memory SQLite database"),
         ))
@@ -446,14 +444,18 @@ impl StateStore {
         }
     }
 
-    /// Record a webhook ID to prevent replay attacks.
+    /// Record a webhook ID as completed to prevent replay attacks.
     ///
-    /// Should be called after successful webhook validation but before
-    /// processing the webhook payload.
+    /// This immediately marks the webhook as completed (processed successfully).
+    /// Use this only after processing succeeds, or for flows that don't need
+    /// retry support.
+    ///
+    /// For processing with retry support, use the claim-based flow instead:
+    /// 1. `try_claim_webhook_id` - atomically claim before processing
+    /// 2. `complete_webhook_claim` - mark as completed on success
+    /// 3. `release_webhook_claim` - release on failure to allow retries
     ///
     /// Returns `Ok(())` on success, `Err` on storage failure.
-    /// On storage failure, the caller should log but continue processing
-    /// (fail open) since the webhook was already validated.
     pub async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
         self.repository.record_webhook_id(webhook_id).await
     }
@@ -765,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_store_get_or_default() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         let state = store.get_or_default(&pr_id).await.unwrap();
@@ -779,7 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_store_set_and_get() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         let state = ReviewMachineState::Idle {
@@ -796,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_store_remove() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         let state = ReviewMachineState::Idle {
@@ -825,7 +827,7 @@ mod tests {
     async fn test_get_or_init_updates_reviews_enabled_when_changed() {
         use crate::state_machine::state::{BatchId, CheckRunId, CommentId, CommitSha};
 
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // Simulate: PR opened with reviews enabled, batch is pending
@@ -857,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_init_creates_new_state_with_reviews_enabled() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // No existing state - should create Idle with reviews_enabled: false
@@ -885,7 +887,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let store = Arc::new(StateStore::new());
+        let store = Arc::new(StateStore::new_for_testing());
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
         let mismatch_count = Arc::new(AtomicUsize::new(0));
 
@@ -937,7 +939,7 @@ mod tests {
     async fn test_different_prs_not_blocked() {
         use std::sync::Arc;
 
-        let store = Arc::new(StateStore::new());
+        let store = Arc::new(StateStore::new_for_testing());
 
         // Spawn tasks for different PRs concurrently
         let mut handles = vec![];
@@ -1157,7 +1159,7 @@ mod tests {
     /// Regression test for: installation_id preservation across state updates.
     #[tokio::test]
     async fn test_installation_id_preserved_across_state_updates() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // Set initial state with installation_id
@@ -1194,7 +1196,7 @@ mod tests {
     /// Test that get_or_init preserves installation_id when updating reviews_enabled.
     #[tokio::test]
     async fn test_get_or_init_preserves_installation_id() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // Set up initial state with installation_id
@@ -1445,7 +1447,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                let store = StateStore::new();
+                let store = StateStore::new_for_testing();
                 let pr_id = test_pr_id(1);
 
                 // Set initial state with installation_id
@@ -1478,7 +1480,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                let store = StateStore::new();
+                let store = StateStore::new_for_testing();
                 let pr_id = test_pr_id(1);
 
                 // Set initial state

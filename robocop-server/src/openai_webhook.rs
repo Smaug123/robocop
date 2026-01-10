@@ -678,15 +678,15 @@ mod tests {
         );
     }
 
-    /// Test that webhook IDs expire after the tolerance window.
+    /// Test that webhook IDs expire after cleanup with TTL.
     ///
-    /// Property: After TIMESTAMP_TOLERANCE_SECONDS, the same webhook ID
-    /// should be accepted again (though in practice a valid signature would
-    /// fail the timestamp check anyway).
+    /// Property: After `cleanup_expired_webhooks` removes old entries,
+    /// the webhook ID should no longer be seen.
     #[tokio::test]
-    async fn test_webhook_id_expires_after_tolerance() {
+    async fn test_webhook_id_expires_after_cleanup() {
         use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
+        use rusqlite::params;
         use std::sync::Arc;
 
         let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
@@ -694,19 +694,40 @@ mod tests {
 
         let webhook_id = "msg_expire_test";
 
-        // Record the webhook ID
+        // Record the webhook ID (marks as completed)
         state_store.record_webhook_id(webhook_id).await.unwrap();
-
-        // Should be seen immediately after recording
         assert!(
             state_store.is_webhook_seen(webhook_id).await,
             "Webhook ID should be seen immediately after recording"
         );
 
-        // Note: We can't easily test time-based expiry in a unit test without
-        // injecting a clock. The important property is that the dedup store
-        // cleans up expired entries. This test verifies the basic functionality;
-        // SQLite-based tests verify TTL cleanup via direct DB inspection.
+        // Make it old by manipulating the DB timestamp
+        {
+            let conn = repo.conn.lock().unwrap();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Set timestamp to well past the tolerance window
+            let old_timestamp = now_secs - (TIMESTAMP_TOLERANCE_SECONDS + 60);
+            conn.execute(
+                "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
+                params![old_timestamp, webhook_id],
+            )
+            .unwrap();
+        }
+
+        // Cleanup with TTL matching timestamp tolerance
+        let cleaned = state_store
+            .cleanup_expired_webhooks(TIMESTAMP_TOLERANCE_SECONDS)
+            .await;
+        assert!(cleaned > 0, "Should have cleaned up expired webhook");
+
+        // Should no longer be seen
+        assert!(
+            !state_store.is_webhook_seen(webhook_id).await,
+            "Webhook should be gone after cleanup"
+        );
     }
 
     /// Test that concurrent webhook claims are properly serialized.

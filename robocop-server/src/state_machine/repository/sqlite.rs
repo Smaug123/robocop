@@ -50,7 +50,9 @@ const STALE_IN_PROGRESS_TTL_SECONDS: i64 = 30 * 60;
 /// Uses `tokio::task::spawn_blocking` to run synchronous rusqlite operations
 /// without blocking the async runtime.
 pub struct SqliteRepository {
-    conn: Arc<Mutex<Connection>>,
+    /// Database connection. Exposed as `pub(crate)` for test access to
+    /// manipulate timestamps when testing expiry behavior.
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteRepository {
