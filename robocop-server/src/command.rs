@@ -111,6 +111,23 @@ impl fmt::Display for RobocopCommand {
     }
 }
 
+/// Normalize a model name by inserting a hyphen after "gpt" if missing.
+///
+/// OpenAI's naming convention uses "gpt-" prefix (e.g., "gpt-4", "gpt-5.2").
+/// This autocorrects common mistakes like "gpt4" or "gpt5.2" to "gpt-4" or "gpt-5.2".
+fn normalize_model_name(model: &str) -> String {
+    // Check if it starts with "gpt" (case-insensitive) but not "gpt-"
+    if model.len() > 3 {
+        let prefix = &model[..3];
+        let after_prefix = model.chars().nth(3).unwrap();
+        if prefix.eq_ignore_ascii_case("gpt") && after_prefix != '-' {
+            // Insert hyphen after "gpt"
+            return format!("{}-{}", &model[..3], &model[3..]);
+        }
+    }
+    model.to_string()
+}
+
 /// Parse key:value options from a space-separated string
 ///
 /// Returns ReviewOptions with any recognized options filled in.
@@ -128,7 +145,7 @@ fn parse_review_options(options_str: &str) -> ReviewOptions {
             }
             // Only lowercase the key for comparison, preserve value case
             match key.to_lowercase().as_str() {
-                "model" => opts.model = Some(value.to_string()),
+                "model" => opts.model = Some(normalize_model_name(value)),
                 "reasoning" => opts.reasoning_effort = Some(value.to_string()),
                 _ => {} // Ignore unrecognized keys for forward compatibility
             }
@@ -600,6 +617,38 @@ mod tests {
             parse_comment("@smaug123-robocop review reasoning:XHIGH"),
             review_with(None, Some("XHIGH")),
             "Reasoning values should preserve their original case"
+        );
+    }
+
+    #[test]
+    fn test_model_name_autocorrects_missing_hyphen() {
+        // OpenAI models use "gpt-" prefix with hyphen; autocorrect if user omits it
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:gpt5.2"),
+            review_with(Some("gpt-5.2"), None),
+            "gpt5.2 should be autocorrected to gpt-5.2"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:GPT4"),
+            review_with(Some("GPT-4"), None),
+            "GPT4 should be autocorrected to GPT-4"
+        );
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:gpt4o"),
+            review_with(Some("gpt-4o"), None),
+            "gpt4o should be autocorrected to gpt-4o"
+        );
+        // Already correct - should not be modified
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:gpt-5.2"),
+            review_with(Some("gpt-5.2"), None),
+            "gpt-5.2 should remain unchanged"
+        );
+        // Non-gpt models should not be modified
+        assert_eq!(
+            parse_comment("@smaug123-robocop review model:o1"),
+            review_with(Some("o1"), None),
+            "o1 should remain unchanged"
         );
     }
 
