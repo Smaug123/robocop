@@ -1,13 +1,10 @@
 //! Repository abstraction for state machine persistence.
 //!
 //! This module defines the `StateRepository` trait that abstracts
-//! storage operations for PR review states. Implementations can
-//! provide different backends (in-memory, SQLite, etc.).
+//! storage operations for PR review states.
 
-mod memory;
 mod sqlite;
 
-pub use memory::InMemoryRepository;
 pub use sqlite::SqliteRepository;
 
 // Re-export dashboard types for convenience

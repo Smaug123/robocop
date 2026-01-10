@@ -323,7 +323,6 @@ impl SqliteRepository {
     }
 
     /// Create a new in-memory SQLite repository (for testing).
-    #[cfg(test)]
     pub fn new_in_memory() -> Result<Self, RepositoryError> {
         Self::new(":memory:")
     }

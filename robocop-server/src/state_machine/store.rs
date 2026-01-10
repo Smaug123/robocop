@@ -13,7 +13,7 @@ use tracing::info;
 use super::event::Event;
 use super::interpreter::{execute_effects, InterpreterContext};
 use super::repository::{
-    InMemoryRepository, RepositoryError, StateRepository, StoredState, WebhookClaimResult,
+    RepositoryError, SqliteRepository, StateRepository, StoredState, WebhookClaimResult,
 };
 use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
@@ -49,8 +49,7 @@ impl StateMachinePrId {
 /// concurrent events (webhooks, commands, batch completions) target the same PR.
 /// All state-modifying operations acquire a per-PR lock before proceeding.
 ///
-/// The actual state storage is delegated to a `StateRepository` implementation,
-/// allowing different backends (in-memory, SQLite, etc.).
+/// The actual state storage is delegated to a `StateRepository` implementation.
 pub struct StateStore {
     /// Repository for persisting PR states.
     repository: Arc<dyn StateRepository>,
@@ -69,9 +68,14 @@ impl Default for StateStore {
 }
 
 impl StateStore {
-    /// Create a new StateStore with the default in-memory repository.
+    /// Create a new StateStore with an in-memory SQLite repository.
+    ///
+    /// This is primarily for testing. Production code should use
+    /// `with_repository` with a file-backed `SqliteRepository`.
     pub fn new() -> Self {
-        Self::with_repository(Arc::new(InMemoryRepository::new()))
+        Self::with_repository(Arc::new(
+            SqliteRepository::new_in_memory().expect("Failed to create in-memory SQLite database"),
+        ))
     }
 
     /// Create a new StateStore with a custom repository.
@@ -958,7 +962,7 @@ mod tests {
 
     /// A repository that fails on demand, for testing error handling.
     struct FailingRepository {
-        inner: InMemoryRepository,
+        inner: SqliteRepository,
         fail_gets: std::sync::atomic::AtomicBool,
         fail_puts: std::sync::atomic::AtomicBool,
     }
@@ -966,7 +970,7 @@ mod tests {
     impl FailingRepository {
         fn new() -> Self {
             Self {
-                inner: InMemoryRepository::new(),
+                inner: SqliteRepository::new_in_memory().unwrap(),
                 fail_gets: std::sync::atomic::AtomicBool::new(false),
                 fail_puts: std::sync::atomic::AtomicBool::new(false),
             }
@@ -1561,7 +1565,7 @@ mod tests {
 
     /// A repository that tracks operations for testing atomicity guarantees.
     struct TrackingRepository {
-        inner: InMemoryRepository,
+        inner: SqliteRepository,
         fail_gets: std::sync::atomic::AtomicBool,
         fail_puts: std::sync::atomic::AtomicBool,
         fail_get_by_batch_id: std::sync::atomic::AtomicBool,
@@ -1578,7 +1582,7 @@ mod tests {
     impl TrackingRepository {
         fn new() -> Self {
             Self {
-                inner: InMemoryRepository::new(),
+                inner: SqliteRepository::new_in_memory().unwrap(),
                 fail_gets: std::sync::atomic::AtomicBool::new(false),
                 fail_puts: std::sync::atomic::AtomicBool::new(false),
                 fail_get_by_batch_id: std::sync::atomic::AtomicBool::new(false),

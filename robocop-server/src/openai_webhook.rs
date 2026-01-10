@@ -650,12 +650,12 @@ mod tests {
     /// Regression test for: webhook-id is parsed but never stored/deduped
     #[tokio::test]
     async fn test_duplicate_webhook_id_rejected() {
-        use crate::state_machine::repository::InMemoryRepository;
+        use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
         use std::sync::Arc;
 
         // Create a repository with webhook dedup support
-        let repo = Arc::new(InMemoryRepository::new());
+        let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
         let state_store = StateStore::with_repository(repo.clone());
 
         let webhook_id = "msg_test123";
@@ -685,11 +685,11 @@ mod tests {
     /// fail the timestamp check anyway).
     #[tokio::test]
     async fn test_webhook_id_expires_after_tolerance() {
-        use crate::state_machine::repository::InMemoryRepository;
+        use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
         use std::sync::Arc;
 
-        let repo = Arc::new(InMemoryRepository::new());
+        let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
         let state_store = StateStore::with_repository(repo.clone());
 
         let webhook_id = "msg_expire_test";
@@ -719,12 +719,12 @@ mod tests {
     /// to both pass the check before either recorded.
     #[tokio::test]
     async fn test_concurrent_webhook_claims_only_one_succeeds() {
-        use crate::state_machine::repository::InMemoryRepository;
+        use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let repo = Arc::new(InMemoryRepository::new());
+        let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
         let state_store = Arc::new(StateStore::with_repository(repo));
 
         let webhook_id = "msg_concurrent_test";
@@ -787,11 +787,11 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                use crate::state_machine::repository::InMemoryRepository;
+                use crate::state_machine::repository::SqliteRepository;
                 use crate::state_machine::store::StateStore;
                 use std::sync::Arc;
 
-                let repo = Arc::new(InMemoryRepository::new());
+                let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
                 let state_store = StateStore::with_repository(repo);
 
                 let mut any_success = false;
@@ -837,11 +837,11 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                use crate::state_machine::repository::InMemoryRepository;
+                use crate::state_machine::repository::SqliteRepository;
                 use crate::state_machine::store::StateStore;
                 use std::sync::Arc;
 
-                let repo = Arc::new(InMemoryRepository::new());
+                let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
                 let state_store = StateStore::with_repository(repo);
 
                 // Simulate N failed attempts (don't mark as seen)
