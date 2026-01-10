@@ -362,6 +362,24 @@ fn i64_to_pr_number(value: i64, operation: &'static str) -> Result<u64, Reposito
     })
 }
 
+/// Convert a usize limit to i64 for SQLite LIMIT clause.
+///
+/// Returns an error if the value exceeds i64::MAX, which would cause
+/// silent overflow/wrap with `as i64`. On 64-bit systems, very large
+/// usize values can wrap to negative i64, changing SQLite's LIMIT behavior.
+fn usize_to_i64_limit(limit: usize, operation: &'static str) -> Result<i64, RepositoryError> {
+    i64::try_from(limit).map_err(|_| {
+        RepositoryError::storage(
+            operation,
+            format!(
+                "limit {} exceeds maximum storable value ({})",
+                limit,
+                i64::MAX
+            ),
+        )
+    })
+}
+
 #[async_trait]
 impl StateRepository for SqliteRepository {
     async fn get(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
@@ -999,6 +1017,7 @@ impl StateRepository for SqliteRepository {
         let repo_owner = pr_id.repo_owner.clone();
         let repo_name = pr_id.repo_name.clone();
         let pr_number = pr_number_to_i64(pr_id.pr_number, "get_pr_events")?;
+        let limit_i64 = usize_to_i64_limit(limit, "get_pr_events")?;
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
@@ -1015,7 +1034,7 @@ impl StateRepository for SqliteRepository {
 
             let rows = stmt
                 .query_map(
-                    params![repo_owner, repo_name, pr_number, limit as i64],
+                    params![repo_owner, repo_name, pr_number, limit_i64],
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)?,

@@ -360,11 +360,11 @@ pub trait StateRepository: Send + Sync {
 
     /// Get PRs with recent activity.
     ///
-    /// Returns summaries of PRs that have events recorded after the given timestamp.
+    /// Returns summaries of PRs that have events recorded at or after the given timestamp.
     /// Results are ordered by most recent activity first.
     ///
     /// # Arguments
-    /// * `since_timestamp` - Unix timestamp; only include PRs with events after this time
+    /// * `since_timestamp` - Unix timestamp; only include PRs with events at or after this time
     ///
     /// Returns:
     /// - `Ok(vec)` with PR summaries on success
