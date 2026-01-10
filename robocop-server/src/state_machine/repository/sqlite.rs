@@ -27,7 +27,7 @@ use super::{
     DashboardEventType, PrEvent, PrSummary, RepositoryError, StateRepository, StoredState,
     WebhookClaimResult,
 };
-use crate::state_machine::state::ReviewMachineState;
+use crate::state_machine::state::{state_variant_name, ReviewMachineState};
 use crate::state_machine::store::StateMachinePrId;
 
 /// Current schema version. Increment this when making schema changes and add
@@ -378,6 +378,15 @@ fn usize_to_i64_limit(limit: usize, operation: &'static str) -> Result<i64, Repo
             ),
         )
     })
+}
+
+/// Safely convert an i64 count from SQLite to usize.
+///
+/// Returns None if the value is negative or exceeds usize::MAX (possible on
+/// 32-bit platforms with very large counts). This uses checked conversion
+/// instead of `as usize` which would silently wrap/truncate.
+fn i64_to_event_count(value: i64) -> Option<usize> {
+    usize::try_from(value).ok()
 }
 
 #[async_trait]
@@ -1154,13 +1163,28 @@ impl StateRepository for SqliteRepository {
                     }
                 };
 
+                // Safely convert event count from i64 - skip rows with invalid data
+                let event_count = match i64_to_event_count(event_count) {
+                    Some(n) => n,
+                    None => {
+                        tracing::warn!(
+                            "Skipping PR {}/{} #{} with invalid event count: {}",
+                            owner,
+                            name,
+                            pr_number,
+                            event_count
+                        );
+                        continue;
+                    }
+                };
+
                 summaries.push(PrSummary {
                     repo_owner: owner,
                     repo_name: name,
                     pr_number,
                     current_state,
                     latest_event_at,
-                    event_count: event_count as usize,
+                    event_count,
                     reviews_enabled,
                 });
             }
@@ -1205,21 +1229,6 @@ fn event_type_variant_name(event_type: &DashboardEventType) -> &'static str {
         DashboardEventType::CheckRunCreated { .. } => "CheckRunCreated",
     }
 }
-
-/// Extract the variant name from a ReviewMachineState for display.
-fn state_variant_name(state: &ReviewMachineState) -> String {
-    match state {
-        ReviewMachineState::Idle { .. } => "Idle".to_string(),
-        ReviewMachineState::Preparing { .. } => "Preparing".to_string(),
-        ReviewMachineState::BatchSubmitting { .. } => "BatchSubmitting".to_string(),
-        ReviewMachineState::AwaitingAncestryCheck { .. } => "AwaitingAncestryCheck".to_string(),
-        ReviewMachineState::BatchPending { .. } => "BatchPending".to_string(),
-        ReviewMachineState::Completed { .. } => "Completed".to_string(),
-        ReviewMachineState::Failed { .. } => "Failed".to_string(),
-        ReviewMachineState::Cancelled { .. } => "Cancelled".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

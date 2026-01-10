@@ -45,6 +45,9 @@ pub struct InMemoryRepository {
     /// Webhook IDs with their claim state and recording timestamp (unix seconds).
     /// Used for replay attack prevention and idempotent processing.
     webhook_claims: RwLock<HashMap<String, (WebhookClaimState, i64)>>,
+    /// Dashboard events stored in memory.
+    /// Enables testing of event logging without requiring SQLite.
+    events: RwLock<Vec<PrEvent>>,
 }
 
 impl InMemoryRepository {
@@ -52,6 +55,7 @@ impl InMemoryRepository {
         Self {
             states: RwLock::new(HashMap::new()),
             webhook_claims: RwLock::new(HashMap::new()),
+            events: RwLock::new(Vec::new()),
         }
     }
 
@@ -216,34 +220,95 @@ impl StateRepository for InMemoryRepository {
     }
 
     // =========================================================================
-    // Dashboard event logging (stub implementations for in-memory testing)
+    // Dashboard event logging
     // =========================================================================
 
-    async fn log_event(&self, _event: &PrEvent) -> Result<(), RepositoryError> {
-        // In-memory repository doesn't persist events - this is a no-op for testing
+    async fn log_event(&self, event: &PrEvent) -> Result<(), RepositoryError> {
+        let mut events = self.events.write().await;
+        // Assign a unique ID based on the current length
+        let mut event_with_id = event.clone();
+        event_with_id.id = events.len() as i64 + 1;
+        events.push(event_with_id);
         Ok(())
     }
 
     async fn get_pr_events(
         &self,
-        _pr_id: &StateMachinePrId,
-        _limit: usize,
+        pr_id: &StateMachinePrId,
+        limit: usize,
     ) -> Result<Vec<PrEvent>, RepositoryError> {
-        // In-memory repository doesn't persist events - return empty for testing
-        Ok(Vec::new())
+        let events = self.events.read().await;
+        let mut matching: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.repo_owner == pr_id.repo_owner
+                    && e.repo_name == pr_id.repo_name
+                    && e.pr_number == pr_id.pr_number
+            })
+            .cloned()
+            .collect();
+        // Sort by recorded_at descending (most recent first)
+        matching.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+        matching.truncate(limit);
+        Ok(matching)
     }
 
     async fn get_prs_with_recent_activity(
         &self,
-        _since_timestamp: i64,
+        since_timestamp: i64,
     ) -> Result<Vec<PrSummary>, RepositoryError> {
-        // In-memory repository doesn't persist events - return empty for testing
-        Ok(Vec::new())
+        let events = self.events.read().await;
+        let states = self.states.read().await;
+
+        // Group events by PR
+        let mut pr_events: HashMap<(String, String, u64), Vec<&PrEvent>> = HashMap::new();
+        for event in events.iter() {
+            let key = (
+                event.repo_owner.clone(),
+                event.repo_name.clone(),
+                event.pr_number,
+            );
+            pr_events.entry(key).or_default().push(event);
+        }
+
+        // Build summaries for PRs with recent activity
+        let mut summaries = Vec::new();
+        for ((repo_owner, repo_name, pr_number), events) in pr_events {
+            let latest_event_at = events.iter().map(|e| e.recorded_at).max().unwrap_or(0);
+            if latest_event_at < since_timestamp {
+                continue;
+            }
+
+            let pr_id = StateMachinePrId::new(&repo_owner, &repo_name, pr_number);
+            let (current_state, reviews_enabled) = match states.get(&pr_id) {
+                Some(stored) => (
+                    crate::state_machine::state::state_variant_name(&stored.state),
+                    stored.state.reviews_enabled(),
+                ),
+                None => ("Unknown".to_string(), true),
+            };
+
+            summaries.push(PrSummary {
+                repo_owner,
+                repo_name,
+                pr_number,
+                current_state,
+                latest_event_at,
+                event_count: events.len(),
+                reviews_enabled,
+            });
+        }
+
+        // Sort by latest_event_at descending
+        summaries.sort_by(|a, b| b.latest_event_at.cmp(&a.latest_event_at));
+        Ok(summaries)
     }
 
-    async fn cleanup_old_events(&self, _older_than: i64) -> Result<usize, RepositoryError> {
-        // In-memory repository doesn't persist events - nothing to clean up
-        Ok(0)
+    async fn cleanup_old_events(&self, older_than: i64) -> Result<usize, RepositoryError> {
+        let mut events = self.events.write().await;
+        let initial_len = events.len();
+        events.retain(|e| e.recorded_at >= older_than);
+        Ok(initial_len - events.len())
     }
 }
 
