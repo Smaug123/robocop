@@ -81,6 +81,14 @@ This is a GitHub webhook-based bot that provides automated code reviews using Op
 **Batch Processing:**
 The system uses OpenAI's batch API for cost-effective async processing. When new commits supersede existing ones, it automatically cancels obsolete batches using git ancestry checks.
 
+**Dashboard:**
+The server includes a built-in dashboard at `/dashboard` for monitoring PR review states and event timelines:
+- **Event Timeline**: Per-PR event log showing webhook receipts, state transitions, batch submissions/completions
+- **Master-Detail Layout**: PR list on left (35%), event timeline on right (65%)
+- **TRON Styling**: Cyan/magenta neon theme with Share Tech Mono and Orbitron fonts
+- **Authentication**: Uses `STATUS_AUTH_TOKEN` for API access; HTML page stores token in localStorage
+- **Auto-Cleanup**: Events older than 7 days are automatically purged
+
 ### Robocop CLI
 
 The Rust CLI tool (`robocop-cli`) is a standalone command-line application that uses the robocop-core library to perform code reviews.
@@ -112,7 +120,7 @@ Environment variables required:
 - `STATE_DIR`: Directory for persistent state database (default: current directory)
 - `RECORDING_ENABLED`: Enable HTTP recording (default: false)
 - `RECORDING_LOG_PATH`: Recording log file path (default: recordings.jsonl)
-- `STATUS_AUTH_TOKEN`: Bearer token for /status endpoint authentication (if not set, endpoint is disabled)
+- `STATUS_AUTH_TOKEN`: Bearer token for `/status` and `/dashboard` endpoint authentication (if not set, these endpoints are disabled)
 - `OPENAI_WEBHOOK_SECRET`: Signing secret for OpenAI webhook verification (if not set, `/openai-webhook` endpoint returns 503). Configure webhooks in the OpenAI dashboard to receive real-time batch completion notifications instead of polling.
 
 
@@ -180,6 +188,7 @@ nix develop --command cargo run -p robocop-cli -- list-models
 - **Batch Processing**: Uses OpenAI's batch API for cost-effective async processing (wraps robocop-core types)
 - **HTTP Recording**: Optional request/response logging for debugging
 - **Async Runtime**: Uses tokio for async webhook handling and polling
+- **Dashboard Module** (`robocop-server/src/dashboard/`): Event logging types, API handlers, and embedded HTML UI
 
 ### Robocop CLI
 - **Async Runtime**: Uses tokio with single-threaded runtime for async operations
