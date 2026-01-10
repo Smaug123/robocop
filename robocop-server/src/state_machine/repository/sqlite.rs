@@ -715,7 +715,7 @@ impl StateRepository for SqliteRepository {
 
             let exists: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM seen_webhook_ids WHERE webhook_id = ?1)",
+                    "SELECT EXISTS(SELECT 1 FROM seen_webhook_ids WHERE webhook_id = ?1 AND claim_state = 1)",
                     params![webhook_id],
                     |row| row.get(0),
                 )

@@ -1921,14 +1921,13 @@ mod tests {
         // This SHOULD try to update reviews_enabled and fail, returning Err.
         let result = store.get_or_init(&pr_id, false).await;
 
-        // BUG: Currently returns Ok(original_state) when write fails.
-        // CORRECT behavior: Should return Err when the update couldn't be persisted.
+        // Regression: Previously returned Ok(original_state) when write fails.
+        // This test verifies the fix: returns Err when the update couldn't be persisted.
         assert!(
             result.is_err(),
             "get_or_init MUST return Err when updating reviews_enabled fails.\n\
-             Current behavior (BUG): Returns Ok({:?}) hiding the write failure.\n\
-             This allows callers to proceed unaware that the update wasn't persisted,\n\
-             leading to reviews running when they should be suppressed.",
+             Previous behavior (fixed): Returned Ok hiding the write failure.\n\
+             Got: {:?}",
             result
         );
     }
@@ -2017,13 +2016,14 @@ mod tests {
 
     /// Regression test: get_pr_by_batch_id must return Err on repository errors.
     ///
-    /// Bug: get_pr_by_batch_id returns None on errors, making it impossible for
-    /// callers (like the OpenAI webhook handler) to distinguish between:
+    /// Previously: get_pr_by_batch_id returned None on errors, making it impossible
+    /// for callers (like the OpenAI webhook handler) to distinguish between:
     /// - "batch not found" (legitimate, e.g., CLI batch) → return 200, mark seen
     /// - "transient DB error" → return 500, DON'T mark seen, allow retry
     ///
-    /// Impact: During DB hiccups, the webhook handler marks the webhook as seen
-    /// and returns 200, so OpenAI won't retry and the batch completion is lost.
+    /// Impact of the old bug: During DB hiccups, the webhook handler marked the
+    /// webhook as seen and returned 200, so OpenAI wouldn't retry and the batch
+    /// completion was lost.
     #[tokio::test]
     async fn test_get_pr_by_batch_id_must_return_err_on_repository_error() {
         let repo = Arc::new(TrackingRepository::new());
@@ -2064,7 +2064,7 @@ mod tests {
         assert!(
             result.is_err(),
             "get_pr_by_batch_id MUST return Err on repository errors.\n\
-             Current behavior (BUG): Returns Ok(None), making it impossible for\n\
+             Previous behavior (fixed): Returned Ok(None), making it impossible for\n\
              callers to distinguish 'not found' from 'transient error'.\n\
              Got: {:?}",
             result
