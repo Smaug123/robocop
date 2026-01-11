@@ -234,6 +234,36 @@ struct BatchOutputResponse {
 #[derive(Debug, serde::Deserialize)]
 struct ResponsesApiBody {
     output: Vec<ResponsesApiOutput>,
+    /// Response status - can be "completed" or "incomplete"
+    #[serde(default)]
+    status: Option<String>,
+    /// Details about why the response is incomplete
+    #[serde(default)]
+    incomplete_details: Option<IncompleteDetails>,
+    /// Token usage information
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+/// Details about why a response is incomplete
+#[derive(Debug, serde::Deserialize)]
+struct IncompleteDetails {
+    reason: String,
+}
+
+/// Token usage information from the response
+#[derive(Debug, serde::Deserialize)]
+struct UsageInfo {
+    output_tokens: u64,
+    #[serde(default)]
+    output_tokens_details: Option<OutputTokensDetails>,
+}
+
+/// Breakdown of output token usage
+#[derive(Debug, serde::Deserialize)]
+struct OutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 /// Output item from responses API
@@ -255,6 +285,54 @@ struct ResponsesApiContent {
     text: Option<String>,
 }
 
+/// Build a descriptive error message for incomplete responses.
+///
+/// When using reasoning models with high reasoning effort, the model can exhaust
+/// its entire output token budget on internal reasoning, leaving no tokens for
+/// the actual response text.
+fn build_incomplete_response_error(body: &ResponsesApiBody) -> anyhow::Error {
+    let reason = body.incomplete_details.as_ref().map(|d| d.reason.as_str());
+
+    match reason {
+        Some("max_output_tokens") => {
+            // For max_output_tokens, provide detailed breakdown if available
+            let detail = body
+                .usage
+                .as_ref()
+                .map(|usage| {
+                    let reasoning_tokens = usage
+                        .output_tokens_details
+                        .as_ref()
+                        .map(|d| d.reasoning_tokens)
+                        .unwrap_or(0);
+
+                    if reasoning_tokens > 0 && reasoning_tokens == usage.output_tokens {
+                        format!(
+                            "all {} output tokens were used for reasoning, leaving none for the actual response",
+                            usage.output_tokens
+                        )
+                    } else if reasoning_tokens > 0 {
+                        format!(
+                            "{} output tokens used, {} for reasoning",
+                            usage.output_tokens, reasoning_tokens
+                        )
+                    } else {
+                        format!("{} output tokens used", usage.output_tokens)
+                    }
+                })
+                .unwrap_or_else(|| "no usage details available".to_string());
+
+            anyhow::anyhow!("Response incomplete: max_output_tokens ({})", detail)
+        }
+        Some(other_reason) => {
+            anyhow::anyhow!("Response incomplete: {}", other_reason)
+        }
+        None => {
+            anyhow::anyhow!("Response incomplete: unknown reason")
+        }
+    }
+}
+
 fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
     // Parse the JSONL - should be exactly one line
     let line = jsonl_content.lines().next().context("Empty batch output")?;
@@ -273,6 +351,13 @@ fn parse_batch_output(jsonl_content: &str) -> Result<ReviewResult> {
             "Non-200 status code: {}",
             batch_output.response.status_code
         ));
+    }
+
+    // Check if response is incomplete (e.g., model exhausted output tokens on reasoning)
+    if let Some(status) = &batch_output.response.body.status {
+        if status == "incomplete" {
+            return Err(build_incomplete_response_error(&batch_output.response.body));
+        }
     }
 
     // Extract content from responses API format
@@ -338,5 +423,42 @@ mod tests {
         let jsonl = r#"{"response":{"status_code":500,"body":{"output":[]}},"error":null}"#;
         let result = parse_batch_output(jsonl);
         assert!(result.is_err());
+    }
+
+    /// Test that we correctly detect and report incomplete responses.
+    ///
+    /// This is a real response from gpt-5.2 with xhigh reasoning effort where the model
+    /// exhausted all 4694 output tokens on reasoning, leaving none for the actual response.
+    /// The batch completed successfully (HTTP 200) but the response body has status "incomplete".
+    #[test]
+    fn test_parse_batch_output_incomplete_max_output_tokens() {
+        // Real response from batch_6962e2fbac6081909605d75f054b117d - the model used all
+        // output tokens for reasoning and produced no text output.
+        let jsonl = r#"{"id":"batch_req_69638c579748819088e1c95d406575b6","custom_id":"robocop-review-1","response":{"status_code":200,"request_id":"d8687857687a6ea22cceb3f6295bb38a","body":{"id":"resp_07f2ad82c0afb75f0069638c1e4f50819f8d8193783a6adbec","object":"response","created_at":1768131614,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"id":"rs_07f2ad82c0afb75f0069638c1eb9ac819fb88514e99d093598","type":"reasoning","summary":[]}],"usage":{"input_tokens":22390,"input_tokens_details":{"cached_tokens":22272},"output_tokens":4694,"output_tokens_details":{"reasoning_tokens":4694},"total_tokens":27084}}},"error":null}"#;
+
+        let result = parse_batch_output(jsonl);
+        assert!(result.is_err());
+
+        let error_message = result.unwrap_err().to_string();
+        assert!(
+            error_message.contains("incomplete"),
+            "Error should mention 'incomplete': {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("max_output_tokens"),
+            "Error should mention 'max_output_tokens': {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("4694"),
+            "Error should mention the token count: {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("reasoning"),
+            "Error should mention that tokens were used for reasoning: {}",
+            error_message
+        );
     }
 }
