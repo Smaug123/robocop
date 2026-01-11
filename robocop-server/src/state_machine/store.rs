@@ -423,13 +423,18 @@ impl StateStore {
     // Webhook replay protection
     // =========================================================================
 
-    /// Check if a webhook ID has been seen recently.
+    /// Check if a webhook ID was successfully processed (completed).
     ///
-    /// Used by the webhook middleware to prevent replay attacks where an
-    /// attacker captures a valid webhook and replays it within the timestamp
-    /// tolerance window.
+    /// This checks specifically for *completed* claims, not in-progress ones.
+    /// Returns `true` only if the webhook was successfully processed and
+    /// `complete_webhook_claim` was called.
     ///
-    /// Returns `true` if the webhook ID has been seen (i.e., it's a replay).
+    /// **Important:** This method is NOT suitable for deduplication at request start.
+    /// For idempotent webhook handling, use `try_claim_webhook_id` instead, which
+    /// atomically claims the webhook and distinguishes between Claimed, InProgress,
+    /// and Completed states.
+    ///
+    /// Returns `true` if the webhook was successfully completed.
     /// On repository errors, returns `false` to fail open (allowing the webhook)
     /// rather than blocking legitimate traffic.
     pub async fn is_webhook_seen(&self, webhook_id: &str) -> bool {

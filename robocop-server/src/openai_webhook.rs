@@ -733,7 +733,8 @@ mod tests {
     /// Test that concurrent webhook claims are properly serialized.
     ///
     /// Property: When multiple concurrent callers try to claim the same webhook ID,
-    /// exactly one succeeds (returns true) and all others fail (return false).
+    /// exactly one succeeds (returns `Claimed`) and all others get `InProgress`
+    /// or `Completed`.
     ///
     /// This is a regression test for the race condition where the non-atomic
     /// is_webhook_seen + record_webhook_id pattern allowed concurrent requests
