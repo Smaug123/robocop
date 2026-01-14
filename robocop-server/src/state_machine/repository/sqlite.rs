@@ -32,7 +32,7 @@ use crate::state_machine::store::StateMachinePrId;
 
 /// Current schema version. Increment this when making schema changes and add
 /// corresponding migration logic in `run_migrations()`.
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 /// TTL for stale InProgress claims (30 minutes).
 ///
@@ -315,6 +315,40 @@ impl SqliteRepository {
                 "#,
             )
             .map_err(|e| RepositoryError::storage("migration v5", e.to_string()))?;
+        }
+
+        // Migration from version 5 to version 6: Make event_data NOT NULL.
+        // The log_event function always writes JSON, so NULL values should never exist.
+        // SQLite requires table recreation to add NOT NULL constraint.
+        if from_version < 6 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE pr_events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo_owner TEXT NOT NULL,
+                    repo_name TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_data TEXT NOT NULL,
+                    recorded_at INTEGER NOT NULL
+                );
+
+                INSERT INTO pr_events_new (id, repo_owner, repo_name, pr_number, event_type, event_data, recorded_at)
+                SELECT id, repo_owner, repo_name, pr_number, event_type, event_data, recorded_at
+                FROM pr_events
+                WHERE event_data IS NOT NULL;
+
+                DROP TABLE pr_events;
+
+                ALTER TABLE pr_events_new RENAME TO pr_events;
+
+                CREATE INDEX IF NOT EXISTS idx_pr_events_lookup
+                    ON pr_events(repo_owner, repo_name, pr_number, recorded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_pr_events_recent
+                    ON pr_events(recorded_at DESC);
+                "#,
+            )
+            .map_err(|e| RepositoryError::storage("migration v6", e.to_string()))?;
         }
 
         // Update schema version
