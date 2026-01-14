@@ -462,7 +462,6 @@ fn extract_final_text(data: &str) -> Result<String> {
 struct StreamState {
     response_id: Option<String>,
     last_sequence: Option<u64>,
-    final_result: Option<String>,
 }
 
 /// Result of processing an SSE stream
@@ -502,12 +501,11 @@ async fn process_sse_stream(response: reqwest::Response, state: &mut StreamState
                 }
             };
 
-            // Track sequence number for resumption
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(seq) = parsed.get("sequence_number").and_then(|s| s.as_u64()) {
-                    state.last_sequence = Some(seq);
-                }
-            }
+            // Extract sequence number but don't commit until after successful processing.
+            // This ensures we can retry an event if processing fails.
+            let event_sequence = serde_json::from_str::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|parsed| parsed.get("sequence_number").and_then(|s| s.as_u64()));
 
             match event_type.as_str() {
                 "response.created" => {
@@ -515,10 +513,18 @@ async fn process_sse_stream(response: reqwest::Response, state: &mut StreamState
                         state.response_id = Some(id.clone());
                         eprintln!("Response ID: {}", id);
                     }
+                    if let Some(seq) = event_sequence {
+                        state.last_sequence = Some(seq);
+                    }
                 }
                 "response.completed" => match extract_final_text(&data) {
-                    Ok(text) => state.final_result = Some(text),
+                    Ok(text) => {
+                        // Return immediately - we have the final result, no need to
+                        // continue reading the stream and risk spurious errors.
+                        return StreamResult::Completed(text);
+                    }
                     Err(e) => {
+                        // Don't update sequence - we want to retry this event
                         return StreamResult::Interrupted {
                             error: e.context("Failed to extract final text"),
                         };
@@ -532,7 +538,11 @@ async fn process_sse_stream(response: reqwest::Response, state: &mut StreamState
                     let error_info = extract_error_info(&data);
                     return StreamResult::Failed(error_info);
                 }
-                _ => {}
+                _ => {
+                    if let Some(seq) = event_sequence {
+                        state.last_sequence = Some(seq);
+                    }
+                }
             }
         }
     }
@@ -546,12 +556,9 @@ async fn process_sse_stream(response: reqwest::Response, state: &mut StreamState
         );
     }
 
-    if let Some(result) = state.final_result.take() {
-        StreamResult::Completed(result)
-    } else {
-        StreamResult::Interrupted {
-            error: anyhow!("Stream ended without response.completed event"),
-        }
+    // If we reach here, the stream ended without a response.completed event
+    StreamResult::Interrupted {
+        error: anyhow!("Stream ended without response.completed event"),
     }
 }
 
@@ -653,7 +660,6 @@ async fn process_response(
     let mut state = StreamState {
         response_id: None,
         last_sequence: None,
-        final_result: None,
     };
 
     // Process initial stream
