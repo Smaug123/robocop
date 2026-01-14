@@ -1,13 +1,10 @@
 //! Repository abstraction for state machine persistence.
 //!
 //! This module defines the `StateRepository` trait that abstracts
-//! storage operations for PR review states. Implementations can
-//! provide different backends (in-memory, SQLite, etc.).
+//! storage operations for PR review states.
 
-mod memory;
 mod sqlite;
 
-pub use memory::InMemoryRepository;
 pub use sqlite::SqliteRepository;
 
 // Re-export dashboard types for convenience
@@ -250,14 +247,22 @@ pub trait StateRepository: Send + Sync {
     // Webhook replay protection
     // =========================================================================
 
-    /// Check if a webhook ID has been seen recently.
+    /// Check if a webhook ID was successfully processed (completed).
     ///
-    /// Used to prevent replay attacks where an attacker captures a valid
-    /// webhook and replays it within the timestamp tolerance window.
+    /// This checks specifically for *completed* claims, not in-progress ones.
+    /// A webhook is considered "seen" only after it has been successfully processed
+    /// and `complete_webhook_claim` has been called.
+    ///
+    /// **Important:** This method is NOT suitable for deduplication at request start.
+    /// For idempotent webhook handling, use `try_claim_webhook_id` instead, which
+    /// atomically claims the webhook and distinguishes between:
+    /// - First claim (proceed to process)
+    /// - In-progress (another request is processing - return retryable error)
+    /// - Completed (already processed - return success without reprocessing)
     ///
     /// Returns:
-    /// - `Ok(true)` if the webhook ID has been seen within the TTL window
-    /// - `Ok(false)` if the webhook ID has not been seen (or has expired)
+    /// - `Ok(true)` if the webhook was successfully completed
+    /// - `Ok(false)` if the webhook is unknown, in-progress, or expired
     /// - `Err(RepositoryError)` if storage operation failed
     async fn is_webhook_seen(&self, webhook_id: &str) -> Result<bool, RepositoryError>;
 

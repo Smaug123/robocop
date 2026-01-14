@@ -642,89 +642,127 @@ mod tests {
     // Webhook replay protection tests
     // =========================================================================
 
-    /// Test that duplicate webhook IDs are rejected (replay protection).
+    /// Test that successfully processed webhooks are not reprocessed (replay protection).
     ///
-    /// This test verifies that a captured webhook cannot be replayed within
-    /// the 5-minute timestamp window.
+    /// This test verifies that the claim-based deduplication flow works correctly:
+    /// 1. First `try_claim_webhook_id` returns `Claimed` (we own processing)
+    /// 2. After `complete_webhook_claim`, the webhook is marked as done
+    /// 3. Subsequent `try_claim_webhook_id` returns `Completed` (skip reprocessing)
+    ///
+    /// This mirrors the production flow in `verify_openai_webhook_signature` middleware:
+    /// - Middleware calls `try_claim_webhook_id` before passing to handler
+    /// - Handler calls `complete_webhook_claim` on success
+    /// - Future requests see `Completed` and return 200 without reprocessing
     ///
     /// Regression test for: webhook-id is parsed but never stored/deduped
     #[tokio::test]
-    async fn test_duplicate_webhook_id_rejected() {
-        use crate::state_machine::repository::InMemoryRepository;
+    async fn test_completed_webhook_not_reprocessed() {
+        use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
         use std::sync::Arc;
 
         // Create a repository with webhook dedup support
-        let repo = Arc::new(InMemoryRepository::new());
+        let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
         let state_store = StateStore::with_repository(repo.clone());
 
         let webhook_id = "msg_test123";
 
-        // First request should succeed (not seen before)
-        let first_seen = state_store.is_webhook_seen(webhook_id).await;
-        assert!(
-            !first_seen,
-            "First request for webhook ID should not be seen"
+        // First claim should succeed
+        let first_claim = state_store.try_claim_webhook_id(webhook_id).await;
+        assert_eq!(
+            first_claim,
+            WebhookClaimResult::Claimed,
+            "First claim should return Claimed"
         );
 
-        // Record the webhook ID
-        state_store.record_webhook_id(webhook_id).await.unwrap();
+        // Mark as successfully completed (this is what the handler does on success)
+        state_store.complete_webhook_claim(webhook_id).await;
 
-        // Second request with same webhook ID should be detected as duplicate
-        let second_seen = state_store.is_webhook_seen(webhook_id).await;
+        // Subsequent claim should return Completed (not Claimed or InProgress)
+        let second_claim = state_store.try_claim_webhook_id(webhook_id).await;
+        assert_eq!(
+            second_claim,
+            WebhookClaimResult::Completed,
+            "After completion, subsequent claims should return Completed"
+        );
+
+        // Verify is_webhook_seen also returns true (for completeness)
+        let is_seen = state_store.is_webhook_seen(webhook_id).await;
         assert!(
-            second_seen,
-            "Second request with same webhook ID should be detected as duplicate"
+            is_seen,
+            "Completed webhook should be seen by is_webhook_seen"
         );
     }
 
-    /// Test that webhook IDs expire after the tolerance window.
+    /// Test that webhook IDs expire after cleanup with TTL.
     ///
-    /// Property: After TIMESTAMP_TOLERANCE_SECONDS, the same webhook ID
-    /// should be accepted again (though in practice a valid signature would
-    /// fail the timestamp check anyway).
+    /// Property: After `cleanup_expired_webhooks` removes old entries,
+    /// the webhook ID should no longer be seen.
     #[tokio::test]
-    async fn test_webhook_id_expires_after_tolerance() {
-        use crate::state_machine::repository::InMemoryRepository;
+    async fn test_webhook_id_expires_after_cleanup() {
+        use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
+        use rusqlite::params;
         use std::sync::Arc;
 
-        let repo = Arc::new(InMemoryRepository::new());
+        let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
         let state_store = StateStore::with_repository(repo.clone());
 
         let webhook_id = "msg_expire_test";
 
-        // Record the webhook ID
+        // Record the webhook ID (marks as completed)
         state_store.record_webhook_id(webhook_id).await.unwrap();
-
-        // Should be seen immediately after recording
         assert!(
             state_store.is_webhook_seen(webhook_id).await,
             "Webhook ID should be seen immediately after recording"
         );
 
-        // Note: We can't easily test time-based expiry in a unit test without
-        // injecting a clock. The important property is that the dedup store
-        // cleans up expired entries. This test verifies the basic functionality;
-        // SQLite-based tests verify TTL cleanup via direct DB inspection.
+        // Make it old by manipulating the DB timestamp
+        {
+            let conn = repo.conn.lock().unwrap();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Set timestamp to well past the tolerance window
+            let old_timestamp = now_secs - (TIMESTAMP_TOLERANCE_SECONDS + 60);
+            conn.execute(
+                "UPDATE seen_webhook_ids SET recorded_at = ?1 WHERE webhook_id = ?2",
+                params![old_timestamp, webhook_id],
+            )
+            .unwrap();
+        }
+
+        // Cleanup with TTL matching timestamp tolerance
+        let cleaned = state_store
+            .cleanup_expired_webhooks(TIMESTAMP_TOLERANCE_SECONDS)
+            .await;
+        assert!(cleaned > 0, "Should have cleaned up expired webhook");
+
+        // Should no longer be seen
+        assert!(
+            !state_store.is_webhook_seen(webhook_id).await,
+            "Webhook should be gone after cleanup"
+        );
     }
 
     /// Test that concurrent webhook claims are properly serialized.
     ///
     /// Property: When multiple concurrent callers try to claim the same webhook ID,
-    /// exactly one succeeds (returns true) and all others fail (return false).
+    /// exactly one succeeds (returns `Claimed`) and all others get `InProgress`
+    /// or `Completed`.
     ///
     /// This is a regression test for the race condition where the non-atomic
     /// is_webhook_seen + record_webhook_id pattern allowed concurrent requests
     /// to both pass the check before either recorded.
     #[tokio::test]
     async fn test_concurrent_webhook_claims_only_one_succeeds() {
-        use crate::state_machine::repository::InMemoryRepository;
+        use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let repo = Arc::new(InMemoryRepository::new());
+        let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
         let state_store = Arc::new(StateStore::with_repository(repo));
 
         let webhook_id = "msg_concurrent_test";
@@ -780,6 +818,11 @@ mod tests {
         ///
         /// The original bug violated this: webhook IDs were marked "seen" before
         /// processing, so failures left them marked, blocking retries.
+        ///
+        /// This test models the actual handler flow:
+        /// 1. try_claim_webhook_id() → Claimed/InProgress/Completed
+        /// 2. If Claimed + success → complete_webhook_claim()
+        /// 3. If Claimed + failure → release_webhook_claim()
         #[test]
         fn webhook_seen_iff_successfully_processed(
             webhook_id in arb_webhook_id(),
@@ -787,32 +830,41 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                use crate::state_machine::repository::InMemoryRepository;
+                use crate::state_machine::repository::{SqliteRepository, WebhookClaimResult};
                 use crate::state_machine::store::StateStore;
                 use std::sync::Arc;
 
-                let repo = Arc::new(InMemoryRepository::new());
+                let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
                 let state_store = StateStore::with_repository(repo);
 
                 let mut any_success = false;
 
-                // Simulate a sequence of processing attempts
+                // Simulate a sequence of processing attempts using the claim-based flow
                 for success in &outcomes {
-                    // Check current state before processing
-                    let was_seen_before = state_store.is_webhook_seen(&webhook_id).await;
+                    // This is what the handler middleware does
+                    let claim_result = state_store.try_claim_webhook_id(&webhook_id).await;
 
-                    if was_seen_before {
-                        // If already seen, we would reject - no state change
-                        continue;
+                    match claim_result {
+                        WebhookClaimResult::Claimed => {
+                            // We claimed it, now process
+                            if *success {
+                                // Success: mark as completed (this is what the handler does)
+                                state_store.complete_webhook_claim(&webhook_id).await;
+                                any_success = true;
+                            } else {
+                                // Failure: release the claim to allow retry
+                                state_store.release_webhook_claim(&webhook_id).await;
+                            }
+                        }
+                        WebhookClaimResult::InProgress => {
+                            // Another request is processing - handler returns 409
+                            // No state change
+                        }
+                        WebhookClaimResult::Completed => {
+                            // Already completed - handler returns 200
+                            // No state change
+                        }
                     }
-
-                    // Simulate processing attempt
-                    if *success {
-                        // Success: mark as seen (this is what the handler does)
-                        state_store.record_webhook_id(&webhook_id).await.unwrap();
-                        any_success = true;
-                    }
-                    // Failure: don't mark as seen (retry should work)
                 }
 
                 // Verify the invariant
@@ -830,6 +882,10 @@ mod tests {
         ///
         /// If a webhook fails N times and then succeeds, the final state should
         /// be "seen". This tests the retry path that the original bug broke.
+        ///
+        /// This test models the actual handler flow:
+        /// - Failed attempt: try_claim → Claimed → release_webhook_claim
+        /// - Successful attempt: try_claim → Claimed → complete_webhook_claim
         #[test]
         fn failed_attempts_allow_retry(
             webhook_id in arb_webhook_id(),
@@ -837,23 +893,42 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                use crate::state_machine::repository::InMemoryRepository;
+                use crate::state_machine::repository::{SqliteRepository, WebhookClaimResult};
                 use crate::state_machine::store::StateStore;
                 use std::sync::Arc;
 
-                let repo = Arc::new(InMemoryRepository::new());
+                let repo = Arc::new(SqliteRepository::new_in_memory().unwrap());
                 let state_store = StateStore::with_repository(repo);
 
-                // Simulate N failed attempts (don't mark as seen)
-                for _ in 0..num_failures {
+                // Simulate N failed attempts using the claim-based flow
+                for i in 0..num_failures {
+                    // Claim the webhook (simulating handler middleware)
+                    let claim_result = state_store.try_claim_webhook_id(&webhook_id).await;
+                    assert_eq!(
+                        claim_result,
+                        WebhookClaimResult::Claimed,
+                        "Attempt {} should successfully claim",
+                        i
+                    );
+
                     // Each failure should NOT mark the webhook as seen
                     let seen = state_store.is_webhook_seen(&webhook_id).await;
                     assert!(
                         !seen,
-                        "Webhook should not be seen after {} failures",
-                        num_failures
+                        "Webhook should not be seen while in-progress (attempt {})",
+                        i
                     );
-                    // On failure, we don't call record_webhook_id
+
+                    // Simulate failure: release the claim to allow retry
+                    state_store.release_webhook_claim(&webhook_id).await;
+
+                    // After release, still not seen (allows retry)
+                    let seen_after_release = state_store.is_webhook_seen(&webhook_id).await;
+                    assert!(
+                        !seen_after_release,
+                        "Webhook should not be seen after release (attempt {})",
+                        i
+                    );
                 }
 
                 // Now simulate a successful attempt
@@ -863,14 +938,31 @@ mod tests {
                     "Webhook should not be seen before successful processing"
                 );
 
-                // Success! Mark as seen
-                state_store.record_webhook_id(&webhook_id).await.unwrap();
+                // Claim for the successful attempt
+                let claim_result = state_store.try_claim_webhook_id(&webhook_id).await;
+                assert_eq!(
+                    claim_result,
+                    WebhookClaimResult::Claimed,
+                    "Should be able to claim for successful attempt after {} failures",
+                    num_failures
+                );
+
+                // Success: complete the claim
+                state_store.complete_webhook_claim(&webhook_id).await;
 
                 // Now it should be seen
                 let seen_after_success = state_store.is_webhook_seen(&webhook_id).await;
                 assert!(
                     seen_after_success,
                     "Webhook should be seen after successful processing"
+                );
+
+                // Verify we can't claim again (already completed)
+                let final_claim = state_store.try_claim_webhook_id(&webhook_id).await;
+                assert_eq!(
+                    final_claim,
+                    WebhookClaimResult::Completed,
+                    "Should return Completed for already-processed webhook"
                 );
             });
         }
