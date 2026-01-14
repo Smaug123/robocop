@@ -83,6 +83,10 @@ struct PollArgs {
     /// OpenAI API key (if not provided, will use OPENAI_API_KEY environment variable)
     #[arg(long)]
     api_key: Option<String>,
+
+    /// Print full event data for each SSE event
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -774,6 +778,11 @@ async fn run_poll(client: &reqwest::Client, args: PollArgs) -> Result<()> {
                 if let Some(seq) = parsed.get("sequence_number").and_then(|s| s.as_u64()) {
                     last_sequence = Some(seq);
                     eprintln!("Sequence: {} ({})", seq, event_type);
+                    if args.debug {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&parsed) {
+                            eprintln!("{}", pretty);
+                        }
+                    }
                 }
             }
 
