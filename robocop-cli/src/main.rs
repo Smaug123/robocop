@@ -462,7 +462,148 @@ fn extract_final_text(data: &str) -> Result<String> {
         .map(|s| s.to_string())
 }
 
-/// Process request using the responses API with streaming
+/// State tracked during SSE streaming
+struct StreamState {
+    response_id: Option<String>,
+    last_sequence: Option<u64>,
+}
+
+/// Result of processing an SSE stream
+enum StreamResult {
+    /// Stream completed successfully with final text
+    Completed(String),
+    /// Stream failed with an API error (not retryable)
+    Failed(String),
+    /// Stream was interrupted (retryable if we have response_id)
+    Interrupted { error: anyhow::Error },
+}
+
+/// Process an SSE stream, updating state and returning the result
+async fn process_sse_stream(response: reqwest::Response, state: &mut StreamState) -> StreamResult {
+    let mut stream = response.bytes_stream();
+    let mut sse = SseProcessor::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                return StreamResult::Interrupted {
+                    error: anyhow::Error::from(e).context("Failed to read chunk from stream"),
+                };
+            }
+        };
+        sse.push(&chunk);
+
+        // Process all complete events in the buffer
+        while let Some(event_result) = sse.next_event() {
+            let (event_type, data) = match event_result {
+                Ok(e) => e,
+                Err(e) => {
+                    return StreamResult::Interrupted {
+                        error: e.context("Failed to parse SSE event"),
+                    };
+                }
+            };
+
+            // Extract sequence number but don't commit until after successful processing.
+            // This ensures we can retry an event if processing fails.
+            let event_sequence = serde_json::from_str::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|parsed| parsed.get("sequence_number").and_then(|s| s.as_u64()));
+
+            match event_type.as_str() {
+                "response.created" => {
+                    if let Some(id) = extract_response_id(&data) {
+                        state.response_id = Some(id.clone());
+                        eprintln!("Response ID: {}", id);
+                    }
+                    if let Some(seq) = event_sequence {
+                        state.last_sequence = Some(seq);
+                    }
+                }
+                "response.completed" => match extract_final_text(&data) {
+                    Ok(text) => {
+                        // Return immediately - we have the final result, no need to
+                        // continue reading the stream and risk spurious errors.
+                        return StreamResult::Completed(text);
+                    }
+                    Err(e) => {
+                        // Don't update sequence - we want to retry this event
+                        return StreamResult::Interrupted {
+                            error: e.context("Failed to extract final text"),
+                        };
+                    }
+                },
+                "response.failed" => {
+                    let error_info = extract_error_info(&data);
+                    return StreamResult::Failed(error_info);
+                }
+                "error" => {
+                    let error_info = extract_error_info(&data);
+                    return StreamResult::Failed(error_info);
+                }
+                _ => {
+                    if let Some(seq) = event_sequence {
+                        state.last_sequence = Some(seq);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for incomplete data in buffer
+    if sse.has_remaining() {
+        let remaining = sse.remaining_as_string();
+        eprintln!(
+            "Warning: stream ended with unparsed data: {}",
+            remaining.chars().take(100).collect::<String>()
+        );
+    }
+
+    // If we reach here, the stream ended without a response.completed event
+    StreamResult::Interrupted {
+        error: anyhow!("Stream ended without response.completed event"),
+    }
+}
+
+/// Poll a stored response by ID, optionally resuming from a sequence number
+async fn poll_response(
+    client: &reqwest::Client,
+    api_key: &str,
+    response_id: &str,
+    starting_after: Option<u64>,
+) -> Result<reqwest::Response> {
+    let mut url = format!(
+        "https://api.openai.com/v1/responses/{}?stream=true",
+        response_id
+    );
+    if let Some(seq) = starting_after {
+        url.push_str(&format!("&starting_after={}", seq));
+    }
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .context("Failed to send poll request to OpenAI")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .context("Failed to read error response")?;
+        return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
+    }
+
+    Ok(response)
+}
+
+const MAX_STREAM_RETRIES: u32 = 3;
+const RETRY_DELAY_MS: u64 = 1000;
+
+/// Process request using the responses API with streaming and automatic retry
 async fn process_response(
     client: &reqwest::Client,
     api_key: &str,
@@ -520,63 +661,56 @@ async fn process_response(
         return Err(anyhow!("OpenAI API error: {} - {}", status, error_text));
     }
 
-    // Stream the response and parse SSE events
-    let mut stream = response.bytes_stream();
-    let mut sse = SseProcessor::new();
-    let mut final_result: Option<String> = None;
-    let mut response_id: Option<String> = None;
+    let mut state = StreamState {
+        response_id: None,
+        last_sequence: None,
+    };
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Failed to read chunk from stream")?;
-        sse.push(&chunk);
+    // Process initial stream
+    let mut result = process_sse_stream(response, &mut state).await;
 
-        // Process all complete events in the buffer
-        while let Some(event_result) = sse.next_event() {
-            let (event_type, data) = event_result?;
-
-            match event_type.as_str() {
-                "response.created" => {
-                    if let Some(id) = extract_response_id(&data) {
-                        response_id = Some(id.clone());
-                        eprintln!("Response ID: {}", id);
-                    }
-                }
-                "response.completed" => {
-                    final_result = Some(extract_final_text(&data)?);
-                }
-                "response.failed" => {
-                    let error_info = extract_error_info(&data);
-                    return Err(anyhow!("Response failed: {}", error_info));
-                }
-                "error" => {
-                    let error_info = extract_error_info(&data);
-                    return Err(anyhow!("Stream error: {}", error_info));
-                }
-                _ => {}
+    // Retry loop for interrupted streams
+    let mut retries = 0;
+    while let StreamResult::Interrupted { error } = result {
+        if let Some(ref response_id) = state.response_id {
+            if retries >= MAX_STREAM_RETRIES {
+                return Err(error.context(format!(
+                    "Stream interrupted after {} retries. Response ID: {}",
+                    retries, response_id
+                )));
             }
+
+            retries += 1;
+            eprintln!(
+                "Stream interrupted (attempt {}/{}), retrying: {}",
+                retries, MAX_STREAM_RETRIES, error
+            );
+
+            // Brief delay before retry
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+
+            // Poll the stored response, resuming from last sequence if available
+            match poll_response(client, api_key, response_id, state.last_sequence).await {
+                Ok(response) => {
+                    result = process_sse_stream(response, &mut state).await;
+                }
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "Failed to resume stream. Response ID: {}",
+                        response_id
+                    )));
+                }
+            }
+        } else {
+            // No response ID means we can't retry
+            return Err(error.context("Stream interrupted before receiving response ID"));
         }
     }
 
-    // Check for incomplete data in buffer
-    if sse.has_remaining() {
-        let remaining = sse.remaining_as_string();
-        eprintln!(
-            "Warning: stream ended with unparsed data: {}",
-            remaining.chars().take(100).collect::<String>()
-        );
-    }
-
-    match final_result {
-        Some(result) => Ok(result),
-        None => {
-            let id_info = response_id
-                .map(|id| format!(" (Response ID: {})", id))
-                .unwrap_or_default();
-            Err(anyhow!(
-                "Stream ended without response.completed event{}",
-                id_info
-            ))
-        }
+    match result {
+        StreamResult::Completed(text) => Ok(text),
+        StreamResult::Failed(error_info) => Err(anyhow!("Response failed: {}", error_info)),
+        StreamResult::Interrupted { .. } => unreachable!("handled in retry loop"),
     }
 }
 
