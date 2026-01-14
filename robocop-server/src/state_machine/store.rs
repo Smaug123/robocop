@@ -12,9 +12,9 @@ use tracing::info;
 
 use super::event::Event;
 use super::interpreter::{execute_effects, InterpreterContext};
-use super::repository::{
-    InMemoryRepository, RepositoryError, StateRepository, StoredState, WebhookClaimResult,
-};
+#[cfg(test)]
+use super::repository::SqliteRepository;
+use super::repository::{RepositoryError, StateRepository, StoredState, WebhookClaimResult};
 use super::state::{CommitSha, ReviewMachineState, ReviewOptions};
 use super::transition::{transition, TransitionResult};
 use crate::github::GitHubClient;
@@ -49,8 +49,7 @@ impl StateMachinePrId {
 /// concurrent events (webhooks, commands, batch completions) target the same PR.
 /// All state-modifying operations acquire a per-PR lock before proceeding.
 ///
-/// The actual state storage is delegated to a `StateRepository` implementation,
-/// allowing different backends (in-memory, SQLite, etc.).
+/// The actual state storage is delegated to a `StateRepository` implementation.
 pub struct StateStore {
     /// Repository for persisting PR states.
     repository: Arc<dyn StateRepository>,
@@ -62,16 +61,19 @@ pub struct StateStore {
     pr_locks: RwLock<HashMap<StateMachinePrId, Arc<Mutex<()>>>>,
 }
 
-impl Default for StateStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl StateStore {
-    /// Create a new StateStore with the default in-memory repository.
-    pub fn new() -> Self {
-        Self::with_repository(Arc::new(InMemoryRepository::new()))
+    /// Create a new StateStore with an in-memory SQLite repository for testing.
+    ///
+    /// This creates an ephemeral in-memory database that does not persist
+    /// across restarts. Use only in tests.
+    ///
+    /// Production code should use `with_repository` with a file-backed
+    /// `SqliteRepository` for durability.
+    #[cfg(test)]
+    pub fn new_for_testing() -> Self {
+        Self::with_repository(Arc::new(
+            SqliteRepository::new_in_memory().expect("Failed to create in-memory SQLite database"),
+        ))
     }
 
     /// Create a new StateStore with a custom repository.
@@ -421,13 +423,18 @@ impl StateStore {
     // Webhook replay protection
     // =========================================================================
 
-    /// Check if a webhook ID has been seen recently.
+    /// Check if a webhook ID was successfully processed (completed).
     ///
-    /// Used by the webhook middleware to prevent replay attacks where an
-    /// attacker captures a valid webhook and replays it within the timestamp
-    /// tolerance window.
+    /// This checks specifically for *completed* claims, not in-progress ones.
+    /// Returns `true` only if the webhook was successfully processed and
+    /// `complete_webhook_claim` was called.
     ///
-    /// Returns `true` if the webhook ID has been seen (i.e., it's a replay).
+    /// **Important:** This method is NOT suitable for deduplication at request start.
+    /// For idempotent webhook handling, use `try_claim_webhook_id` instead, which
+    /// atomically claims the webhook and distinguishes between Claimed, InProgress,
+    /// and Completed states.
+    ///
+    /// Returns `true` if the webhook was successfully completed.
     /// On repository errors, returns `false` to fail open (allowing the webhook)
     /// rather than blocking legitimate traffic.
     pub async fn is_webhook_seen(&self, webhook_id: &str) -> bool {
@@ -442,14 +449,18 @@ impl StateStore {
         }
     }
 
-    /// Record a webhook ID to prevent replay attacks.
+    /// Record a webhook ID as completed to prevent replay attacks.
     ///
-    /// Should be called after successful webhook validation but before
-    /// processing the webhook payload.
+    /// This immediately marks the webhook as completed (processed successfully).
+    /// Use this only after processing succeeds, or for flows that don't need
+    /// retry support.
+    ///
+    /// For processing with retry support, use the claim-based flow instead:
+    /// 1. `try_claim_webhook_id` - atomically claim before processing
+    /// 2. `complete_webhook_claim` - mark as completed on success
+    /// 3. `release_webhook_claim` - release on failure to allow retries
     ///
     /// Returns `Ok(())` on success, `Err` on storage failure.
-    /// On storage failure, the caller should log but continue processing
-    /// (fail open) since the webhook was already validated.
     pub async fn record_webhook_id(&self, webhook_id: &str) -> Result<(), RepositoryError> {
         self.repository.record_webhook_id(webhook_id).await
     }
@@ -761,7 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_store_get_or_default() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         let state = store.get_or_default(&pr_id).await.unwrap();
@@ -775,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_store_set_and_get() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         let state = ReviewMachineState::Idle {
@@ -792,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_store_remove() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         let state = ReviewMachineState::Idle {
@@ -821,7 +832,7 @@ mod tests {
     async fn test_get_or_init_updates_reviews_enabled_when_changed() {
         use crate::state_machine::state::{BatchId, CheckRunId, CommentId, CommitSha};
 
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // Simulate: PR opened with reviews enabled, batch is pending
@@ -853,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_init_creates_new_state_with_reviews_enabled() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // No existing state - should create Idle with reviews_enabled: false
@@ -881,7 +892,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let store = Arc::new(StateStore::new());
+        let store = Arc::new(StateStore::new_for_testing());
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
         let mismatch_count = Arc::new(AtomicUsize::new(0));
 
@@ -933,7 +944,7 @@ mod tests {
     async fn test_different_prs_not_blocked() {
         use std::sync::Arc;
 
-        let store = Arc::new(StateStore::new());
+        let store = Arc::new(StateStore::new_for_testing());
 
         // Spawn tasks for different PRs concurrently
         let mut handles = vec![];
@@ -958,7 +969,7 @@ mod tests {
 
     /// A repository that fails on demand, for testing error handling.
     struct FailingRepository {
-        inner: InMemoryRepository,
+        inner: SqliteRepository,
         fail_gets: std::sync::atomic::AtomicBool,
         fail_puts: std::sync::atomic::AtomicBool,
     }
@@ -966,7 +977,7 @@ mod tests {
     impl FailingRepository {
         fn new() -> Self {
             Self {
-                inner: InMemoryRepository::new(),
+                inner: SqliteRepository::new_in_memory().unwrap(),
                 fail_gets: std::sync::atomic::AtomicBool::new(false),
                 fail_puts: std::sync::atomic::AtomicBool::new(false),
             }
@@ -1153,7 +1164,7 @@ mod tests {
     /// Regression test for: installation_id preservation across state updates.
     #[tokio::test]
     async fn test_installation_id_preserved_across_state_updates() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // Set initial state with installation_id
@@ -1190,7 +1201,7 @@ mod tests {
     /// Test that get_or_init preserves installation_id when updating reviews_enabled.
     #[tokio::test]
     async fn test_get_or_init_preserves_installation_id() {
-        let store = StateStore::new();
+        let store = StateStore::new_for_testing();
         let pr_id = StateMachinePrId::new("owner", "repo", 123);
 
         // Set up initial state with installation_id
@@ -1441,7 +1452,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                let store = StateStore::new();
+                let store = StateStore::new_for_testing();
                 let pr_id = test_pr_id(1);
 
                 // Set initial state with installation_id
@@ -1474,7 +1485,7 @@ mod tests {
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
-                let store = StateStore::new();
+                let store = StateStore::new_for_testing();
                 let pr_id = test_pr_id(1);
 
                 // Set initial state
@@ -1561,7 +1572,7 @@ mod tests {
 
     /// A repository that tracks operations for testing atomicity guarantees.
     struct TrackingRepository {
-        inner: InMemoryRepository,
+        inner: SqliteRepository,
         fail_gets: std::sync::atomic::AtomicBool,
         fail_puts: std::sync::atomic::AtomicBool,
         fail_get_by_batch_id: std::sync::atomic::AtomicBool,
@@ -1578,7 +1589,7 @@ mod tests {
     impl TrackingRepository {
         fn new() -> Self {
             Self {
-                inner: InMemoryRepository::new(),
+                inner: SqliteRepository::new_in_memory().unwrap(),
                 fail_gets: std::sync::atomic::AtomicBool::new(false),
                 fail_puts: std::sync::atomic::AtomicBool::new(false),
                 fail_get_by_batch_id: std::sync::atomic::AtomicBool::new(false),
@@ -1915,14 +1926,13 @@ mod tests {
         // This SHOULD try to update reviews_enabled and fail, returning Err.
         let result = store.get_or_init(&pr_id, false).await;
 
-        // BUG: Currently returns Ok(original_state) when write fails.
-        // CORRECT behavior: Should return Err when the update couldn't be persisted.
+        // Regression: Previously returned Ok(original_state) when write fails.
+        // This test verifies the fix: returns Err when the update couldn't be persisted.
         assert!(
             result.is_err(),
             "get_or_init MUST return Err when updating reviews_enabled fails.\n\
-             Current behavior (BUG): Returns Ok({:?}) hiding the write failure.\n\
-             This allows callers to proceed unaware that the update wasn't persisted,\n\
-             leading to reviews running when they should be suppressed.",
+             Previous behavior (fixed): Returned Ok hiding the write failure.\n\
+             Got: {:?}",
             result
         );
     }
@@ -2011,13 +2021,14 @@ mod tests {
 
     /// Regression test: get_pr_by_batch_id must return Err on repository errors.
     ///
-    /// Bug: get_pr_by_batch_id returns None on errors, making it impossible for
-    /// callers (like the OpenAI webhook handler) to distinguish between:
+    /// Previously: get_pr_by_batch_id returned None on errors, making it impossible
+    /// for callers (like the OpenAI webhook handler) to distinguish between:
     /// - "batch not found" (legitimate, e.g., CLI batch) → return 200, mark seen
     /// - "transient DB error" → return 500, DON'T mark seen, allow retry
     ///
-    /// Impact: During DB hiccups, the webhook handler marks the webhook as seen
-    /// and returns 200, so OpenAI won't retry and the batch completion is lost.
+    /// Impact of the old bug: During DB hiccups, the webhook handler marked the
+    /// webhook as seen and returned 200, so OpenAI wouldn't retry and the batch
+    /// completion was lost.
     #[tokio::test]
     async fn test_get_pr_by_batch_id_must_return_err_on_repository_error() {
         let repo = Arc::new(TrackingRepository::new());
@@ -2058,7 +2069,7 @@ mod tests {
         assert!(
             result.is_err(),
             "get_pr_by_batch_id MUST return Err on repository errors.\n\
-             Current behavior (BUG): Returns Ok(None), making it impossible for\n\
+             Previous behavior (fixed): Returned Ok(None), making it impossible for\n\
              callers to distinguish 'not found' from 'transient error'.\n\
              Got: {:?}",
             result

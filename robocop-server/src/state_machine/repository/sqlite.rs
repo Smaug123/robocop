@@ -50,7 +50,9 @@ const STALE_IN_PROGRESS_TTL_SECONDS: i64 = 30 * 60;
 /// Uses `tokio::task::spawn_blocking` to run synchronous rusqlite operations
 /// without blocking the async runtime.
 pub struct SqliteRepository {
-    conn: Arc<Mutex<Connection>>,
+    /// Database connection. Exposed as `pub(crate)` for test access to
+    /// manipulate timestamps when testing expiry behavior.
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteRepository {
@@ -323,7 +325,6 @@ impl SqliteRepository {
     }
 
     /// Create a new in-memory SQLite repository (for testing).
-    #[cfg(test)]
     pub fn new_in_memory() -> Result<Self, RepositoryError> {
         Self::new(":memory:")
     }
@@ -714,7 +715,7 @@ impl StateRepository for SqliteRepository {
 
             let exists: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM seen_webhook_ids WHERE webhook_id = ?1)",
+                    "SELECT EXISTS(SELECT 1 FROM seen_webhook_ids WHERE webhook_id = ?1 AND claim_state = 1)",
                     params![webhook_id],
                     |row| row.get(0),
                 )
