@@ -156,6 +156,11 @@ pub struct BatchRequestBody {
     pub text: TextFormat,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
+    /// Maximum number of tokens for output (reasoning + response combined).
+    /// For reasoning models, this must be large enough to accommodate both
+    /// the internal chain-of-thought and the final response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -713,6 +718,7 @@ impl OpenAIClient {
                 },
                 text: Self::create_text_format(),
                 metadata: Some(batch_metadata.clone()),
+                max_output_tokens: Some(75_000),
             },
         };
 
