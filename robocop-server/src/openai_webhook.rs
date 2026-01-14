@@ -642,14 +642,21 @@ mod tests {
     // Webhook replay protection tests
     // =========================================================================
 
-    /// Test that duplicate webhook IDs are rejected (replay protection).
+    /// Test that successfully processed webhooks are not reprocessed (replay protection).
     ///
-    /// This test verifies that a captured webhook cannot be replayed within
-    /// the 5-minute timestamp window.
+    /// This test verifies that the claim-based deduplication flow works correctly:
+    /// 1. First `try_claim_webhook_id` returns `Claimed` (we own processing)
+    /// 2. After `complete_webhook_claim`, the webhook is marked as done
+    /// 3. Subsequent `try_claim_webhook_id` returns `Completed` (skip reprocessing)
+    ///
+    /// This mirrors the production flow in `verify_openai_webhook_signature` middleware:
+    /// - Middleware calls `try_claim_webhook_id` before passing to handler
+    /// - Handler calls `complete_webhook_claim` on success
+    /// - Future requests see `Completed` and return 200 without reprocessing
     ///
     /// Regression test for: webhook-id is parsed but never stored/deduped
     #[tokio::test]
-    async fn test_duplicate_webhook_id_rejected() {
+    async fn test_completed_webhook_not_reprocessed() {
         use crate::state_machine::repository::SqliteRepository;
         use crate::state_machine::store::StateStore;
         use std::sync::Arc;
@@ -660,21 +667,30 @@ mod tests {
 
         let webhook_id = "msg_test123";
 
-        // First request should succeed (not seen before)
-        let first_seen = state_store.is_webhook_seen(webhook_id).await;
-        assert!(
-            !first_seen,
-            "First request for webhook ID should not be seen"
+        // First claim should succeed
+        let first_claim = state_store.try_claim_webhook_id(webhook_id).await;
+        assert_eq!(
+            first_claim,
+            WebhookClaimResult::Claimed,
+            "First claim should return Claimed"
         );
 
-        // Record the webhook ID
-        state_store.record_webhook_id(webhook_id).await.unwrap();
+        // Mark as successfully completed (this is what the handler does on success)
+        state_store.complete_webhook_claim(webhook_id).await;
 
-        // Second request with same webhook ID should be detected as duplicate
-        let second_seen = state_store.is_webhook_seen(webhook_id).await;
+        // Subsequent claim should return Completed (not Claimed or InProgress)
+        let second_claim = state_store.try_claim_webhook_id(webhook_id).await;
+        assert_eq!(
+            second_claim,
+            WebhookClaimResult::Completed,
+            "After completion, subsequent claims should return Completed"
+        );
+
+        // Verify is_webhook_seen also returns true (for completeness)
+        let is_seen = state_store.is_webhook_seen(webhook_id).await;
         assert!(
-            second_seen,
-            "Second request with same webhook ID should be detected as duplicate"
+            is_seen,
+            "Completed webhook should be seen by is_webhook_seen"
         );
     }
 
