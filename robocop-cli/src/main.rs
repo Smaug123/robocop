@@ -695,10 +695,10 @@ async fn process_response(
                     result = process_sse_stream(response, &mut state).await;
                 }
                 Err(e) => {
-                    return Err(e.context(format!(
-                        "Failed to resume stream. Response ID: {}",
-                        response_id
-                    )));
+                    // Poll request itself failed - treat as interrupted and retry
+                    result = StreamResult::Interrupted {
+                        error: e.context("Poll request failed"),
+                    };
                 }
             }
         } else {
