@@ -102,17 +102,22 @@
           inherit system;
           config.allowUnfree = true;
         };
+        pkgs' = pkgs.extend (import rust-overlay);
+        rustToolchain = pkgs'.rust-bin.stable.latest.default.override {
+          extensions = [ "rust-src" "clippy" ];
+        };
+        craneLib = (crane.mkLib pkgs').overrideToolchain (_: rustToolchain);
       in
       {
         packages = mkPackages pkgs;
 
-        devShells.default = (crane.mkLib (pkgs.extend (import rust-overlay))).devShell {
-          packages = [
-            pkgs.pkg-config
-            pkgs.openssl
-            pkgs.libiconv
-            pkgs.claude-code
-            pkgs.codex
+        devShells.default = craneLib.devShell {
+          packages = with pkgs'; [
+            pkg-config
+            openssl
+            libiconv
+            claude-code
+            codex
           ];
 
           RUST_BACKTRACE = "1";
