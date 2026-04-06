@@ -60,6 +60,7 @@
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
             version = "0.1.0";
+            ROBOCOP_GIT_HASH = if (self ? rev) && (self.rev != null) then self.rev else "dirty";
           };
 
           cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
@@ -70,8 +71,6 @@
           robocop-server = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             pname = "robocop-server";
-
-            ROBOCOP_GIT_HASH = if (self ? rev) && (self.rev != null) then self.rev else "dirty";
 
             cargoExtraArgs = "--locked -p robocop-server";
 
