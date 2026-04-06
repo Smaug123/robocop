@@ -16,13 +16,14 @@
       mkPackages = pkgs:
         let
           pkgs' = pkgs.extend (import rust-overlay);
+          isCross = pkgs'.stdenv.buildPlatform != pkgs'.stdenv.hostPlatform;
           rustPkgs =
-            if pkgs'.stdenv.buildPlatform.system != pkgs'.stdenv.hostPlatform.system
+            if isCross
             then pkgs'.buildPackages
             else pkgs';
           rustTarget = pkgs'.stdenv.hostPlatform.rust.rustcTarget or null;
           rustTargets = pkgs'.lib.optional (
-            rustTarget != null && pkgs'.stdenv.buildPlatform.system != pkgs'.stdenv.hostPlatform.system
+            rustTarget != null && isCross
           ) rustTarget;
 
           rustToolchain = rustPkgs.rust-bin.stable.latest.default.override {
