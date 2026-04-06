@@ -92,7 +92,9 @@ jobs:
         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
         skipPush: true
 
-    - name: Build Linux package
+    - name: Build Linux package and push to Cachix
       run: |
-        cachix watch-exec ${{ env.CACHIX_CACHE }} -- \
-          nix build .#packages.x86_64-linux.robocop-server --print-build-logs
+        nix build .#packages.x86_64-linux.robocop-server \
+          --print-build-logs \
+          --print-out-paths \
+          | cachix push ${{ env.CACHIX_CACHE }}
