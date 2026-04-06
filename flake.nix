@@ -16,12 +16,16 @@
       mkPackages = pkgs:
         let
           pkgs' = pkgs.extend (import rust-overlay);
+          rustPkgs =
+            if pkgs'.stdenv.buildPlatform.system != pkgs'.stdenv.hostPlatform.system
+            then pkgs'.buildPackages
+            else pkgs';
           rustTarget = pkgs'.stdenv.hostPlatform.rust.rustcTarget or null;
           rustTargets = pkgs'.lib.optional (
             rustTarget != null && pkgs'.stdenv.buildPlatform.system != pkgs'.stdenv.hostPlatform.system
           ) rustTarget;
 
-          rustToolchain = pkgs'.rust-bin.stable.latest.default.override {
+          rustToolchain = rustPkgs.rust-bin.stable.latest.default.override {
             extensions = [ "rust-src" "clippy" ];
             targets = rustTargets;
           };
