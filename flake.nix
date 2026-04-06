@@ -16,9 +16,14 @@
       mkPackages = pkgs:
         let
           pkgs' = pkgs.extend (import rust-overlay);
+          rustTarget = pkgs'.stdenv.hostPlatform.rust.rustcTarget or null;
+          rustTargets = pkgs'.lib.optional (
+            rustTarget != null && pkgs'.stdenv.buildPlatform.system != pkgs'.stdenv.hostPlatform.system
+          ) rustTarget;
 
           rustToolchain = pkgs'.rust-bin.stable.latest.default.override {
             extensions = [ "rust-src" "clippy" ];
+            targets = rustTargets;
           };
 
           craneLib = (crane.mkLib pkgs').overrideToolchain (_: rustToolchain);
@@ -36,6 +41,7 @@
 
           commonBuildInputs = with pkgs'; [
             openssl
+          ] ++ pkgs'.lib.optionals pkgs'.stdenv.hostPlatform.isDarwin [
             libiconv
           ];
 
@@ -112,12 +118,13 @@
         packages = mkPackages pkgs;
 
         devShells.default = craneLib.devShell {
-          packages = with pkgs'; [
+          packages = (with pkgs'; [
             pkg-config
             openssl
-            libiconv
             claude-code
             codex
+          ]) ++ pkgs'.lib.optionals pkgs'.stdenv.hostPlatform.isDarwin [
+            pkgs'.libiconv
           ];
 
           RUST_BACKTRACE = "1";
