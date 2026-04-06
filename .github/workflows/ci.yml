@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 env:
-  CACHIX_CACHE: robocop
+  CACHIX_CACHE: smaug123
 
 jobs:
   rust:
