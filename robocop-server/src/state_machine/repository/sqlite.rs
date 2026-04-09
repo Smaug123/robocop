@@ -23,8 +23,11 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{error, warn};
 
-use super::{RepositoryError, StateRepository, StoredState, WebhookClaimResult};
-use crate::state_machine::state::ReviewMachineState;
+use super::{
+    DashboardEventType, PrEvent, PrSummary, RepositoryError, StateRepository, StoredState,
+    WebhookClaimResult,
+};
+use crate::state_machine::state::{state_variant_name, ReviewMachineState};
 use crate::state_machine::store::StateMachinePrId;
 
 /// Current schema version. Increment this when making schema changes and add
@@ -330,13 +333,70 @@ impl SqliteRepository {
     }
 }
 
+/// Convert a PR number (u64) to i64 for SQLite storage.
+///
+/// Returns an error if the PR number exceeds i64::MAX, which would
+/// cause silent overflow with `as i64`.
+fn pr_number_to_i64(pr_number: u64, operation: &'static str) -> Result<i64, RepositoryError> {
+    i64::try_from(pr_number).map_err(|_| {
+        RepositoryError::storage(
+            operation,
+            format!(
+                "PR number {} exceeds maximum storable value ({})",
+                pr_number,
+                i64::MAX
+            ),
+        )
+    })
+}
+
+/// Convert an i64 from SQLite to a PR number (u64).
+///
+/// Returns an error if the value is negative, which would indicate
+/// database corruption or a bug in previous code.
+fn i64_to_pr_number(value: i64, operation: &'static str) -> Result<u64, RepositoryError> {
+    u64::try_from(value).map_err(|_| {
+        RepositoryError::storage(
+            operation,
+            format!("invalid negative PR number {} in database", value),
+        )
+    })
+}
+
+/// Convert a usize limit to i64 for SQLite LIMIT clause.
+///
+/// Returns an error if the value exceeds i64::MAX, which would cause
+/// silent overflow/wrap with `as i64`. On 64-bit systems, very large
+/// usize values can wrap to negative i64, changing SQLite's LIMIT behavior.
+fn usize_to_i64_limit(limit: usize, operation: &'static str) -> Result<i64, RepositoryError> {
+    i64::try_from(limit).map_err(|_| {
+        RepositoryError::storage(
+            operation,
+            format!(
+                "limit {} exceeds maximum storable value ({})",
+                limit,
+                i64::MAX
+            ),
+        )
+    })
+}
+
+/// Safely convert an i64 count from SQLite to usize.
+///
+/// Returns None if the value is negative or exceeds usize::MAX (possible on
+/// 32-bit platforms with very large counts). This uses checked conversion
+/// instead of `as usize` which would silently wrap/truncate.
+fn i64_to_event_count(value: i64) -> Option<usize> {
+    usize::try_from(value).ok()
+}
+
 #[async_trait]
 impl StateRepository for SqliteRepository {
     async fn get(&self, id: &StateMachinePrId) -> Result<Option<StoredState>, RepositoryError> {
         let conn = self.conn.clone();
         let owner = id.repo_owner.clone();
         let name = id.repo_name.clone();
-        let pr_num = id.pr_number;
+        let pr_num = pr_number_to_i64(id.pr_number, "get")?;
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
@@ -345,7 +405,7 @@ impl StateRepository for SqliteRepository {
                 .query_row(
                     "SELECT state_json, installation_id FROM pr_states
                      WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3",
-                    params![owner, name, pr_num as i64],
+                    params![owner, name, pr_num],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -371,7 +431,7 @@ impl StateRepository for SqliteRepository {
         let conn = self.conn.clone();
         let owner = id.repo_owner.clone();
         let name = id.repo_name.clone();
-        let pr_num = id.pr_number;
+        let pr_num = pr_number_to_i64(id.pr_number, "put")?;
 
         let state_json = serde_json::to_string(&state.state)
             .map_err(|e| RepositoryError::storage("serialize state", e.to_string()))?;
@@ -398,7 +458,7 @@ impl StateRepository for SqliteRepository {
                 params![
                     owner,
                     name,
-                    pr_num as i64,
+                    pr_num,
                     state_json,
                     installation_id,
                     has_pending_batch,
@@ -418,7 +478,7 @@ impl StateRepository for SqliteRepository {
         let conn = self.conn.clone();
         let owner = id.repo_owner.clone();
         let name = id.repo_name.clone();
-        let pr_num = id.pr_number;
+        let pr_num = pr_number_to_i64(id.pr_number, "delete")?;
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
@@ -429,7 +489,7 @@ impl StateRepository for SqliteRepository {
                     "DELETE FROM pr_states
                      WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3
                      RETURNING state_json, installation_id",
-                    params![owner, name, pr_num as i64],
+                    params![owner, name, pr_num],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -502,7 +562,20 @@ impl StateRepository for SqliteRepository {
                     }
                 };
 
-                let id = StateMachinePrId::new(owner, name, pr_num as u64);
+                // Skip rows with invalid (negative) PR numbers - indicates database corruption
+                let pr_number = match i64_to_pr_number(pr_num, "get_pending") {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!(
+                            "Skipping corrupt row in get_pending: {}. \
+                             This indicates database corruption.",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                let id = StateMachinePrId::new(owner, name, pr_number);
                 results.push((
                     id,
                     StoredState {
@@ -571,7 +644,20 @@ impl StateRepository for SqliteRepository {
                     }
                 };
 
-                let id = StateMachinePrId::new(owner, name, pr_num as u64);
+                // Skip rows with invalid (negative) PR numbers - indicates database corruption
+                let pr_number = match i64_to_pr_number(pr_num, "get_submitting") {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!(
+                            "Skipping corrupt row in get_submitting: {}. \
+                             This indicates database corruption.",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                let id = StateMachinePrId::new(owner, name, pr_number);
                 results.push((
                     id,
                     StoredState {
@@ -638,7 +724,10 @@ impl StateRepository for SqliteRepository {
                     }
                 };
 
-                let id = StateMachinePrId::new(owner, name, pr_num as u64);
+                // Return error for invalid (negative) PR numbers - indicates database corruption
+                let pr_number = i64_to_pr_number(pr_num, "get_all")?;
+
+                let id = StateMachinePrId::new(owner, name, pr_number);
                 results.push((
                     id,
                     StoredState {
@@ -686,7 +775,8 @@ impl StateRepository for SqliteRepository {
                 Some((owner, name, pr_num, json, installation_id)) => {
                     let state: ReviewMachineState = serde_json::from_str(&json)
                         .map_err(|_| RepositoryError::corruption("state JSON"))?;
-                    let id = StateMachinePrId::new(owner, name, pr_num as u64);
+                    let pr_number = i64_to_pr_number(pr_num, "get_by_batch_id")?;
+                    let id = StateMachinePrId::new(owner, name, pr_number);
                     Ok(Some((
                         id,
                         StoredState {
@@ -886,8 +976,260 @@ impl StateRepository for SqliteRepository {
         .await
         .map_err(|e| RepositoryError::storage("cleanup_expired_webhooks", e.to_string()))?
     }
+
+    // =========================================================================
+    // Dashboard event logging
+    // =========================================================================
+
+    async fn log_event(&self, event: &PrEvent) -> Result<(), RepositoryError> {
+        let conn = self.conn.clone();
+        let repo_owner = event.repo_owner.clone();
+        let repo_name = event.repo_name.clone();
+        let pr_number = pr_number_to_i64(event.pr_number, "log_event")?;
+        let recorded_at = event.recorded_at;
+
+        // Serialize event_type to JSON for the event_data column
+        let event_json = serde_json::to_string(&event.event_type)
+            .map_err(|e| RepositoryError::storage("log_event serialize", e.to_string()))?;
+
+        // Extract the variant name for the event_type column (for easier querying)
+        let event_type_name = event_type_variant_name(&event.event_type);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            conn.execute(
+                "INSERT INTO pr_events (repo_owner, repo_name, pr_number, event_type, event_data, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    repo_owner,
+                    repo_name,
+                    pr_number,
+                    event_type_name,
+                    event_json,
+                    recorded_at
+                ],
+            )
+            .map_err(|e| RepositoryError::storage("log_event", e.to_string()))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("log_event", e.to_string()))?
+    }
+
+    async fn get_pr_events(
+        &self,
+        pr_id: &StateMachinePrId,
+        limit: usize,
+    ) -> Result<Vec<PrEvent>, RepositoryError> {
+        let conn = self.conn.clone();
+        let repo_owner = pr_id.repo_owner.clone();
+        let repo_name = pr_id.repo_name.clone();
+        let pr_number = pr_number_to_i64(pr_id.pr_number, "get_pr_events")?;
+        let limit_i64 = usize_to_i64_limit(limit, "get_pr_events")?;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, repo_owner, repo_name, pr_number, event_data, recorded_at
+                     FROM pr_events
+                     WHERE repo_owner = ?1 AND repo_name = ?2 AND pr_number = ?3
+                     ORDER BY recorded_at DESC, id DESC
+                     LIMIT ?4",
+                )
+                .map_err(|e| RepositoryError::storage("get_pr_events", e.to_string()))?;
+
+            let rows = stmt
+                .query_map(
+                    params![repo_owner, repo_name, pr_number, limit_i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|e| RepositoryError::storage("get_pr_events", e.to_string()))?;
+
+            let mut events = Vec::new();
+            for row in rows {
+                let (id, owner, name, pr_num, event_data, recorded_at) =
+                    row.map_err(|e| RepositoryError::storage("get_pr_events row", e.to_string()))?;
+
+                let event_type: DashboardEventType = serde_json::from_str(&event_data)
+                    .map_err(|_| RepositoryError::corruption("event_data JSON"))?;
+
+                let pr_number = i64_to_pr_number(pr_num, "get_pr_events")?;
+
+                events.push(PrEvent {
+                    id,
+                    repo_owner: owner,
+                    repo_name: name,
+                    pr_number,
+                    event_type,
+                    recorded_at,
+                });
+            }
+
+            Ok(events)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("get_pr_events", e.to_string()))?
+    }
+
+    async fn get_prs_with_recent_activity(
+        &self,
+        since_timestamp: i64,
+    ) -> Result<Vec<PrSummary>, RepositoryError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            // Query to get PR summaries with recent events, joined with pr_states for current state.
+            // Uses HAVING instead of WHERE so we count ALL events for each PR,
+            // while still filtering to only include PRs that have recent activity.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        e.repo_owner,
+                        e.repo_name,
+                        e.pr_number,
+                        COALESCE(s.state_json, '{}') as state_json,
+                        MAX(e.recorded_at) as latest_event_at,
+                        COUNT(*) as event_count
+                     FROM pr_events e
+                     LEFT JOIN pr_states s ON
+                        e.repo_owner = s.repo_owner AND
+                        e.repo_name = s.repo_name AND
+                        e.pr_number = s.pr_number
+                     GROUP BY e.repo_owner, e.repo_name, e.pr_number
+                     HAVING MAX(e.recorded_at) >= ?1
+                     ORDER BY latest_event_at DESC",
+                )
+                .map_err(|e| {
+                    RepositoryError::storage("get_prs_with_recent_activity", e.to_string())
+                })?;
+
+            let rows = stmt
+                .query_map(params![since_timestamp], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .map_err(|e| {
+                    RepositoryError::storage("get_prs_with_recent_activity", e.to_string())
+                })?;
+
+            let mut summaries = Vec::new();
+            for row in rows {
+                let (owner, name, pr_num, state_json, latest_event_at, event_count) =
+                    row.map_err(|e| {
+                        RepositoryError::storage("get_prs_with_recent_activity row", e.to_string())
+                    })?;
+
+                // Safely convert PR number from i64 - skip rows with invalid data
+                let pr_number = match i64_to_pr_number(pr_num, "get_prs_with_recent_activity") {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping PR with invalid number in {}/{}: {}",
+                            owner,
+                            name,
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                // Parse state to extract current_state name and reviews_enabled
+                let (current_state, reviews_enabled) = if state_json == "{}" {
+                    ("Unknown".to_string(), true)
+                } else {
+                    match serde_json::from_str::<ReviewMachineState>(&state_json) {
+                        Ok(state) => (state_variant_name(&state), state.reviews_enabled()),
+                        Err(_) => ("Unknown".to_string(), true),
+                    }
+                };
+
+                // Safely convert event count from i64 - skip rows with invalid data
+                let event_count = match i64_to_event_count(event_count) {
+                    Some(n) => n,
+                    None => {
+                        tracing::warn!(
+                            "Skipping PR {}/{} #{} with invalid event count: {}",
+                            owner,
+                            name,
+                            pr_number,
+                            event_count
+                        );
+                        continue;
+                    }
+                };
+
+                summaries.push(PrSummary {
+                    repo_owner: owner,
+                    repo_name: name,
+                    pr_number,
+                    current_state,
+                    latest_event_at,
+                    event_count,
+                    reviews_enabled,
+                });
+            }
+
+            Ok(summaries)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("get_prs_with_recent_activity", e.to_string()))?
+    }
+
+    async fn cleanup_old_events(&self, older_than: i64) -> Result<usize, RepositoryError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+
+            let deleted = conn
+                .execute(
+                    "DELETE FROM pr_events WHERE recorded_at < ?1",
+                    params![older_than],
+                )
+                .map_err(|e| RepositoryError::storage("cleanup_old_events", e.to_string()))?;
+
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| RepositoryError::storage("cleanup_old_events", e.to_string()))?
+    }
 }
 
+/// Extract the variant name from a DashboardEventType for storage.
+fn event_type_variant_name(event_type: &DashboardEventType) -> &'static str {
+    match event_type {
+        DashboardEventType::WebhookReceived { .. } => "WebhookReceived",
+        DashboardEventType::CommandReceived { .. } => "CommandReceived",
+        DashboardEventType::StateTransition { .. } => "StateTransition",
+        DashboardEventType::BatchSubmitted { .. } => "BatchSubmitted",
+        DashboardEventType::BatchCompleted { .. } => "BatchCompleted",
+        DashboardEventType::BatchFailed { .. } => "BatchFailed",
+        DashboardEventType::BatchCancelled { .. } => "BatchCancelled",
+        DashboardEventType::CommentPosted { .. } => "CommentPosted",
+        DashboardEventType::CheckRunCreated { .. } => "CheckRunCreated",
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2196,5 +2538,404 @@ mod tests {
                 "Stale InProgress claims should be reclaimable after database reopen"
             );
         }
+    }
+
+    // =========================================================================
+    // Dashboard event logging tests
+    // =========================================================================
+
+    fn make_test_event(
+        pr_number: u64,
+        event_type: DashboardEventType,
+        recorded_at: i64,
+    ) -> PrEvent {
+        PrEvent {
+            id: 0, // Will be assigned by DB
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number,
+            event_type,
+            recorded_at,
+        }
+    }
+
+    /// Test: log_event followed by get_pr_events returns the event.
+    #[tokio::test]
+    async fn test_log_event_then_get() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        let event = make_test_event(
+            1,
+            DashboardEventType::StateTransition {
+                from_state: "Idle".to_string(),
+                to_state: "Preparing".to_string(),
+                trigger: "PrUpdated".to_string(),
+            },
+            1000,
+        );
+
+        repo.log_event(&event).await.unwrap();
+
+        let events = repo.get_pr_events(&pr_id, 100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].pr_number, 1);
+        assert_eq!(events[0].recorded_at, 1000);
+
+        match &events[0].event_type {
+            DashboardEventType::StateTransition {
+                from_state,
+                to_state,
+                trigger,
+            } => {
+                assert_eq!(from_state, "Idle");
+                assert_eq!(to_state, "Preparing");
+                assert_eq!(trigger, "PrUpdated");
+            }
+            _ => panic!("Expected StateTransition event"),
+        }
+    }
+
+    /// Test: get_pr_events returns events in reverse chronological order.
+    #[tokio::test]
+    async fn test_get_pr_events_order() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        // Log events with different timestamps
+        for (i, ts) in [100, 300, 200].iter().enumerate() {
+            let event = make_test_event(
+                1,
+                DashboardEventType::StateTransition {
+                    from_state: format!("State{}", i),
+                    to_state: format!("State{}", i + 1),
+                    trigger: format!("Event{}", i),
+                },
+                *ts,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let events = repo.get_pr_events(&pr_id, 100).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Should be ordered by recorded_at DESC
+        assert_eq!(events[0].recorded_at, 300);
+        assert_eq!(events[1].recorded_at, 200);
+        assert_eq!(events[2].recorded_at, 100);
+    }
+
+    /// Test: get_pr_events respects limit.
+    #[tokio::test]
+    async fn test_get_pr_events_limit() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        // Log 10 events
+        for i in 0..10 {
+            let event = make_test_event(
+                1,
+                DashboardEventType::StateTransition {
+                    from_state: format!("State{}", i),
+                    to_state: format!("State{}", i + 1),
+                    trigger: format!("Event{}", i),
+                },
+                i as i64,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let events = repo.get_pr_events(&pr_id, 3).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Should get the 3 most recent (highest timestamps)
+        assert_eq!(events[0].recorded_at, 9);
+        assert_eq!(events[1].recorded_at, 8);
+        assert_eq!(events[2].recorded_at, 7);
+    }
+
+    /// Test: get_pr_events only returns events for the requested PR.
+    #[tokio::test]
+    async fn test_get_pr_events_filters_by_pr() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Log events for different PRs
+        for pr_num in [1, 2, 1, 3, 1] {
+            let event = make_test_event(
+                pr_num,
+                DashboardEventType::WebhookReceived {
+                    action: "opened".to_string(),
+                    head_sha: format!("sha{}", pr_num),
+                },
+                pr_num as i64 * 100,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let events = repo.get_pr_events(&test_pr_id(1), 100).await.unwrap();
+        assert_eq!(events.len(), 3);
+        for event in events {
+            assert_eq!(event.pr_number, 1);
+        }
+    }
+
+    /// Test: cleanup_old_events removes only old events.
+    #[tokio::test]
+    async fn test_cleanup_old_events() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Log events with different timestamps
+        let old_event = make_test_event(
+            1,
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "old".to_string(),
+            },
+            100, // Old
+        );
+        let new_event = make_test_event(
+            1,
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "new".to_string(),
+            },
+            300, // New
+        );
+
+        repo.log_event(&old_event).await.unwrap();
+        repo.log_event(&new_event).await.unwrap();
+
+        // Cleanup events older than 200
+        let deleted = repo.cleanup_old_events(200).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        // Only the new event should remain
+        let events = repo.get_pr_events(&test_pr_id(1), 100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].recorded_at, 300);
+    }
+
+    /// Test: get_prs_with_recent_activity returns PRs with events after threshold.
+    #[tokio::test]
+    async fn test_get_prs_with_recent_activity() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // Add a PR state for reference
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+        repo.put(&test_pr_id(2), pending_state(222)).await.unwrap();
+
+        // Log old events for PR#1
+        let old_event = make_test_event(
+            1,
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "abc".to_string(),
+            },
+            100,
+        );
+        repo.log_event(&old_event).await.unwrap();
+
+        // Log recent events for PR#2
+        let recent_event = make_test_event(
+            2,
+            DashboardEventType::StateTransition {
+                from_state: "Idle".to_string(),
+                to_state: "BatchPending".to_string(),
+                trigger: "PrUpdated".to_string(),
+            },
+            300,
+        );
+        repo.log_event(&recent_event).await.unwrap();
+
+        // Get PRs with activity after timestamp 200
+        let summaries = repo.get_prs_with_recent_activity(200).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].pr_number, 2);
+        assert_eq!(summaries[0].current_state, "BatchPending");
+        assert_eq!(summaries[0].latest_event_at, 300);
+        assert_eq!(summaries[0].event_count, 1);
+    }
+
+    /// Test: get_prs_with_recent_activity counts all events for a PR.
+    #[tokio::test]
+    async fn test_get_prs_with_recent_activity_event_count() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+
+        // Log multiple events for the same PR
+        for i in 0..5 {
+            let event = make_test_event(
+                1,
+                DashboardEventType::StateTransition {
+                    from_state: format!("State{}", i),
+                    to_state: format!("State{}", i + 1),
+                    trigger: "Event".to_string(),
+                },
+                100 + i as i64,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        let summaries = repo.get_prs_with_recent_activity(0).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].event_count, 5);
+        assert_eq!(summaries[0].latest_event_at, 104); // Most recent
+    }
+
+    /// Test: event_count is total events, not just recent events.
+    ///
+    /// When filtering by recency, we should still count ALL events for a PR,
+    /// not just the ones after the threshold. The threshold determines which
+    /// PRs to include (those with any recent activity), but event_count should
+    /// reflect the total history.
+    #[tokio::test]
+    async fn test_event_count_is_total_not_filtered() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        repo.put(&test_pr_id(1), idle_state(111)).await.unwrap();
+
+        // Log 5 events: 3 old (100, 101, 102) and 2 recent (200, 201)
+        let timestamps = [100, 101, 102, 200, 201];
+        for (i, ts) in timestamps.iter().enumerate() {
+            let event = make_test_event(
+                1,
+                DashboardEventType::StateTransition {
+                    from_state: format!("State{}", i),
+                    to_state: format!("State{}", i + 1),
+                    trigger: "Event".to_string(),
+                },
+                *ts,
+            );
+            repo.log_event(&event).await.unwrap();
+        }
+
+        // Query with threshold 150 - should include the PR (has events at 200, 201)
+        // but event_count should be 5 (total), not 2 (recent only)
+        let summaries = repo.get_prs_with_recent_activity(150).await.unwrap();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "PR should be included due to recent activity"
+        );
+        assert_eq!(
+            summaries[0].event_count, 5,
+            "event_count should be total events (5), not just recent events (2)"
+        );
+        assert_eq!(summaries[0].latest_event_at, 201);
+    }
+
+    /// Test: all DashboardEventType variants serialize and deserialize correctly.
+    #[tokio::test]
+    async fn test_all_event_types_roundtrip() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+        let pr_id = test_pr_id(1);
+
+        let event_types = vec![
+            DashboardEventType::WebhookReceived {
+                action: "opened".to_string(),
+                head_sha: "abc123".to_string(),
+            },
+            DashboardEventType::CommandReceived {
+                command: "review".to_string(),
+                user: "testuser".to_string(),
+            },
+            DashboardEventType::StateTransition {
+                from_state: "Idle".to_string(),
+                to_state: "Preparing".to_string(),
+                trigger: "PrUpdated".to_string(),
+            },
+            DashboardEventType::BatchSubmitted {
+                batch_id: "batch_123".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            DashboardEventType::BatchCompleted {
+                batch_id: "batch_123".to_string(),
+                has_issues: true,
+            },
+            DashboardEventType::BatchFailed {
+                batch_id: "batch_123".to_string(),
+                reason: "rate limited".to_string(),
+            },
+            DashboardEventType::BatchCancelled {
+                batch_id: Some("batch_123".to_string()),
+                reason: "superseded".to_string(),
+            },
+            DashboardEventType::BatchCancelled {
+                batch_id: None,
+                reason: "user requested".to_string(),
+            },
+            DashboardEventType::CommentPosted { comment_id: 12345 },
+            DashboardEventType::CheckRunCreated {
+                check_run_id: 67890,
+            },
+        ];
+
+        // Log all event types
+        for (i, event_type) in event_types.iter().enumerate() {
+            let event = make_test_event(1, event_type.clone(), i as i64);
+            repo.log_event(&event).await.unwrap();
+        }
+
+        // Retrieve and verify all events roundtrip correctly
+        let events = repo.get_pr_events(&pr_id, 100).await.unwrap();
+        assert_eq!(events.len(), event_types.len());
+
+        // Events are returned in reverse order
+        for (i, event) in events.iter().rev().enumerate() {
+            assert_eq!(
+                &event.event_type, &event_types[i],
+                "Event type mismatch at index {}: expected {:?}, got {:?}",
+                i, event_types[i], event.event_type
+            );
+        }
+    }
+
+    /// Test: PR numbers exceeding i64::MAX should error, not silently wrap.
+    ///
+    /// SQLite stores integers as i64. A u64 PR number larger than i64::MAX
+    /// would wrap to a negative value if we use `as i64`. We should reject
+    /// such values with an explicit error.
+    #[tokio::test]
+    async fn test_large_pr_number_returns_error() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // u64::MAX is 18446744073709551615, way larger than i64::MAX (9223372036854775807)
+        let large_pr_id = test_pr_id(u64::MAX);
+
+        // Attempting to store should return an error, not silently corrupt
+        let result = repo.put(&large_pr_id, idle_state(111)).await;
+        assert!(
+            result.is_err(),
+            "Storing PR number > i64::MAX should error, not silently wrap"
+        );
+    }
+
+    /// Test: Negative PR numbers in the database should error on read.
+    ///
+    /// If the database contains a negative pr_number (due to corruption or
+    /// past bugs), reading it with `as u64` would silently wrap to a large
+    /// positive number. We should detect and reject such values.
+    #[tokio::test]
+    async fn test_negative_pr_number_in_db_returns_error() {
+        let repo = SqliteRepository::new_in_memory().unwrap();
+
+        // First insert a valid state
+        repo.put(&test_pr_id(42), idle_state(111)).await.unwrap();
+
+        // Manually corrupt the database by setting a negative PR number
+        {
+            let conn = repo.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE pr_states SET pr_number = -1 WHERE pr_number = 42",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Attempting to read all states should error, not silently wrap
+        let result = repo.get_all().await;
+        assert!(
+            result.is_err(),
+            "Reading negative PR number should error, not silently wrap to large u64"
+        );
     }
 }

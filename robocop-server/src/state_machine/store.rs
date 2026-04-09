@@ -1068,6 +1068,34 @@ mod tests {
         ) -> Result<usize, RepositoryError> {
             self.inner.cleanup_expired_webhooks(ttl_seconds).await
         }
+
+        async fn log_event(
+            &self,
+            event: &crate::dashboard::types::PrEvent,
+        ) -> Result<(), RepositoryError> {
+            self.inner.log_event(event).await
+        }
+
+        async fn get_pr_events(
+            &self,
+            pr_id: &StateMachinePrId,
+            limit: usize,
+        ) -> Result<Vec<crate::dashboard::types::PrEvent>, RepositoryError> {
+            self.inner.get_pr_events(pr_id, limit).await
+        }
+
+        async fn get_prs_with_recent_activity(
+            &self,
+            since_timestamp: i64,
+        ) -> Result<Vec<crate::dashboard::types::PrSummary>, RepositoryError> {
+            self.inner
+                .get_prs_with_recent_activity(since_timestamp)
+                .await
+        }
+
+        async fn cleanup_old_events(&self, older_than: i64) -> Result<usize, RepositoryError> {
+            self.inner.cleanup_old_events(older_than).await
+        }
     }
 
     // =========================================================================
@@ -1742,6 +1770,34 @@ mod tests {
             ttl_seconds: i64,
         ) -> Result<usize, RepositoryError> {
             self.inner.cleanup_expired_webhooks(ttl_seconds).await
+        }
+
+        async fn log_event(
+            &self,
+            event: &crate::dashboard::types::PrEvent,
+        ) -> Result<(), RepositoryError> {
+            self.inner.log_event(event).await
+        }
+
+        async fn get_pr_events(
+            &self,
+            pr_id: &StateMachinePrId,
+            limit: usize,
+        ) -> Result<Vec<crate::dashboard::types::PrEvent>, RepositoryError> {
+            self.inner.get_pr_events(pr_id, limit).await
+        }
+
+        async fn get_prs_with_recent_activity(
+            &self,
+            since_timestamp: i64,
+        ) -> Result<Vec<crate::dashboard::types::PrSummary>, RepositoryError> {
+            self.inner
+                .get_prs_with_recent_activity(since_timestamp)
+                .await
+        }
+
+        async fn cleanup_old_events(&self, older_than: i64) -> Result<usize, RepositoryError> {
+            self.inner.cleanup_old_events(older_than).await
         }
     }
 
