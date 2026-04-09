@@ -60,6 +60,9 @@
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
             version = "0.1.0";
+          };
+
+          commonArgsWithHash = commonArgs // {
             ROBOCOP_GIT_HASH = if (self ? rev) && (self.rev != null) then self.rev else "dirty";
           };
 
@@ -68,7 +71,7 @@
             cargoExtraArgs = "--locked --workspace";
           });
 
-          robocop-server = craneLib.buildPackage (commonArgs // {
+          robocop-server = craneLib.buildPackage (commonArgsWithHash // {
             inherit cargoArtifacts;
             pname = "robocop-server";
 
@@ -82,7 +85,7 @@
             };
           });
 
-          robocop-cli = craneLib.buildPackage (commonArgs // {
+          robocop-cli = craneLib.buildPackage (commonArgsWithHash // {
             inherit cargoArtifacts;
             pname = "robocop-cli";
 
