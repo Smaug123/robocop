@@ -16,9 +16,19 @@
       mkPackages = pkgs:
         let
           pkgs' = pkgs.extend (import rust-overlay);
+          isCross = pkgs'.stdenv.buildPlatform != pkgs'.stdenv.hostPlatform;
+          rustPkgs =
+            if isCross
+            then pkgs'.buildPackages
+            else pkgs';
+          rustTarget = pkgs'.stdenv.hostPlatform.rust.rustcTarget or null;
+          rustTargets = pkgs'.lib.optional (
+            rustTarget != null && isCross
+          ) rustTarget;
 
-          rustToolchain = pkgs'.rust-bin.stable.latest.default.override {
+          rustToolchain = rustPkgs.rust-bin.stable.latest.default.override {
             extensions = [ "rust-src" "clippy" ];
+            targets = rustTargets;
           };
 
           craneLib = (crane.mkLib pkgs').overrideToolchain (_: rustToolchain);
@@ -36,6 +46,7 @@
 
           commonBuildInputs = with pkgs'; [
             openssl
+          ] ++ pkgs'.lib.optionals pkgs'.stdenv.hostPlatform.isDarwin [
             libiconv
           ];
 
@@ -51,16 +62,18 @@
             version = "0.1.0";
           };
 
+          commonArgsWithHash = commonArgs // {
+            ROBOCOP_GIT_HASH = if (self ? rev) && (self.rev != null) then self.rev else "dirty";
+          };
+
           cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
             pname = "robocop-deps";
             cargoExtraArgs = "--locked --workspace";
           });
 
-          robocop-server = craneLib.buildPackage (commonArgs // {
+          robocop-server = craneLib.buildPackage (commonArgsWithHash // {
             inherit cargoArtifacts;
             pname = "robocop-server";
-
-            ROBOCOP_GIT_HASH = if (self ? rev) && (self.rev != null) then self.rev else "dirty";
 
             cargoExtraArgs = "--locked -p robocop-server";
 
@@ -72,7 +85,7 @@
             };
           });
 
-          robocop-cli = craneLib.buildPackage (commonArgs // {
+          robocop-cli = craneLib.buildPackage (commonArgsWithHash // {
             inherit cargoArtifacts;
             pname = "robocop-cli";
 
@@ -112,12 +125,13 @@
         packages = mkPackages pkgs;
 
         devShells.default = craneLib.devShell {
-          packages = with pkgs'; [
+          packages = (with pkgs'; [
             pkg-config
             openssl
-            libiconv
             claude-code
             codex
+          ]) ++ pkgs'.lib.optionals pkgs'.stdenv.hostPlatform.isDarwin [
+            pkgs'.libiconv
           ];
 
           RUST_BACKTRACE = "1";
