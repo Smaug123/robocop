@@ -511,6 +511,27 @@ impl ReviewMachineState {
             },
         }
     }
+
+    /// Returns the variant name as a string for display purposes.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Idle { .. } => "Idle",
+            Self::Preparing { .. } => "Preparing",
+            Self::BatchSubmitting { .. } => "BatchSubmitting",
+            Self::AwaitingAncestryCheck { .. } => "AwaitingAncestryCheck",
+            Self::BatchPending { .. } => "BatchPending",
+            Self::Completed { .. } => "Completed",
+            Self::Failed { .. } => "Failed",
+            Self::Cancelled { .. } => "Cancelled",
+        }
+    }
+}
+
+/// Returns the variant name of a ReviewMachineState for display.
+///
+/// This is a convenience function that wraps `state.variant_name()`.
+pub fn state_variant_name(state: &ReviewMachineState) -> String {
+    state.variant_name().to_string()
 }
 
 impl Default for ReviewMachineState {
