@@ -99,8 +99,32 @@ pub enum FailureReason {
     NoOutputFile,
     /// Batch submission failed.
     SubmissionFailed { error: String },
+    /// OpenAI billing hard limit was reached. This is an external/operational
+    /// condition rather than a defect in the review pipeline, so it surfaces
+    /// as an "unstable" (Neutral) check rather than a hard failure.
+    QuotaExhausted { error: String },
     /// Data fetch failed (diff too large, etc.).
     DataFetchFailed { reason: String },
+}
+
+impl FailureReason {
+    /// Classify a batch submission error string into the appropriate variant.
+    /// Recognises OpenAI's `billing_hard_limit_reached` error code and routes
+    /// it to `QuotaExhausted` so callers can surface it as unstable.
+    pub fn from_submission_error(error: String) -> Self {
+        if error.contains("billing_hard_limit_reached") {
+            Self::QuotaExhausted { error }
+        } else {
+            Self::SubmissionFailed { error }
+        }
+    }
+
+    /// Whether this failure should be reported as "unstable" (Neutral check
+    /// conclusion) rather than a hard failure. True for transient/operational
+    /// conditions outside our control.
+    pub fn is_unstable(&self) -> bool {
+        matches!(self, Self::QuotaExhausted { .. })
+    }
 }
 
 impl fmt::Display for FailureReason {
@@ -116,6 +140,9 @@ impl fmt::Display for FailureReason {
             Self::ParseFailed { error } => write!(f, "parse failed: {}", error),
             Self::NoOutputFile => write!(f, "no output file"),
             Self::SubmissionFailed { error } => write!(f, "submission failed: {}", error),
+            Self::QuotaExhausted { error } => {
+                write!(f, "OpenAI billing hard limit reached: {}", error)
+            }
             Self::DataFetchFailed { reason } => write!(f, "data fetch failed: {}", reason),
         }
     }

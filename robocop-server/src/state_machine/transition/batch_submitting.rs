@@ -91,14 +91,25 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
         ) => {
             // Use check_run_id from event if available, otherwise from state
             let effective_check_run_id = event_check_run_id.or(*check_run_id);
+            let reason = FailureReason::from_submission_error(error);
+            let (conclusion, title) = if reason.is_unstable() {
+                (
+                    EffectCheckRunConclusion::Neutral,
+                    "Code review unstable".to_string(),
+                )
+            } else {
+                (
+                    EffectCheckRunConclusion::Failure,
+                    "Code review failed".to_string(),
+                )
+            };
+            let summary = reason.to_string();
 
             let mut effects = vec![Effect::UpdateComment {
                 content: CommentContent::ReviewFailed {
                     head_sha: head_sha.clone(),
                     batch_id: BatchId::from("(submission failed)".to_string()),
-                    reason: FailureReason::SubmissionFailed {
-                        error: error.clone(),
-                    },
+                    reason: reason.clone(),
                 },
             }];
 
@@ -106,9 +117,9 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 effects.push(Effect::UpdateCheckRun {
                     check_run_id: cr_id,
                     status: EffectCheckRunStatus::Completed,
-                    conclusion: Some(EffectCheckRunConclusion::Failure),
-                    title: "Code review failed".to_string(),
-                    summary: format!("Batch submission failed: {}", error),
+                    conclusion: Some(conclusion),
+                    title,
+                    summary,
                     external_id: None,
                 });
             }
@@ -117,7 +128,7 @@ pub fn handle(state: ReviewMachineState, event: Event) -> TransitionResult {
                 ReviewMachineState::Failed {
                     reviews_enabled: *reviews_enabled,
                     head_sha: head_sha.clone(),
-                    reason: FailureReason::SubmissionFailed { error },
+                    reason,
                 },
                 effects,
             )
@@ -431,6 +442,62 @@ mod tests {
             }
             _ => panic!("Expected Failed, got {:?}", result.state),
         }
+    }
+
+    /// A billing hard limit error from OpenAI is transient/external — it should
+    /// be reported as an "unstable" check (Neutral conclusion), not a hard failure.
+    #[test]
+    fn test_batch_submission_billing_hard_limit_is_neutral() {
+        let state = ReviewMachineState::BatchSubmitting {
+            reviews_enabled: true,
+            reconciliation_token: "test-token-123".to_string(),
+            head_sha: CommitSha::from("abc123"),
+            base_sha: CommitSha::from("def456"),
+            options: ReviewOptions::default(),
+            comment_id: None,
+            check_run_id: Some(CheckRunId(99)),
+            model: "gpt-4".to_string(),
+            reasoning_effort: "high".to_string(),
+        };
+        let event = Event::BatchSubmissionFailed {
+            error: "OpenAI Batches API error: 400 Bad Request - {\"error\": {\"message\": \"Billing hard limit has been reached\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": \"billing_hard_limit_reached\"}}".to_string(),
+            comment_id: None,
+            check_run_id: Some(CheckRunId(99)),
+        };
+
+        let result = handle(state, event);
+
+        match &result.state {
+            ReviewMachineState::Failed { reason, .. } => {
+                assert!(
+                    matches!(reason, FailureReason::QuotaExhausted { .. }),
+                    "Expected QuotaExhausted, got {:?}",
+                    reason
+                );
+            }
+            _ => panic!("Expected Failed, got {:?}", result.state),
+        }
+
+        let check_run_update = result
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::UpdateCheckRun {
+                    conclusion, title, ..
+                } => Some((conclusion, title)),
+                _ => None,
+            })
+            .expect("expected an UpdateCheckRun effect");
+        assert_eq!(
+            *check_run_update.0,
+            Some(EffectCheckRunConclusion::Neutral),
+            "billing hard limit should map to Neutral conclusion (unstable), not Failure"
+        );
+        assert!(
+            !check_run_update.1.contains("failed"),
+            "title should not say 'failed' for billing hard limit; got {:?}",
+            check_run_update.1
+        );
     }
 
     #[test]

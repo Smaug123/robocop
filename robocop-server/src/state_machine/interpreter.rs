@@ -491,12 +491,19 @@ fn format_comment_content(content: &CommentContent) -> String {
             batch_id,
             reason,
         } => {
+            let (icon, header) = if reason.is_unstable() {
+                ("⚠️", "Code review unstable")
+            } else {
+                ("❌", "Code review failed")
+            };
             format!(
-                "❌ **Code review failed**\n\n\
+                "{} **{}**\n\n\
                 Commit: `{}`\n\
                 Reason: {}\n\n\
                 Batch ID: `{}`\n\n\
                 ---\n_Robocop v{}_",
+                icon,
+                header,
                 head_sha.short(),
                 reason,
                 batch_id,

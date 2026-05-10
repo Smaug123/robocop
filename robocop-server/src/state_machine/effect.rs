@@ -155,6 +155,7 @@ impl EffectCheckRunStatus {
 pub enum EffectCheckRunConclusion {
     Success,
     Failure,
+    Neutral,
     Cancelled,
     Skipped,
     Stale,
@@ -167,6 +168,7 @@ impl EffectCheckRunConclusion {
         match self {
             Self::Success => crate::github::CheckRunConclusion::Success,
             Self::Failure => crate::github::CheckRunConclusion::Failure,
+            Self::Neutral => crate::github::CheckRunConclusion::Neutral,
             Self::Cancelled => crate::github::CheckRunConclusion::Cancelled,
             Self::Skipped => crate::github::CheckRunConclusion::Skipped,
             Self::Stale => crate::github::CheckRunConclusion::Stale,
