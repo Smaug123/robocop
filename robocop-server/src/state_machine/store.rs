@@ -1270,6 +1270,7 @@ mod tests {
             any::<String>().prop_map(|error| FailureReason::ParseFailed { error }),
             Just(FailureReason::NoOutputFile),
             any::<String>().prop_map(|error| FailureReason::SubmissionFailed { error }),
+            any::<String>().prop_map(|error| FailureReason::QuotaExhausted { error }),
             any::<String>().prop_map(|reason| FailureReason::DataFetchFailed { reason }),
         ]
     }
